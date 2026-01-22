@@ -7,11 +7,20 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 @dataclass
+def _default_data_dir() -> Path:
+    env_dir = os.getenv("DATA_DIR")
+    if env_dir:
+        return Path(env_dir)
+    if Path("./src/data").exists():
+        return Path("./src/data")
+    return Path("./data")
+
+
 class AppConfig:
     """Application configuration with environment overrides."""
     
     # Paths
-    data_dir: Path = field(default_factory=lambda: Path(os.getenv("DATA_DIR", "./data")))
+    data_dir: Path = field(default_factory=_default_data_dir)
     
     # Environment
     app_env: str = field(default_factory=lambda: os.getenv("APP_ENV", "dev"))
