@@ -331,10 +331,20 @@ def main():
         )
         
         # Use benchmark values for cost and rate
-        edited_df["task_cost"] = edited_df["Suggested Hours"] * edited_df["cost_per_hour_bench"].fillna(
+        cost_col = (
+            "cost_per_hour_bench"
+            if "cost_per_hour_bench" in edited_df.columns
+            else ("cost_per_hour" if "cost_per_hour" in edited_df.columns else "Cost/hr")
+        )
+        rate_col = (
+            "quote_rate_bench"
+            if "quote_rate_bench" in edited_df.columns
+            else ("quote_rate" if "quote_rate" in edited_df.columns else "Quote Rate")
+        )
+        edited_df["task_cost"] = edited_df["Suggested Hours"] * edited_df[cost_col].fillna(
             benchmarks["cost_per_hour"].median()
         )
-        edited_df["task_value"] = edited_df["Suggested Hours"] * edited_df["quote_rate_bench"].fillna(
+        edited_df["task_value"] = edited_df["Suggested Hours"] * edited_df[rate_col].fillna(
             benchmarks["quote_rate"].median()
         )
         
@@ -377,8 +387,8 @@ def main():
                         tasks.append(QuotePlanTask(
                             task_name=row["Task"],
                             hours=row["Suggested Hours"],
-                            cost_per_hour=row.get("cost_per_hour_bench", 0) or 0,
-                            quote_rate=row.get("quote_rate_bench", 0) or 0,
+                            cost_per_hour=row.get(cost_col, 0) or 0,
+                            quote_rate=row.get(rate_col, 0) or 0,
                         ))
                 
                 plan = QuotePlan(
@@ -402,8 +412,8 @@ def main():
                         tasks.append(QuotePlanTask(
                             task_name=row["Task"],
                             hours=row["Suggested Hours"],
-                            cost_per_hour=row.get("cost_per_hour_bench", 0) or 0,
-                            quote_rate=row.get("quote_rate_bench", 0) or 0,
+                            cost_per_hour=row.get(cost_col, 0) or 0,
+                            quote_rate=row.get(rate_col, 0) or 0,
                         ))
                 
                 plan = QuotePlan(
