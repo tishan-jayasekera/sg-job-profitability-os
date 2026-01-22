@@ -5,6 +5,7 @@ Main entry point for Streamlit app.
 """
 import streamlit as st
 from pathlib import Path
+from datetime import datetime, timezone
 
 # Page config must be first Streamlit command
 st.set_page_config(
@@ -21,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from src.ui.state import init_state
 from src.data.loader import load_fact_timesheet, get_data_status
 from src.data.schema import validate_schema, display_validation_result
-from src.config import config
+from src.config import config, TABLE_FILES
 
 
 def main():
@@ -63,6 +64,23 @@ def main():
         
         st.info("Once data is in place, refresh this page.")
         return
+
+    with st.expander("Data fingerprint", expanded=False):
+        rows = []
+        for filename in TABLE_FILES.values():
+            for ext in ("parquet", "csv"):
+                path = config.processed_dir / f"{filename}.{ext}"
+                if path.exists():
+                    mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                    rows.append({
+                        "file": path.name,
+                        "size_mb": round(path.stat().st_size / (1024 * 1024), 2),
+                        "modified_utc": mtime.strftime("%Y-%m-%d %H:%M"),
+                    })
+        if rows:
+            st.dataframe(rows, use_container_width=True)
+        else:
+            st.info(f"No files found in {config.processed_dir}.")
     
     # Load and validate data
     with st.spinner("Loading data..."):
