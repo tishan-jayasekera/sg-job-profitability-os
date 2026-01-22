@@ -6,7 +6,6 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
-@dataclass
 def _default_data_dir() -> Path:
     env_dir = os.getenv("DATA_DIR")
     if env_dir:
@@ -16,6 +15,7 @@ def _default_data_dir() -> Path:
     return Path("./data")
 
 
+@dataclass
 class AppConfig:
     """Application configuration with environment overrides."""
     
