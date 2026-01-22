@@ -16,7 +16,7 @@ from src.ui.layout import section_header
 from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent, fmt_count
 from src.ui.charts import time_series, quadrant_scatter, horizontal_bar
 from src.data.loader import load_fact_timesheet
-from src.data.semantic import safe_quote_job_task, utilisation_metrics
+from src.data.semantic import safe_quote_job_task, utilisation_metrics, get_category_col
 from src.data.cohorts import filter_by_time_window
 from src.config import config
 
@@ -57,9 +57,10 @@ def calculate_job_mix_metrics(df: pd.DataFrame, cohort_df: pd.DataFrame) -> pd.D
     """Calculate job mix metrics by cohort month."""
     
     # Get job-level attributes
+    category_col = get_category_col(df)
     job_attrs = df.groupby("job_no").agg(
         department_final=("department_final", "first"),
-        job_category=("job_category", "first"),
+        job_category=(category_col, "first"),
     ).reset_index()
     
     # Safe quote totals per job
@@ -150,7 +151,7 @@ def main():
     st.caption("Analyze job intake patterns and capacity implications")
     
     # Load data
-    df = load_fact_timesheet()
+    df_all = load_fact_timesheet()
     
     # Sidebar controls
     st.sidebar.header("Controls")
@@ -174,24 +175,23 @@ def main():
         index=1
     )
     
-    df = filter_by_time_window(df, time_window)
-    
-    departments = ["All"] + sorted(df["department_final"].dropna().unique().tolist())
+    departments = ["All"] + sorted(df_all["department_final"].dropna().unique().tolist())
     selected_dept = st.sidebar.selectbox("Department", departments)
     
     if selected_dept != "All":
-        df = df[df["department_final"] == selected_dept]
+        df_all = df_all[df_all["department_final"] == selected_dept]
     
     # Calculate cohorts
-    cohort_df = calculate_job_cohorts(df, cohort_type)
+    cohort_df = calculate_job_cohorts(df_all, cohort_type)
     
     if len(cohort_df) == 0:
         st.warning("No job data available for analysis.")
         return
     
     # Calculate metrics
-    monthly_metrics = calculate_job_mix_metrics(df, cohort_df)
-    demand_supply = calculate_demand_vs_supply(df, monthly_metrics)
+    monthly_metrics = calculate_job_mix_metrics(df_all, cohort_df)
+    monthly_metrics = filter_by_time_window(monthly_metrics, time_window, date_col="cohort_month")
+    demand_supply = calculate_demand_vs_supply(df_all, monthly_metrics)
     
     # =========================================================================
     # SECTION A: KPI STRIP
@@ -284,7 +284,7 @@ def main():
     section_header("Job Value vs Effort", "Identify 'high value / low hours' segment")
     
     # Get job-level data
-    job_task = safe_quote_job_task(df)
+    job_task = safe_quote_job_task(df_all)
     if len(job_task) > 0:
         job_quotes = job_task.groupby("job_no").agg(
             quoted_hours=("quoted_time_total", "sum"),

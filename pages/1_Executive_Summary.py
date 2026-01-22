@@ -1,7 +1,7 @@
 """
 Executive Summary Page
 
-Company → Department → Category → Task/Staff drill-down with KPIs,
+Company → Department → Category → Staff → Breakdown → Task drill-down with KPIs,
 quote-delivery reconciliation, and rate capture analysis.
 """
 import streamlit as st
@@ -13,8 +13,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.ui.state import (
-    init_state, get_state, set_state, get_drill_level,
-    drill_to_department, drill_to_category, get_drill_filter,
+    init_state, get_state, get_drill_level,
+    drill_to_department, drill_to_category, drill_to_staff,
+    drill_to_breakdown, drill_to_task, get_drill_filter,
     apply_drill_filter
 )
 from src.ui.layout import (
@@ -31,7 +32,7 @@ from src.ui.charts import (
 from src.data.loader import load_fact_timesheet
 from src.data.semantic import (
     full_metric_pack, profitability_rollup, quote_delivery_metrics,
-    rate_rollups, utilisation_metrics, exclude_leave
+    rate_rollups, utilisation_metrics, exclude_leave, get_category_col
 )
 from src.data.cohorts import filter_by_time_window, filter_active_jobs
 
@@ -70,6 +71,8 @@ def apply_global_filters(df: pd.DataFrame) -> pd.DataFrame:
         df = df[df["job_status"] == status]
     
     return df
+
+
 
 
 def main():
@@ -222,10 +225,13 @@ def main():
         # Rate scatter by drill level
         level = get_drill_level()
         
+        category_col = get_category_col(df_drill)
         if level == "company":
             group_col = "department_final"
         elif level == "department":
-            group_col = "job_category"
+            group_col = category_col
+        elif level == "category":
+            group_col = "staff_name"
         else:
             group_col = "task_name"
         
@@ -248,28 +254,28 @@ def main():
     # =========================================================================
     level = get_drill_level()
     
+    category_col = get_category_col(df_drill)
     if level == "company":
         section_header("By Department", "Click a row to drill down")
         group_col = "department_final"
     elif level == "department":
         section_header("By Category", "Click a row to drill down")
-        group_col = "job_category"
+        group_col = category_col
+    elif level == "category":
+        section_header("By Staff", "Click a row to drill down")
+        group_col = "staff_name"
+    elif level == "staff":
+        section_header("By Breakdown", "Click a row to drill down")
+        group_col = "breakdown" if "breakdown" in df_drill.columns else "task_name"
+    elif level == "breakdown":
+        section_header("By Task", "Click a row to drill down")
+        group_col = "task_name"
     else:
-        # Category level - show tabs
-        section_header("Tasks & Staff")
-        tab1, tab2 = st.tabs(["By Task", "By Staff"])
-        
-        with tab1:
-            group_col = "task_name"
-            render_drill_table_section(df_drill, group_col, can_drill=False)
-        
-        with tab2:
-            group_col = "staff_name"
-            render_drill_table_section(df_drill, group_col, can_drill=False)
-        
-        return
+        section_header("Tasks")
+        group_col = "task_name"
     
-    render_drill_table_section(df_drill, group_col, can_drill=True)
+    can_drill = level != "task"
+    render_drill_table_section(df_drill, group_col, can_drill=can_drill)
     
     # =========================================================================
     # SECTION D: ACTION SHORTLIST
@@ -313,8 +319,10 @@ def render_drill_table_section(df: pd.DataFrame, group_col: str, can_drill: bool
     col_names = {
         "department_final": "Department",
         "job_category": "Category",
+        "category_rev_job": "Category",
         "task_name": "Task",
         "staff_name": "Staff",
+        "breakdown": "Breakdown",
         "revenue": "Revenue",
         "margin_pct": "Margin %",
         "hours": "Hours",
@@ -347,6 +355,18 @@ def render_drill_table_section(df: pd.DataFrame, group_col: str, can_drill: bool
                 st.rerun()
             elif level == "department":
                 drill_to_category(selected_value)
+                st.rerun()
+            elif level == "category":
+                drill_to_staff(selected_value)
+                st.rerun()
+            elif level == "staff":
+                if group_col == "breakdown":
+                    drill_to_breakdown(selected_value)
+                else:
+                    drill_to_task(selected_value)
+                st.rerun()
+            elif level == "breakdown":
+                drill_to_task(selected_value)
                 st.rerun()
     else:
         st.dataframe(formatted_df, use_container_width=True, hide_index=True)

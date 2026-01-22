@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
 from src.config import config
+from src.data.semantic import get_category_col
 
 
 def get_job_first_activity(df: pd.DataFrame) -> pd.DataFrame:
@@ -150,9 +151,10 @@ def get_active_jobs_with_metrics(df: pd.DataFrame,
         return pd.DataFrame()
     
     # Job-level aggregations
+    category_col = get_category_col(df_active)
     job_agg = df_active.groupby("job_no").agg(
         department_final=("department_final", "first"),
-        job_category=("job_category", "first"),
+        job_category=(category_col, "first"),
         client=("client", "first") if "client" in df_active.columns else ("job_no", "first"),
         job_status=("job_status", "first") if "job_status" in df_active.columns else ("job_no", "first"),
         job_due_date=("job_due_date", "first") if "job_due_date" in df_active.columns else ("job_no", "first"),

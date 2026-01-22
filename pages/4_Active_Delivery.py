@@ -11,12 +11,12 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from src.ui.state import init_state, get_state, set_state
+from src.ui.state import init_state, get_state
 from src.ui.layout import section_header
 from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent, fmt_rate
 from src.ui.charts import horizontal_bar, grouped_bar
-from src.data.loader import load_fact_timesheet, load_mart
-from src.data.semantic import safe_quote_job_task, profitability_rollup
+from src.data.loader import load_fact_timesheet
+from src.data.semantic import safe_quote_job_task, profitability_rollup, get_category_col
 from src.data.cohorts import get_active_jobs, filter_active_jobs
 from src.config import config
 
@@ -37,9 +37,10 @@ def build_active_jobs_view(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     
     # Job-level aggregation
+    category_col = get_category_col(df_active)
     job_agg = df_active.groupby("job_no").agg(
         department_final=("department_final", "first"),
-        job_category=("job_category", "first"),
+        job_category=(category_col, "first"),
         actual_hours=("hours_raw", "sum"),
         actual_cost=("base_cost", "sum"),
         actual_revenue=("rev_alloc", "sum"),

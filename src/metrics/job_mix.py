@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional, List, Dict
 
-from src.data.semantic import safe_quote_job_task
+from src.data.semantic import safe_quote_job_task, get_category_col
 from src.data.job_lifecycle import get_job_first_activity, get_job_first_revenue
 from src.config import config
 
@@ -63,9 +63,10 @@ def compute_job_mix(df: pd.DataFrame,
     cohort = assign_job_cohort(df, cohort_definition)
     
     # Get job-level attributes
+    category_col = get_category_col(df)
     job_attrs = df.groupby("job_no").agg(
         department_final=("department_final", "first"),
-        job_category=("job_category", "first"),
+        job_category=(category_col, "first"),
     ).reset_index()
     
     job_attrs = job_attrs.merge(cohort, on="job_no", how="left")
@@ -227,7 +228,7 @@ def compute_job_quadrant(df: pd.DataFrame,
     # Get job attributes
     job_attrs = df.groupby("job_no").agg(
         department_final=("department_final", "first"),
-        job_category=("job_category", "first"),
+        job_category=(get_category_col(df), "first"),
         client=("client", "first") if "client" in df.columns else ("job_no", "first"),
     ).reset_index()
     

@@ -7,7 +7,7 @@ import pandas as pd
 import numpy as np
 from typing import Optional, List, Dict
 
-from src.data.semantic import safe_quote_job_task, safe_quote_rollup
+from src.data.semantic import safe_quote_job_task, safe_quote_rollup, get_category_col
 from src.config import config
 
 
@@ -253,7 +253,8 @@ def get_top_overrun_tasks(df: pd.DataFrame,
     if department:
         df_filtered = df_filtered[df_filtered["department_final"] == department]
     if category:
-        df_filtered = df_filtered[df_filtered["job_category"] == category]
+        category_col = get_category_col(df_filtered)
+        df_filtered = df_filtered[df_filtered[category_col] == category]
     
     # Get task-level variance
     task_variance = compute_hours_variance(df_filtered, ["task_name"])

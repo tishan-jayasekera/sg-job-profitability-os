@@ -20,7 +20,7 @@ from src.ui.state import (
 from src.ui.layout import section_header
 from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent, fmt_rate
 from src.data.loader import load_fact_timesheet, load_mart
-from src.data.semantic import safe_quote_job_task
+from src.data.semantic import safe_quote_job_task, get_category_col
 from src.data.cohorts import (
     filter_by_time_window, filter_active_staff,
     compute_recency_weights, get_benchmark_metadata
@@ -39,7 +39,9 @@ def get_task_benchmarks(df: pd.DataFrame, department: str, category: str,
     Get task benchmarks for a department/category combination.
     """
     # Filter to department and category
-    mask = (df["department_final"] == department) & (df["job_category"] == category)
+    df_dept = df[df["department_final"] == department] if "department_final" in df.columns else df
+    category_col = get_category_col(df_dept)
+    mask = (df["department_final"] == department) & (df[category_col] == category)
     df_slice = df[mask].copy()
     
     if len(df_slice) == 0:
@@ -175,9 +177,11 @@ def main():
         )
         
         # Category selection (filtered by department)
-        if selected_dept:
+        df_dept = df[df["department_final"] == selected_dept] if selected_dept else df
+        category_col = get_category_col(df_dept)
+        if selected_dept and category_col in df.columns:
             categories = sorted(
-                df[df["department_final"] == selected_dept]["job_category"]
+                df_dept[category_col]
                 .dropna().unique().tolist()
             )
         else:
@@ -239,8 +243,10 @@ def main():
             df_filtered = filter_active_staff(df_filtered)
         
         # Get benchmark metadata
+        df_filtered_dept = df_filtered[df_filtered["department_final"] == selected_dept]
+        category_col = get_category_col(df_filtered_dept)
         mask = (df_filtered["department_final"] == selected_dept) & \
-               (df_filtered["job_category"] == selected_cat)
+               (df_filtered[category_col] == selected_cat)
         df_slice = df_filtered[mask]
         
         meta = get_benchmark_metadata(df_slice, recency_weighted=recency_weighted)

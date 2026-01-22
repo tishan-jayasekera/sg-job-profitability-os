@@ -30,7 +30,7 @@ def main():
     st.markdown("""
     All navigation and analysis follows this hierarchy:
     
-    **Company → `department_final` → `job_category` → (`task_name` | `staff_name`)**
+    **Company → `department_final` → `category_rev_job` → `staff_name` → `breakdown` → `task_name`**
     
     Everything else (client, business unit, state, role, etc.) is **filter-only**.
     """)

@@ -16,8 +16,9 @@ from src.ui.layout import section_header
 from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent
 from src.ui.charts import capacity_bar, scatter_plot
 from src.data.loader import load_fact_timesheet
-from src.data.semantic import exclude_leave, utilisation_metrics
-from src.data.cohorts import filter_by_time_window, get_active_staff, compute_recency_weights
+from src.data.semantic import utilisation_metrics, get_category_col
+from src.data.cohorts import compute_recency_weights
+from src.metrics.capacity import compute_staff_capacity
 from src.config import config
 
 
@@ -28,56 +29,10 @@ init_state()
 
 def calculate_staff_capacity(df: pd.DataFrame, weeks: int = 4) -> pd.DataFrame:
     """Calculate capacity metrics per staff member."""
-    
-    # Get unique staff with their FTE scaling and utilisation target
-    staff_info = df.groupby("staff_name").agg(
-        fte_scaling=("fte_hours_scaling", "first"),
-        util_target=("utilisation_target", "first"),
-        department=("department_final", "first"),
-    ).reset_index()
-    
-    # Calculate capacity
-    staff_info["weekly_capacity"] = config.standard_weekly_hours * staff_info["fte_scaling"]
-    staff_info["period_capacity"] = staff_info["weekly_capacity"] * weeks
-    staff_info["billable_capacity"] = staff_info["period_capacity"] * staff_info["util_target"]
-    
-    # Calculate recent load (exclude leave)
-    df_no_leave = exclude_leave(df)
-    recent_cutoff = df["month_key"].max() - pd.DateOffset(weeks=weeks)
-    df_recent = df_no_leave[df_no_leave["month_key"] >= recent_cutoff]
-    
-    # Billable and total load
-    billable_load = df_recent[df_recent["is_billable"]].groupby("staff_name")["hours_raw"].sum()
-    total_load = df_recent.groupby("staff_name")["hours_raw"].sum()
-    
-    staff_info = staff_info.merge(
-        billable_load.reset_index().rename(columns={"hours_raw": "billable_load"}),
-        on="staff_name", how="left"
-    )
-    staff_info = staff_info.merge(
-        total_load.reset_index().rename(columns={"hours_raw": "total_load"}),
-        on="staff_name", how="left"
-    )
-    
-    staff_info["billable_load"] = staff_info["billable_load"].fillna(0)
-    staff_info["total_load"] = staff_info["total_load"].fillna(0)
-    
-    # Headroom
-    staff_info["headroom"] = staff_info["billable_capacity"] - staff_info["billable_load"]
-    
-    # Utilisation
-    staff_info["utilisation"] = np.where(
-        staff_info["period_capacity"] > 0,
-        staff_info["billable_load"] / staff_info["period_capacity"] * 100,
-        0
-    )
-    
-    # Active jobs
-    active_jobs = df_recent.groupby("staff_name")["job_no"].nunique().reset_index()
-    active_jobs.columns = ["staff_name", "active_job_count"]
-    staff_info = staff_info.merge(active_jobs, on="staff_name", how="left")
-    staff_info["active_job_count"] = staff_info["active_job_count"].fillna(0).astype(int)
-    
+    staff_info = compute_staff_capacity(df, weeks=weeks)
+    if len(staff_info) == 0:
+        return staff_info
+    staff_info = staff_info.rename(columns={"trailing_utilisation": "utilisation"})
     return staff_info
 
 
@@ -89,10 +44,11 @@ def get_staff_capability(df: pd.DataFrame, task_name: str = None,
     df_weighted["weight"] = compute_recency_weights(df_weighted)
     df_weighted["hours_weighted"] = df_weighted["hours_raw"] * df_weighted["weight"]
     
+    category_col = get_category_col(df_weighted)
     if task_name:
         df_slice = df_weighted[df_weighted["task_name"] == task_name]
     elif category:
-        df_slice = df_weighted[df_weighted["job_category"] == category]
+        df_slice = df_weighted[df_weighted[category_col] == category]
     else:
         df_slice = df_weighted
     
@@ -147,11 +103,12 @@ def main():
     # Totals
     total_supply = staff_capacity["period_capacity"].sum()
     total_billable_cap = staff_capacity["billable_capacity"].sum()
-    total_load = staff_capacity["billable_load"].sum()
+    total_billable_load = staff_capacity["billable_load"].sum()
+    total_load = staff_capacity["total_load"].sum()
     total_headroom = staff_capacity["headroom"].sum()
     
     # KPIs
-    cap_cols = st.columns(4)
+    cap_cols = st.columns(5)
     
     with cap_cols[0]:
         st.metric("Total Supply", fmt_hours(total_supply))
@@ -160,14 +117,41 @@ def main():
         st.metric("Billable Capacity", fmt_hours(total_billable_cap))
     
     with cap_cols[2]:
-        st.metric("Current Load", fmt_hours(total_load))
+        st.metric("Billable Load", fmt_hours(total_billable_load))
     
     with cap_cols[3]:
+        st.metric("Total Load", fmt_hours(total_load))
+    
+    with cap_cols[4]:
         st.metric("Headroom", fmt_hours(total_headroom))
     
     # Capacity bar
-    fig = capacity_bar(total_supply, total_load, total_headroom)
+    fig = capacity_bar(total_billable_cap, total_billable_load, total_headroom)
     st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("Load calculation details", expanded=False):
+        if "work_date" in df.columns:
+            reference_date = df["work_date"].max()
+            window_col = "work_date"
+        else:
+            reference_date = df["month_key"].max()
+            window_col = "month_key"
+        cutoff = reference_date - pd.DateOffset(weeks=weeks)
+        st.markdown(
+            f"""
+            **Window:** last {weeks} weeks ending {reference_date.date()} (using `{window_col}`)
+            
+            **Capacity per staff:** `38 hrs × fte_hours_scaling × weeks`
+            
+            **Billable capacity:** `period_capacity × utilisation_target`
+            
+            **Billable load:** sum of `hours_raw` where `is_billable = True`, excluding leave
+            
+            **Total load:** sum of `hours_raw` excluding leave
+            
+            **Headroom:** `billable_capacity − billable_load`
+            """
+        )
     
     st.markdown("---")
     
@@ -180,9 +164,10 @@ def main():
         section_header("Staffing Recommendations", f"For quote plan: {plan.category}")
         
         # Filter to relevant department/category
+        category_col = get_category_col(df)
         df_slice = df[
             (df["department_final"] == plan.department) &
-            (df["job_category"] == plan.category)
+            (df[category_col] == plan.category)
         ]
         
         recommendations = []

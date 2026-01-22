@@ -19,6 +19,7 @@ from src.data.loader import (
     load_audit_unallocated, get_data_status
 )
 from src.data.schema import validate_schema, get_column_info
+from src.data.semantic import get_category_col
 from src.config import config, REQUIRED_COLUMNS, OPTIONAL_COLUMNS
 
 
@@ -120,9 +121,10 @@ def identify_anomalies(df: pd.DataFrame) -> list:
                 "severity": "warning"
             })
     
-    # Missing job_category
-    if "job_category" in df.columns:
-        missing_cat = df[df["job_category"].isna()]
+    # Missing category (revenue-first)
+    category_col = get_category_col(df)
+    if category_col in df.columns:
+        missing_cat = df[df[category_col].isna()]
         if len(missing_cat) > 0:
             anomalies.append({
                 "type": "Missing Job Category",

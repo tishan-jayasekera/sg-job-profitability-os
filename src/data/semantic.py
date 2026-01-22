@@ -11,15 +11,23 @@ from typing import List, Optional, Dict, Any
 # =============================================================================
 # CANONICAL HIERARCHY
 # =============================================================================
-# Company → department_final → job_category → (task_name | staff_name)
+# Company → department_final → category_rev_job → staff_name → breakdown → task_name
 
-HIERARCHY_LEVELS = ["company", "department_final", "job_category", "task_name", "staff_name"]
+HIERARCHY_LEVELS = [
+    "company",
+    "department_final",
+    "category_rev_job",
+    "staff_name",
+    "breakdown",
+    "task_name",
+]
 DRILL_DIMENSIONS = {
     "company": [],
     "department": ["department_final"],
-    "category": ["department_final", "job_category"],
-    "task": ["department_final", "job_category", "task_name"],
-    "staff": ["department_final", "job_category", "staff_name"],
+    "category": ["department_final", "category_rev_job"],
+    "staff": ["department_final", "category_rev_job", "staff_name"],
+    "breakdown": ["department_final", "category_rev_job", "staff_name", "breakdown"],
+    "task": ["department_final", "category_rev_job", "staff_name", "breakdown", "task_name"],
 }
 
 
@@ -41,6 +49,17 @@ def leave_exclusion_mask(df: pd.DataFrame) -> pd.Series:
 def exclude_leave(df: pd.DataFrame) -> pd.DataFrame:
     """Return dataframe with leave tasks excluded."""
     return df[~leave_exclusion_mask(df)].copy()
+
+
+def get_category_col(df: pd.DataFrame) -> str:
+    """Return the best available category column."""
+    if "category_rev_job" in df.columns and df["category_rev_job"].notna().any():
+        return "category_rev_job"
+    if "job_category" in df.columns and df["job_category"].notna().any():
+        return "job_category"
+    if "category_rev_job_month" in df.columns and df["category_rev_job_month"].notna().any():
+        return "category_rev_job_month"
+    return "job_category"
 
 
 # =============================================================================

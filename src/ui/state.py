@@ -12,10 +12,13 @@ from dataclasses import dataclass, field
 
 STATE_KEYS = {
     # Drill navigation
-    "drill_level": "drill_level",  # company | department | category
+    "drill_level": "drill_level",  # company | department | category | staff | breakdown | task
     "selected_department": "selected_department",
     "selected_category": "selected_category",
-    "category_subtab": "category_subtab",  # tasks | staff
+    "selected_staff": "selected_staff",
+    "selected_breakdown": "selected_breakdown",
+    "selected_task": "selected_task",
+    "category_subtab": "category_subtab",  # legacy
     
     # Filters
     "time_window": "time_window",
@@ -43,6 +46,9 @@ DEFAULTS = {
     "drill_level": "company",
     "selected_department": None,
     "selected_category": None,
+    "selected_staff": None,
+    "selected_breakdown": None,
+    "selected_task": None,
     "category_subtab": "tasks",
     "time_window": "12m",
     "active_jobs_only": False,
@@ -99,15 +105,30 @@ def get_breadcrumb() -> List[str]:
     level = get_drill_level()
     crumbs = ["Company"]
     
-    if level in ["department", "category"]:
+    if level in ["department", "category", "staff", "breakdown", "task"]:
         dept = get_state("selected_department")
         if dept:
             crumbs.append(dept)
     
-    if level == "category":
+    if level in ["category", "staff", "breakdown", "task"]:
         cat = get_state("selected_category")
         if cat:
             crumbs.append(cat)
+
+    if level in ["staff", "breakdown", "task"]:
+        staff = get_state("selected_staff")
+        if staff:
+            crumbs.append(staff)
+
+    if level in ["breakdown", "task"]:
+        breakdown = get_state("selected_breakdown")
+        if breakdown:
+            crumbs.append(breakdown)
+
+    if level == "task":
+        task = get_state("selected_task")
+        if task:
+            crumbs.append(task)
     
     return crumbs
 
@@ -117,25 +138,64 @@ def drill_to_department(department: str):
     set_state("drill_level", "department")
     set_state("selected_department", department)
     set_state("selected_category", None)
+    set_state("selected_staff", None)
+    set_state("selected_breakdown", None)
+    set_state("selected_task", None)
 
 
 def drill_to_category(category: str):
     """Drill down to category level."""
     set_state("drill_level", "category")
     set_state("selected_category", category)
+    set_state("selected_staff", None)
+    set_state("selected_breakdown", None)
+    set_state("selected_task", None)
+
+
+def drill_to_staff(staff_name: str):
+    """Drill down to staff level."""
+    set_state("drill_level", "staff")
+    set_state("selected_staff", staff_name)
+    set_state("selected_breakdown", None)
+    set_state("selected_task", None)
+
+
+def drill_to_breakdown(breakdown: str):
+    """Drill down to breakdown level."""
+    set_state("drill_level", "breakdown")
+    set_state("selected_breakdown", breakdown)
+    set_state("selected_task", None)
+
+
+def drill_to_task(task_name: str):
+    """Drill down to task level."""
+    set_state("drill_level", "task")
+    set_state("selected_task", task_name)
 
 
 def drill_up():
     """Drill up one level."""
     level = get_drill_level()
     
-    if level == "category":
+    if level == "task":
+        set_state("drill_level", "breakdown")
+        set_state("selected_task", None)
+    elif level == "breakdown":
+        set_state("drill_level", "staff")
+        set_state("selected_breakdown", None)
+    elif level == "staff":
+        set_state("drill_level", "category")
+        set_state("selected_staff", None)
+    elif level == "category":
         set_state("drill_level", "department")
         set_state("selected_category", None)
     elif level == "department":
         set_state("drill_level", "company")
         set_state("selected_department", None)
         set_state("selected_category", None)
+        set_state("selected_staff", None)
+        set_state("selected_breakdown", None)
+        set_state("selected_task", None)
 
 
 def reset_drill():
@@ -143,6 +203,9 @@ def reset_drill():
     set_state("drill_level", "company")
     set_state("selected_department", None)
     set_state("selected_category", None)
+    set_state("selected_staff", None)
+    set_state("selected_breakdown", None)
+    set_state("selected_task", None)
 
 
 # =============================================================================
@@ -167,15 +230,30 @@ def get_drill_filter() -> Dict[str, Any]:
     
     filters = {}
     
-    if level in ["department", "category"]:
+    if level in ["department", "category", "staff", "breakdown", "task"]:
         dept = get_state("selected_department")
         if dept:
             filters["department_final"] = dept
     
-    if level == "category":
+    if level in ["category", "staff", "breakdown", "task"]:
         cat = get_state("selected_category")
         if cat:
-            filters["job_category"] = cat
+            filters["category_rev_job"] = cat
+
+    if level in ["staff", "breakdown", "task"]:
+        staff = get_state("selected_staff")
+        if staff:
+            filters["staff_name"] = staff
+
+    if level in ["breakdown", "task"]:
+        breakdown = get_state("selected_breakdown")
+        if breakdown:
+            filters["breakdown"] = breakdown
+
+    if level == "task":
+        task = get_state("selected_task")
+        if task:
+            filters["task_name"] = task
     
     return filters
 
@@ -186,8 +264,13 @@ def apply_drill_filter(df, filters: Optional[Dict] = None):
         filters = get_drill_filter()
     
     for col, value in filters.items():
-        if col in df.columns and value is not None:
+        if value is None:
+            continue
+        if col in df.columns:
             df = df[df[col] == value]
+            continue
+        if col == "category_rev_job" and "job_category" in df.columns:
+            df = df[df["job_category"] == value]
     
     return df
 

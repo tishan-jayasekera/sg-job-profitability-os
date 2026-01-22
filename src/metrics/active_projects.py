@@ -14,6 +14,7 @@ from src.data.job_lifecycle import (
     get_job_staff_attribution,
     get_job_burn_rate
 )
+from src.data.semantic import get_category_col
 from src.config import config
 
 
@@ -31,7 +32,8 @@ def get_active_jobs_table(df: pd.DataFrame,
     if department:
         df_filtered = df_filtered[df_filtered["department_final"] == department]
     if category:
-        df_filtered = df_filtered[df_filtered["job_category"] == category]
+        category_col = get_category_col(df_filtered)
+        df_filtered = df_filtered[df_filtered[category_col] == category]
     
     return get_active_jobs_with_metrics(df_filtered, recency_days)
 
