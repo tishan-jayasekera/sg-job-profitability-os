@@ -1,0 +1,182 @@
+"""
+Rate capture metrics pack.
+
+Single source of truth for: quote rate, realised rate, rate variance.
+"""
+import pandas as pd
+import numpy as np
+from typing import Optional, List, Dict
+
+from src.data.semantic import safe_quote_rollup
+
+
+def compute_rate_metrics(df: pd.DataFrame,
+                         group_keys: Optional[List[str]] = None) -> pd.DataFrame:
+    """
+    Compute rate capture metrics.
+    
+    Returns DataFrame with:
+    - quote_rate: quoted_amount / quoted_hours (safe rollup)
+    - realised_rate: revenue / hours
+    - rate_variance: realised_rate - quote_rate
+    - hours, revenue, quoted_hours, quoted_amount
+    """
+    # Safe quote rollup
+    quote = safe_quote_rollup(df, group_keys if group_keys else [])
+    
+    # Profitability metrics for realised rate
+    if group_keys:
+        actuals = df.groupby(group_keys).agg(
+            hours=("hours_raw", "sum"),
+            revenue=("rev_alloc", "sum"),
+        ).reset_index()
+    else:
+        actuals = pd.DataFrame([{
+            "hours": df["hours_raw"].sum(),
+            "revenue": df["rev_alloc"].sum(),
+        }])
+    
+    # Merge
+    if group_keys:
+        result = actuals.merge(
+            quote[group_keys + ["quoted_hours", "quoted_amount", "quote_rate"]],
+            on=group_keys,
+            how="outer"
+        )
+    else:
+        result = actuals.copy()
+        result["quoted_hours"] = quote["quoted_hours"].iloc[0] if len(quote) > 0 else 0
+        result["quoted_amount"] = quote["quoted_amount"].iloc[0] if len(quote) > 0 else 0
+        result["quote_rate"] = quote["quote_rate"].iloc[0] if len(quote) > 0 else np.nan
+    
+    # Realised rate
+    result["realised_rate"] = np.where(
+        result["hours"] > 0,
+        result["revenue"] / result["hours"],
+        np.nan
+    )
+    
+    # Rate variance
+    result["rate_variance"] = result["realised_rate"] - result["quote_rate"]
+    
+    # Rate capture % (realised as % of quote)
+    result["rate_capture_pct"] = np.where(
+        result["quote_rate"] > 0,
+        result["realised_rate"] / result["quote_rate"] * 100,
+        np.nan
+    )
+    
+    return result
+
+
+def compute_weighted_rates(df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Compute hours-weighted average rates for summary display.
+    
+    Returns dict with:
+    - quote_rate_wtd: hours-weighted quote rate
+    - realised_rate_wtd: hours-weighted realised rate
+    - rate_variance_wtd: weighted variance
+    """
+    rates = compute_rate_metrics(df)
+    
+    return {
+        "quote_rate_wtd": rates["quote_rate"].iloc[0] if len(rates) > 0 else np.nan,
+        "realised_rate_wtd": rates["realised_rate"].iloc[0] if len(rates) > 0 else np.nan,
+        "rate_variance_wtd": rates["rate_variance"].iloc[0] if len(rates) > 0 else np.nan,
+        "rate_capture_pct": rates["rate_capture_pct"].iloc[0] if len(rates) > 0 else np.nan,
+    }
+
+
+def compute_rate_distribution(df: pd.DataFrame,
+                              group_key: str = "job_no") -> pd.DataFrame:
+    """
+    Compute rate distribution at a given grain.
+    
+    Returns stats for both quote rate and realised rate.
+    """
+    rates = compute_rate_metrics(df, [group_key])
+    
+    # Filter to valid rates
+    valid_quote = rates[rates["quote_rate"].notna()]
+    valid_realised = rates[rates["realised_rate"].notna()]
+    
+    result = {
+        "n_quote": len(valid_quote),
+        "quote_rate_mean": valid_quote["quote_rate"].mean(),
+        "quote_rate_median": valid_quote["quote_rate"].median(),
+        "quote_rate_std": valid_quote["quote_rate"].std(),
+        "quote_rate_p25": valid_quote["quote_rate"].quantile(0.25),
+        "quote_rate_p75": valid_quote["quote_rate"].quantile(0.75),
+        
+        "n_realised": len(valid_realised),
+        "realised_rate_mean": valid_realised["realised_rate"].mean(),
+        "realised_rate_median": valid_realised["realised_rate"].median(),
+        "realised_rate_std": valid_realised["realised_rate"].std(),
+        "realised_rate_p25": valid_realised["realised_rate"].quantile(0.25),
+        "realised_rate_p75": valid_realised["realised_rate"].quantile(0.75),
+    }
+    
+    return pd.DataFrame([result])
+
+
+def compute_rate_leakage(df: pd.DataFrame,
+                         group_keys: Optional[List[str]] = None,
+                         threshold: float = -10) -> pd.DataFrame:
+    """
+    Identify rate leakage (negative rate variance).
+    
+    Args:
+        threshold: Rate variance threshold below which is considered leakage
+    
+    Returns DataFrame with leakage analysis.
+    """
+    rates = compute_rate_metrics(df, group_keys)
+    
+    # Flag leakage
+    rates["has_leakage"] = rates["rate_variance"] < threshold
+    
+    # Quantify leakage impact
+    rates["leakage_per_hour"] = np.where(
+        rates["rate_variance"] < 0,
+        rates["rate_variance"],
+        0
+    )
+    rates["total_leakage"] = rates["leakage_per_hour"] * rates["hours"]
+    
+    return rates
+
+
+def get_rate_capture_summary(df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Get summary rate capture metrics as a dictionary.
+    """
+    rates = compute_rate_metrics(df)
+    
+    row = rates.iloc[0] if len(rates) > 0 else {}
+    
+    return {
+        "quote_rate": row.get("quote_rate", np.nan),
+        "realised_rate": row.get("realised_rate", np.nan),
+        "rate_variance": row.get("rate_variance", np.nan),
+        "rate_capture_pct": row.get("rate_capture_pct", np.nan),
+        "hours": row.get("hours", 0),
+        "revenue": row.get("revenue", 0),
+        "quoted_hours": row.get("quoted_hours", 0),
+        "quoted_amount": row.get("quoted_amount", 0),
+    }
+
+
+def get_top_rate_leakage(df: pd.DataFrame,
+                         group_key: str,
+                         n: int = 10) -> pd.DataFrame:
+    """
+    Get top groups by rate leakage (worst rate capture).
+    """
+    rates = compute_rate_metrics(df, [group_key])
+    
+    # Filter to negative variance
+    leakage = rates[rates["rate_variance"] < 0].copy()
+    leakage["total_leakage"] = leakage["rate_variance"] * leakage["hours"]
+    
+    return leakage.nsmallest(n, "total_leakage")
