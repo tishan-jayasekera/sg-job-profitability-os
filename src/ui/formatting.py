@@ -3,7 +3,12 @@ Consistent number and display formatting.
 """
 import pandas as pd
 import numpy as np
-from typing import Union, Optional
+from typing import Union, Optional, Any
+
+try:
+    from pandas.io.formats.style import Styler
+except Exception:
+    Styler = Any  # type: ignore[misc]
 
 
 # =============================================================================
@@ -172,7 +177,7 @@ def format_metric_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def style_metric_df(df: pd.DataFrame) -> pd.io.formats.style.Styler:
+def style_metric_df(df: pd.DataFrame) -> "Styler":
     """
     Apply conditional styling to metrics dataframe.
     """
