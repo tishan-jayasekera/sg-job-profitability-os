@@ -737,6 +737,34 @@ Operational signals:
         col1, col2 = st.columns(2)
 
         with col1:
+            dept_summary = compute_capacity_summary(df_window, "department_final", df_base=df_window)
+            if len(dept_summary) > 0:
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Bar(
+                        x=dept_summary["department_final"],
+                        y=dept_summary["actual_hours"],
+                        name="Actual Hours",
+                        marker_color="#4c78a8",
+                    )
+                )
+                fig.add_trace(
+                    go.Bar(
+                        x=dept_summary["department_final"],
+                        y=dept_summary["slack_hours"],
+                        name="Slack Hours",
+                        marker_color="#e45756",
+                    )
+                )
+                fig.update_layout(
+                    title="Capacity Composition by Department",
+                    yaxis=dict(title="Hours"),
+                    barmode="stack",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
             fig = go.Figure()
             fig.add_trace(
                 go.Scatter(
@@ -763,7 +791,9 @@ Operational signals:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-        with col2:
+        col1, col2 = st.columns(2)
+
+        with col1:
             fig = go.Figure()
             fig.add_trace(
                 go.Scatter(
