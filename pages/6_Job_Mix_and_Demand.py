@@ -1103,6 +1103,11 @@ and prevents double counting staff who work across multiple areas.
                 st.plotly_chart(fig, use_container_width=True, key=f"drill_stack_{next_level[0]}")
 
         st.subheader("Slack Hotspots (Current Selection)")
+        st.caption(
+            "Slack is derived from timesheet hours. Each staff member's monthly capacity is allocated "
+            "across departments/categories/tasks based on where their hours went, so cross‑department work "
+            "is captured and totals reconcile."
+        )
         hotspot_levels = [
             ("department_final", "Department"),
             (category_col, "Category"),
@@ -1115,6 +1120,22 @@ and prevents double counting staff who work across multiple areas.
             hotspot = compute_capacity_summary(drill_df, col, df_base=df_window)
             if len(hotspot) == 0:
                 continue
+            with st.expander(f"Methodology: {label} slack calculation", expanded=False):
+                st.markdown(
+                    """
+**How slack is allocated**
+- Staff-month capacity = 38 × FTE (default 1.0) × 4.33 weeks
+- Hour share = slice hours / total hours for each staff-month
+- Allocated capacity = staff-month capacity × hour share
+- Slack Hours = allocated capacity − actual hours
+- Slack % = 100% − utilisation
+
+**Why this works**
+- Uses timesheets, so cross‑department work is included.
+- Prevents double counting when staff split across areas.
+- Totals roll up cleanly to company level.
+                    """
+                )
             top_hotspot = hotspot.sort_values("slack_hours", ascending=False).head(8)
             st.markdown(f"**Top Slack by {label}**")
             st.dataframe(
