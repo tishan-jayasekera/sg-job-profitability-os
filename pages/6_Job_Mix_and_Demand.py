@@ -899,6 +899,14 @@ Decision guide:
             """
         )
 
+        st.caption(
+            "Plain-English method: we only count staff who actually logged time in the month. "
+            "Each person has a weekly capacity (38 × FTE). We convert that to monthly hours, "
+            "then compare it to the hours they actually delivered. Slack is the gap. "
+            "When staff work across departments, their capacity is split in proportion to "
+            "where their timesheet hours went, so totals reconcile cleanly."
+        )
+
         with st.expander("Methodology and reconciliation (operational view)", expanded=False):
             st.markdown(
                 """
@@ -966,8 +974,9 @@ and prevents double counting staff who work across multiple areas.
     # =========================================================================
     section_header("Operational Drilldown", "Follow the delivery chain to locate slack or overload")
     st.caption(
-        "This view allocates each staff member's capacity based on where their hours were spent, "
-        "so totals reconcile from company down the chain."
+        "Plain-English method: we only count staff who logged time in the selected period. "
+        "Capacity is allocated based on their timesheet hour share across the chain, "
+        "so the sum of departments/categories equals the company total."
     )
 
     category_col = "category_rev_job" if "category_rev_job" in df_window.columns else get_category_col(df_window)
