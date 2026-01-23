@@ -1154,15 +1154,18 @@ and prevents double counting staff who work across multiple areas.
                     ),
                 )
                 st.markdown(f"**Actionable Why: {label}**")
+                actionable_view = actionable.rename(columns={
+                    col: label,
+                    "job_volume_delta": "Job Volume Δ",
+                    "billable_ratio": "Billable Ratio",
+                    "slack_hours": "Slack Hours",
+                    "slack_pct": "Slack %",
+                    "why_flag": "Likely Driver",
+                })[
+                    [label, "Slack Hours", "Slack %", "Job Volume Δ", "Billable Ratio", "Likely Driver"]
+                ]
                 st.dataframe(
-                    actionable.rename(columns={
-                        col: label,
-                        "job_volume_delta": "Job Volume Δ",
-                        "billable_ratio": "Billable Ratio",
-                        "why_flag": "Likely Driver",
-                    })[
-                        [label, "Slack Hours", "Slack %", "Job Volume Δ", "Billable Ratio", "Likely Driver"]
-                    ],
+                    actionable_view,
                     use_container_width=True,
                     hide_index=True,
                     column_config={
