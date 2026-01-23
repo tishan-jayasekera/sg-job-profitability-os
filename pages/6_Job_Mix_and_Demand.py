@@ -6,6 +6,7 @@ Analyze job intake patterns and implied capacity demand.
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.graph_objects as go
 from pathlib import Path
 import sys
 
@@ -72,14 +73,20 @@ def calculate_job_mix_metrics(df: pd.DataFrame, cohort_df: pd.DataFrame) -> pd.D
         ).reset_index()
     else:
         job_quotes = pd.DataFrame({"job_no": [], "quoted_hours": [], "quoted_amount": []})
+
+    job_actuals = df.groupby("job_no", dropna=False).agg(
+        actual_hours=("hours_raw", "sum"),
+    ).reset_index()
     
     # Merge
     jobs = job_attrs.merge(cohort_df, on="job_no", how="inner")
     jobs = jobs.merge(job_quotes, on="job_no", how="left")
+    jobs = jobs.merge(job_actuals, on="job_no", how="left")
     
     # Fill NaN
     jobs["quoted_hours"] = jobs["quoted_hours"].fillna(0)
     jobs["quoted_amount"] = jobs["quoted_amount"].fillna(0)
+    jobs["actual_hours"] = jobs["actual_hours"].fillna(0)
     
     # Aggregate by cohort month
     monthly = jobs.groupby("cohort_month").agg(
@@ -88,19 +95,34 @@ def calculate_job_mix_metrics(df: pd.DataFrame, cohort_df: pd.DataFrame) -> pd.D
         total_quoted_amount=("quoted_amount", "sum"),
         avg_quoted_hours=("quoted_hours", "mean"),
         avg_quoted_amount=("quoted_amount", "mean"),
+        total_actual_hours=("actual_hours", "sum"),
+        avg_actual_hours=("actual_hours", "mean"),
     ).reset_index()
-    
+
     # Derived metrics
-    monthly["value_per_hour"] = np.where(
+    monthly["value_per_quoted_hour"] = np.where(
         monthly["total_quoted_hours"] > 0,
         monthly["total_quoted_amount"] / monthly["total_quoted_hours"],
+        np.nan
+    )
+
+    monthly["quoted_vs_actual_ratio"] = np.where(
+        monthly["total_actual_hours"] > 0,
+        monthly["total_quoted_hours"] / monthly["total_actual_hours"],
         np.nan
     )
     
     # Implied FTE demand
     # FTE = quoted_hours / (weeks_in_month * 38)
     weeks_per_month = 4.33
-    monthly["implied_fte"] = monthly["total_quoted_hours"] / (weeks_per_month * config.CAPACITY_HOURS_PER_WEEK)
+    monthly["implied_fte_quoted"] = (
+        monthly["total_quoted_hours"] / (weeks_per_month * config.CAPACITY_HOURS_PER_WEEK)
+    )
+    monthly["implied_fte_actual"] = (
+        monthly["total_actual_hours"] / (weeks_per_month * config.CAPACITY_HOURS_PER_WEEK)
+    )
+
+    monthly["cohort_month"] = pd.to_datetime(monthly["cohort_month"])
     
     return monthly.sort_values("cohort_month")
 
@@ -113,6 +135,7 @@ def calculate_demand_vs_supply(df: pd.DataFrame, monthly_metrics: pd.DataFrame) 
     staff_months = df.groupby(["month_key", "staff_name"]).agg(
         fte_scaling=("fte_hours_scaling", "first"),
     ).reset_index()
+    staff_months["fte_scaling"] = staff_months["fte_scaling"].fillna(config.DEFAULT_FTE_SCALING)
     
     supply = staff_months.groupby("month_key").agg(
         staff_count=("staff_name", "nunique"),
@@ -132,13 +155,20 @@ def calculate_demand_vs_supply(df: pd.DataFrame, monthly_metrics: pd.DataFrame) 
     )
     
     # Calculate slack
-    comparison["implied_utilisation"] = np.where(
+    comparison["implied_utilisation_quoted"] = np.where(
         comparison["supply_capacity_hours"] > 0,
         comparison["total_quoted_hours"] / comparison["supply_capacity_hours"] * 100,
         np.nan
     )
-    
-    comparison["slack_pct"] = 100 - comparison["implied_utilisation"]
+
+    comparison["implied_utilisation_actual"] = np.where(
+        comparison["supply_capacity_hours"] > 0,
+        comparison["total_actual_hours"] / comparison["supply_capacity_hours"] * 100,
+        np.nan
+    )
+
+    comparison["slack_pct_quoted"] = 100 - comparison["implied_utilisation_quoted"]
+    comparison["slack_pct_actual"] = 100 - comparison["implied_utilisation_actual"]
     
     return comparison
 
@@ -195,14 +225,16 @@ def main():
     # =========================================================================
     section_header("Job Mix Summary")
     
-    kpi_cols = st.columns(6)
+    kpi_cols = st.columns(8)
     
     total_jobs = monthly_metrics["job_count"].sum()
     total_quoted_hours = monthly_metrics["total_quoted_hours"].sum()
     total_quoted_amount = monthly_metrics["total_quoted_amount"].sum()
+    total_actual_hours = monthly_metrics["total_actual_hours"].sum()
     avg_hours_per_job = total_quoted_hours / total_jobs if total_jobs > 0 else 0
     avg_amount_per_job = total_quoted_amount / total_jobs if total_jobs > 0 else 0
-    value_per_hour = total_quoted_amount / total_quoted_hours if total_quoted_hours > 0 else 0
+    value_per_quoted_hour = total_quoted_amount / total_quoted_hours if total_quoted_hours > 0 else 0
+    quoted_vs_actual_ratio = total_quoted_hours / total_actual_hours if total_actual_hours > 0 else np.nan
     
     with kpi_cols[0]:
         st.metric("Jobs", fmt_count(total_jobs))
@@ -220,7 +252,24 @@ def main():
         st.metric("Avg Hrs/Job", fmt_hours(avg_hours_per_job))
     
     with kpi_cols[5]:
-        st.metric("$/Hour", fmt_currency(value_per_hour))
+        st.metric("Total Actual Hours", fmt_hours(total_actual_hours))
+
+    with kpi_cols[6]:
+        st.metric("Quoted/Actual Hrs", f"{quoted_vs_actual_ratio:.2f}x" if pd.notna(quoted_vs_actual_ratio) else "—")
+
+    with kpi_cols[7]:
+        st.metric("$/Quoted Hr", fmt_currency(value_per_quoted_hour))
+
+    with st.expander("How these are calculated", expanded=False):
+        st.markdown(
+            """
+- Total Quoted Hours = sum of `quoted_time_total` by job
+- Total Actual Hours = sum of `hours_raw` by job
+- Avg $/Job = Total Quoted $ / Jobs
+- $/Quoted Hr = Total Quoted $ / Total Quoted Hours
+- Quoted vs Actual = Total Quoted Hours / Total Actual Hours
+            """
+        )
     
     st.markdown("---")
     
@@ -232,44 +281,90 @@ def main():
     col1, col2 = st.columns(2)
     
     with col1:
-        # Job count trend
-        fig = time_series(
-            monthly_metrics,
-            x="cohort_month",
-            y="job_count",
-            title="Jobs per Month",
-            y_title="Job Count"
+        fig = go.Figure()
+        fig.add_bar(
+            x=monthly_metrics["cohort_month"],
+            y=monthly_metrics["job_count"],
+            name="Jobs",
+            marker_color="#4c78a8",
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=monthly_metrics["cohort_month"],
+                y=monthly_metrics["avg_quoted_amount"],
+                name="Avg Quote Value",
+                yaxis="y2",
+                mode="lines+markers",
+                line=dict(color="#f58518", width=2),
+            )
+        )
+        fig.update_layout(
+            title="Job Volume vs Quote Value",
+            yaxis=dict(title="Jobs"),
+            yaxis2=dict(title="Avg Quote Value ($)", overlaying="y", side="right"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
         st.plotly_chart(fig, use_container_width=True)
-        
-        # Avg hours per job
-        fig = time_series(
-            monthly_metrics,
-            x="cohort_month",
-            y="avg_quoted_hours",
-            title="Avg Quoted Hours per Job",
-            y_title="Hours"
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=monthly_metrics["cohort_month"],
+                y=monthly_metrics["avg_quoted_hours"],
+                name="Avg Quoted Hours",
+                mode="lines+markers",
+                line=dict(color="#54a24b", width=2),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=monthly_metrics["cohort_month"],
+                y=monthly_metrics["avg_actual_hours"],
+                name="Avg Actual Hours",
+                mode="lines+markers",
+                line=dict(color="#e45756", width=2),
+            )
+        )
+        fig.update_layout(
+            title="Avg Hours per Job: Quoted vs Actual",
+            yaxis=dict(title="Hours"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
         st.plotly_chart(fig, use_container_width=True)
     
     with col2:
-        # Avg value per job
-        fig = time_series(
-            monthly_metrics,
-            x="cohort_month",
-            y="avg_quoted_amount",
-            title="Avg Quoted Value per Job",
-            y_title="$"
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=monthly_metrics["cohort_month"],
+                y=monthly_metrics["total_quoted_hours"],
+                name="Quoted Hours",
+                mode="lines+markers",
+                line=dict(color="#72b7b2", width=2),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=monthly_metrics["cohort_month"],
+                y=monthly_metrics["total_actual_hours"],
+                name="Actual Hours",
+                mode="lines+markers",
+                line=dict(color="#b279a2", width=2),
+            )
+        )
+        fig.update_layout(
+            title="Total Hours: Quoted vs Actual",
+            yaxis=dict(title="Hours"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         )
         st.plotly_chart(fig, use_container_width=True)
-        
-        # Value per hour
+
         fig = time_series(
             monthly_metrics,
             x="cohort_month",
-            y="value_per_hour",
+            y="value_per_quoted_hour",
             title="Value per Quoted Hour",
-            y_title="$/hr"
+            y_title="$/hr",
         )
         st.plotly_chart(fig, use_container_width=True)
     
@@ -348,30 +443,64 @@ def main():
     # =========================================================================
     section_header("Demand vs Supply", "Implied capacity use and slack")
     
-    if len(demand_supply) > 0 and "implied_utilisation" in demand_supply.columns:
+    if len(demand_supply) > 0 and "implied_utilisation_quoted" in demand_supply.columns:
         col1, col2 = st.columns(2)
         
         with col1:
-            # Implied FTE trend
-            fig = time_series(
-                demand_supply,
-                x="cohort_month",
-                y="implied_fte",
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=demand_supply["cohort_month"],
+                    y=demand_supply["implied_fte_quoted"],
+                    name="Implied FTE (Quoted)",
+                    mode="lines+markers",
+                    line=dict(color="#4c78a8", width=2),
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=demand_supply["cohort_month"],
+                    y=demand_supply["implied_fte_actual"],
+                    name="Implied FTE (Actual)",
+                    mode="lines+markers",
+                    line=dict(color="#f58518", width=2),
+                )
+            )
+            fig.update_layout(
                 title="Implied FTE Demand",
-                y_title="FTE"
+                yaxis=dict(title="FTE"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
             st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            # Implied capacity use
-            demand_supply_valid = demand_supply.dropna(subset=["implied_utilisation"])
+            demand_supply_valid = demand_supply.dropna(
+                subset=["implied_utilisation_quoted", "implied_utilisation_actual"]
+            )
             if len(demand_supply_valid) > 0:
-                fig = time_series(
-                    demand_supply_valid,
-                    x="cohort_month",
-                    y="implied_utilisation",
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Scatter(
+                        x=demand_supply_valid["cohort_month"],
+                        y=demand_supply_valid["implied_utilisation_quoted"],
+                        name="Capacity Use (Quoted)",
+                        mode="lines+markers",
+                        line=dict(color="#54a24b", width=2),
+                    )
+                )
+                fig.add_trace(
+                    go.Scatter(
+                        x=demand_supply_valid["cohort_month"],
+                        y=demand_supply_valid["implied_utilisation_actual"],
+                        name="Capacity Use (Actual)",
+                        mode="lines+markers",
+                        line=dict(color="#e45756", width=2),
+                    )
+                )
+                fig.update_layout(
                     title="Implied Capacity Use (%)",
-                    y_title="%"
+                    yaxis=dict(title="%"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 )
                 # Add 100% reference line
                 fig.add_hline(y=100, line_dash="dash", line_color="red",
@@ -379,20 +508,28 @@ def main():
                 st.plotly_chart(fig, use_container_width=True)
         
         # Summary
-        avg_implied_util = demand_supply["implied_utilisation"].mean()
-        avg_slack = demand_supply["slack_pct"].mean()
+        avg_implied_util = demand_supply["implied_utilisation_quoted"].mean()
+        avg_actual_util = demand_supply["implied_utilisation_actual"].mean()
+        avg_slack = demand_supply["slack_pct_quoted"].mean()
+        avg_slack_actual = demand_supply["slack_pct_actual"].mean()
         
-        slack_cols = st.columns(2)
+        slack_cols = st.columns(4)
         
         with slack_cols[0]:
-            st.metric("Avg Capacity Use", fmt_percent(avg_implied_util))
+            st.metric("Avg Capacity Use (Quoted)", fmt_percent(avg_implied_util))
         
         with slack_cols[1]:
-            st.metric("Avg Slack", fmt_percent(avg_slack))
+            st.metric("Avg Capacity Use (Actual)", fmt_percent(avg_actual_util))
+
+        with slack_cols[2]:
+            st.metric("Avg Slack (Quoted)", fmt_percent(avg_slack))
+
+        with slack_cols[3]:
+            st.metric("Avg Slack (Actual)", fmt_percent(avg_slack_actual))
         
         if avg_slack > 20:
             st.info(f"""
-            **Slack Analysis:** {avg_slack:.1f}% average slack suggests capacity exceeds demand.
+            **Slack Analysis:** {avg_slack:.1f}% average quoted slack suggests capacity exceeds demand.
             This could indicate:
             - Fewer jobs coming in
             - Smaller job sizes
@@ -401,12 +538,61 @@ def main():
             """)
         elif avg_slack < 0:
             st.warning(f"""
-            **Capacity Constraint:** Negative slack ({avg_slack:.1f}%) indicates demand exceeds capacity.
+            **Capacity Constraint:** Negative quoted slack ({avg_slack:.1f}%) indicates demand exceeds capacity.
             Consider:
             - Hiring additional staff
             - Outsourcing or partnerships
             - Prioritizing higher-value work
             """)
+
+    st.markdown("---")
+
+    # =========================================================================
+    # SECTION E: SO WHAT (CONSULTANT VIEW)
+    # =========================================================================
+    section_header("So What", "What the trend implies about pricing vs delivery")
+
+    monthly_sorted = monthly_metrics.sort_values("cohort_month")
+    if len(monthly_sorted) >= 6:
+        recent = monthly_sorted.tail(3)
+        prior = monthly_sorted.tail(6).head(3)
+
+        recent_jobs = recent["job_count"].mean()
+        prior_jobs = prior["job_count"].mean()
+        recent_quote = recent["avg_quoted_amount"].mean()
+        prior_quote = prior["avg_quoted_amount"].mean()
+        recent_ratio = (
+            recent["total_quoted_hours"].sum() / recent["total_actual_hours"].sum()
+            if recent["total_actual_hours"].sum() > 0 else np.nan
+        )
+        prior_ratio = (
+            prior["total_quoted_hours"].sum() / prior["total_actual_hours"].sum()
+            if prior["total_actual_hours"].sum() > 0 else np.nan
+        )
+
+        jobs_delta = (recent_jobs - prior_jobs) / prior_jobs if prior_jobs > 0 else np.nan
+        quote_delta = (recent_quote - prior_quote) / prior_quote if prior_quote > 0 else np.nan
+        ratio_delta = recent_ratio - prior_ratio if pd.notna(recent_ratio) and pd.notna(prior_ratio) else np.nan
+
+        jobs_delta_text = fmt_percent(jobs_delta * 100) if pd.notna(jobs_delta) else "n/a"
+        quote_delta_text = fmt_percent(quote_delta * 100) if pd.notna(quote_delta) else "n/a"
+        ratio_delta_text = f"{ratio_delta:+.2f}x" if pd.notna(ratio_delta) else "n/a"
+
+        st.info(
+            f"""
+**Recent 3 months vs prior 3 months**
+- Job volume change: {jobs_delta_text}
+- Avg quote value change: {quote_delta_text}
+- Quoted vs actual hours ratio change: {ratio_delta_text}
+
+**Interpretation**
+- If job volume is falling while quote value rises, you are winning fewer, larger jobs.
+- If quoted vs actual ratio is < 1.0, delivery is heavier than quoted (margin compression).
+- If quoted vs actual ratio is > 1.0, quotes exceed delivery (potential slack/underutilisation).
+            """
+        )
+    else:
+        st.caption("Need at least 6 months of data to compute the trend comparison.")
 
 
 if __name__ == "__main__":
