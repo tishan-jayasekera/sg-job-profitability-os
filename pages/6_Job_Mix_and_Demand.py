@@ -173,6 +173,51 @@ def calculate_demand_vs_supply(df: pd.DataFrame, monthly_metrics: pd.DataFrame) 
     return comparison
 
 
+def calculate_capacity_vs_delivery(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate operational capacity vs delivered hours by calendar month."""
+    staff_months = df.groupby(["month_key", "staff_name"]).agg(
+        fte_scaling=("fte_hours_scaling", "first"),
+    ).reset_index()
+    staff_months["fte_scaling"] = staff_months["fte_scaling"].fillna(config.DEFAULT_FTE_SCALING)
+
+    supply = staff_months.groupby("month_key").agg(
+        staff_count=("staff_name", "nunique"),
+        avg_fte=("fte_scaling", "mean"),
+    ).reset_index()
+
+    weeks_per_month = 4.33
+    supply["supply_fte"] = supply["staff_count"] * supply["avg_fte"]
+    supply["capacity_hours"] = supply["supply_fte"] * weeks_per_month * config.CAPACITY_HOURS_PER_WEEK
+
+    delivery = df.groupby("month_key").agg(
+        actual_hours=("hours_raw", "sum"),
+    ).reset_index()
+
+    if "is_billable" in df.columns:
+        billable = df[df["is_billable"] == True].groupby("month_key")["hours_raw"].sum()
+        nonbillable = df[df["is_billable"] == False].groupby("month_key")["hours_raw"].sum()
+        delivery = delivery.merge(billable.rename("billable_hours"), on="month_key", how="left")
+        delivery = delivery.merge(nonbillable.rename("nonbillable_hours"), on="month_key", how="left")
+        delivery["billable_hours"] = delivery["billable_hours"].fillna(0)
+        delivery["nonbillable_hours"] = delivery["nonbillable_hours"].fillna(0)
+    else:
+        delivery["billable_hours"] = 0
+        delivery["nonbillable_hours"] = 0
+
+    capacity = supply.merge(delivery, on="month_key", how="left")
+    capacity["actual_hours"] = capacity["actual_hours"].fillna(0)
+    capacity["utilisation_pct"] = np.where(
+        capacity["capacity_hours"] > 0,
+        capacity["actual_hours"] / capacity["capacity_hours"] * 100,
+        np.nan,
+    )
+    capacity["slack_hours"] = capacity["capacity_hours"] - capacity["actual_hours"]
+    capacity["slack_pct"] = 100 - capacity["utilisation_pct"]
+    capacity["month_key"] = pd.to_datetime(capacity["month_key"])
+
+    return capacity.sort_values("month_key")
+
+
 def main():
     st.title("Job Mix & Implied FTE Demand")
     st.caption("Analyze job intake patterns and capacity implications")
@@ -221,7 +266,8 @@ def main():
     monthly_metrics["underquoted_hours"] = (
         monthly_metrics["total_actual_hours"] - monthly_metrics["total_quoted_hours"]
     ).clip(lower=0)
-    demand_supply = calculate_demand_vs_supply(df_all, monthly_metrics)
+    capacity_delivery = calculate_capacity_vs_delivery(df_all)
+    capacity_delivery = filter_by_time_window(capacity_delivery, time_window, date_col="month_key")
 
     # Job-level data for loss diagnosis and quadrant drill
     category_col = get_category_col(df_all)
@@ -566,171 +612,157 @@ Operational signals:
     st.markdown("---")
     
     # =========================================================================
-    # SECTION D: DEMAND VS SUPPLY
+    # SECTION D: OPERATIONAL CAPACITY (DELIVERY VS SUPPLY)
     # =========================================================================
-    section_header("Demand vs Supply", "Implied capacity use and slack")
-    
-    if len(demand_supply) > 0 and "implied_utilisation_quoted" in demand_supply.columns:
+    section_header("Operational Capacity", "Actual work delivered vs available capacity")
+
+    if len(capacity_delivery) > 0:
+        growth_pct = st.slider("Sales growth scenario (demand increase)", 0, 50, 0, step=5)
+        capacity_delivery["scenario_hours"] = capacity_delivery["actual_hours"] * (1 + growth_pct / 100)
+        capacity_delivery["scenario_utilisation"] = np.where(
+            capacity_delivery["capacity_hours"] > 0,
+            capacity_delivery["scenario_hours"] / capacity_delivery["capacity_hours"] * 100,
+            np.nan,
+        )
+
         col1, col2 = st.columns(2)
-        
+
         with col1:
             fig = go.Figure()
             fig.add_trace(
                 go.Scatter(
-                    x=demand_supply["cohort_month"],
-                    y=demand_supply["implied_fte_quoted"],
-                    name="Implied FTE (Quoted)",
+                    x=capacity_delivery["month_key"],
+                    y=capacity_delivery["capacity_hours"],
+                    name="Capacity Hours",
                     mode="lines+markers",
                     line=dict(color="#4c78a8", width=2),
                 )
             )
             fig.add_trace(
                 go.Scatter(
-                    x=demand_supply["cohort_month"],
-                    y=demand_supply["implied_fte_actual"],
-                    name="Implied FTE (Actual)",
+                    x=capacity_delivery["month_key"],
+                    y=capacity_delivery["actual_hours"],
+                    name="Actual Delivered Hours",
                     mode="lines+markers",
                     line=dict(color="#f58518", width=2),
                 )
             )
             fig.update_layout(
-                title="Implied FTE Demand",
-                yaxis=dict(title="FTE"),
+                title="Capacity vs Delivered Hours",
+                yaxis=dict(title="Hours"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
             st.plotly_chart(fig, use_container_width=True)
-        
+
         with col2:
-            demand_supply_valid = demand_supply.dropna(
-                subset=["implied_utilisation_quoted", "implied_utilisation_actual"]
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=capacity_delivery["month_key"],
+                    y=capacity_delivery["utilisation_pct"],
+                    name="Utilisation (Actual)",
+                    mode="lines+markers",
+                    line=dict(color="#54a24b", width=2),
+                )
             )
-            if len(demand_supply_valid) > 0:
-                fig = go.Figure()
-                fig.add_trace(
-                    go.Scatter(
-                        x=demand_supply_valid["cohort_month"],
-                        y=demand_supply_valid["implied_utilisation_quoted"],
-                        name="Capacity Use (Quoted)",
-                        mode="lines+markers",
-                        line=dict(color="#54a24b", width=2),
-                    )
+            fig.add_trace(
+                go.Scatter(
+                    x=capacity_delivery["month_key"],
+                    y=capacity_delivery["scenario_utilisation"],
+                    name=f"Utilisation (+{growth_pct}%)",
+                    mode="lines+markers",
+                    line=dict(color="#e45756", width=2, dash="dash"),
                 )
-                fig.add_trace(
-                    go.Scatter(
-                        x=demand_supply_valid["cohort_month"],
-                        y=demand_supply_valid["implied_utilisation_actual"],
-                        name="Capacity Use (Actual)",
-                        mode="lines+markers",
-                        line=dict(color="#e45756", width=2),
-                    )
-                )
-                fig.update_layout(
-                    title="Implied Capacity Use (%)",
-                    yaxis=dict(title="%"),
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                )
-                # Add 100% reference line
-                fig.add_hline(y=100, line_dash="dash", line_color="red",
-                              annotation_text="Full Capacity")
-                st.plotly_chart(fig, use_container_width=True)
-        
-        # Summary
-        avg_implied_util = demand_supply["implied_utilisation_quoted"].mean()
-        avg_actual_util = demand_supply["implied_utilisation_actual"].mean()
-        avg_slack = demand_supply["slack_pct_quoted"].mean()
-        avg_slack_actual = demand_supply["slack_pct_actual"].mean()
-        
-        slack_cols = st.columns(4)
-        
-        with slack_cols[0]:
-            st.metric("Avg Capacity Use (Quoted)", fmt_percent(avg_implied_util))
-        
-        with slack_cols[1]:
-            st.metric("Avg Capacity Use (Actual)", fmt_percent(avg_actual_util))
+            )
+            fig.update_layout(
+                title="Utilisation Under Growth Scenario",
+                yaxis=dict(title="%"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            fig.add_hline(y=100, line_dash="dash", line_color="red",
+                          annotation_text="Full Capacity")
+            st.plotly_chart(fig, use_container_width=True)
 
-        with slack_cols[2]:
-            st.metric("Avg Slack (Quoted)", fmt_percent(avg_slack))
+        latest = capacity_delivery.sort_values("month_key").tail(1)
+        if len(latest) > 0:
+            latest_row = latest.iloc[0]
+            kpi_cols = st.columns(6)
+            with kpi_cols[0]:
+                st.metric("Staff Count", fmt_count(latest_row["staff_count"]))
+            with kpi_cols[1]:
+                st.metric("Avg FTE", f"{latest_row['avg_fte']:.2f}")
+            with kpi_cols[2]:
+                st.metric("Capacity Hours", fmt_hours(latest_row["capacity_hours"]))
+            with kpi_cols[3]:
+                st.metric("Actual Hours", fmt_hours(latest_row["actual_hours"]))
+            with kpi_cols[4]:
+                st.metric("Slack Hours", fmt_hours(latest_row["slack_hours"]))
+            with kpi_cols[5]:
+                st.metric("Utilisation", fmt_percent(latest_row["utilisation_pct"]))
 
-        with slack_cols[3]:
-            st.metric("Avg Slack (Actual)", fmt_percent(avg_slack_actual))
-        
-        if avg_slack > 20:
-            st.info(f"""
-            **Slack Analysis:** {avg_slack:.1f}% average quoted slack suggests capacity exceeds demand.
-            This could indicate:
-            - Fewer jobs coming in
-            - Smaller job sizes
-            - Higher efficiency / fewer hours per job
-            - Opportunity to take on more work or reduce headcount
-            """)
-        elif avg_slack < 0:
-            st.warning(f"""
-            **Capacity Constraint:** Negative quoted slack ({avg_slack:.1f}%) indicates demand exceeds capacity.
-            Consider:
-            - Hiring additional staff
-            - Outsourcing or partnerships
-            - Prioritizing higher-value work
-            """)
+        st.info(
+            """
+Decision guide:
+- If utilisation is consistently low and slack is high, you have capacity — sales/BD focus.
+- If utilisation is near 100% and slack is low/negative, you need hiring or reprioritisation.
+- If utilisation is moderate but billable hours are low, this is a resourcing/ops mix issue.
+            """
+        )
 
-        with st.expander("Methodology and reconciliation", expanded=False):
+        with st.expander("Methodology and reconciliation (operational view)", expanded=False):
             st.markdown(
                 """
-**Demand (Quoted)**
-- Total Quoted Hours = Σ(quoted_time_total) by job in cohort month
-- Implied FTE (Quoted) = Total Quoted Hours / (4.33 × 38)
-
-**Demand (Actual)**
-- Total Actual Hours = Σ(hours_raw) by job in cohort month
-- Implied FTE (Actual) = Total Actual Hours / (4.33 × 38)
-
-**Supply**
+**Supply (Capacity)**
 - Staff Count = unique staff_name with time in month_key
 - Avg FTE = mean fte_hours_scaling (default 1.0 if missing)
-- Supply Capacity Hours = Staff Count × Avg FTE × 4.33 × 38
+- Capacity Hours = Staff Count × Avg FTE × 4.33 × 38
+
+**Demand (Actual Delivery)**
+- Actual Hours = Σ(hours_raw) by month_key
+- Billable / Non‑Billable = Σ(hours_raw) by is_billable flag
 
 **Utilisation & Slack**
-- Capacity Use = Demand Hours / Supply Capacity Hours
-- Slack = 100% − Capacity Use
-
-Note: demand uses cohort month (job intake timing) while supply uses staffing in the same calendar month.
-Interpret this as intake pressure vs available capacity at that time.
+- Utilisation = Actual Hours / Capacity Hours
+- Slack Hours = Capacity Hours − Actual Hours
+- Slack % = 100% − Utilisation
                 """
             )
 
-            latest = demand_supply.sort_values("cohort_month").tail(1)
-            if len(latest) > 0:
-                st.dataframe(
-                    latest[[
-                        "cohort_month",
-                        "total_quoted_hours",
-                        "total_actual_hours",
-                        "staff_count",
-                        "avg_fte",
-                        "supply_capacity_hours",
-                        "implied_utilisation_quoted",
-                        "implied_utilisation_actual",
-                    ]].rename(columns={
-                        "cohort_month": "Month",
-                        "total_quoted_hours": "Quoted Hours",
-                        "total_actual_hours": "Actual Hours",
-                        "staff_count": "Staff",
-                        "avg_fte": "Avg FTE",
-                        "supply_capacity_hours": "Supply Capacity Hours",
-                        "implied_utilisation_quoted": "Capacity Use (Quoted)",
-                        "implied_utilisation_actual": "Capacity Use (Actual)",
-                    }),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Month": st.column_config.DateColumn(format="YYYY-MM"),
-                        "Quoted Hours": st.column_config.NumberColumn(format="%.1f"),
-                        "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
-                        "Avg FTE": st.column_config.NumberColumn(format="%.2f"),
-                        "Supply Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
-                        "Capacity Use (Quoted)": st.column_config.NumberColumn(format="%.1f%%"),
-                        "Capacity Use (Actual)": st.column_config.NumberColumn(format="%.1f%%"),
-                    },
-                )
+            st.dataframe(
+                capacity_delivery[[
+                    "month_key",
+                    "staff_count",
+                    "avg_fte",
+                    "capacity_hours",
+                    "actual_hours",
+                    "billable_hours",
+                    "nonbillable_hours",
+                    "utilisation_pct",
+                    "slack_hours",
+                ]].rename(columns={
+                    "month_key": "Month",
+                    "staff_count": "Staff",
+                    "avg_fte": "Avg FTE",
+                    "capacity_hours": "Capacity Hours",
+                    "actual_hours": "Actual Hours",
+                    "billable_hours": "Billable Hours",
+                    "nonbillable_hours": "Non‑Billable Hours",
+                    "utilisation_pct": "Utilisation",
+                    "slack_hours": "Slack Hours",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Month": st.column_config.DateColumn(format="YYYY-MM"),
+                    "Avg FTE": st.column_config.NumberColumn(format="%.2f"),
+                    "Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Non‑Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Utilisation": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
 
     st.markdown("---")
 
