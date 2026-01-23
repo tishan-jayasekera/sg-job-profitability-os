@@ -218,7 +218,45 @@ def main():
     # Calculate metrics
     monthly_metrics = calculate_job_mix_metrics(df_all, cohort_df)
     monthly_metrics = filter_by_time_window(monthly_metrics, time_window, date_col="cohort_month")
+    monthly_metrics["underquoted_hours"] = (
+        monthly_metrics["total_actual_hours"] - monthly_metrics["total_quoted_hours"]
+    ).clip(lower=0)
     demand_supply = calculate_demand_vs_supply(df_all, monthly_metrics)
+
+    # Job-level data for loss diagnosis and quadrant drill
+    category_col = get_category_col(df_all)
+    job_task = safe_quote_job_task(df_all)
+    if len(job_task) > 0:
+        job_quotes = job_task.groupby("job_no").agg(
+            quoted_hours=("quoted_time_total", "sum"),
+            quoted_amount=("quoted_amount_total", "sum"),
+        ).reset_index()
+    else:
+        job_quotes = pd.DataFrame({"job_no": [], "quoted_hours": [], "quoted_amount": []})
+
+    job_actuals = df_all.groupby("job_no", dropna=False).agg(
+        actual_hours=("hours_raw", "sum"),
+    ).reset_index()
+
+    job_attrs = df_all.groupby("job_no").agg(
+        department_final=("department_final", "first"),
+        job_category=(category_col, "first"),
+    ).reset_index()
+
+    job_level = job_attrs.merge(job_quotes, on="job_no", how="left")
+    job_level = job_level.merge(job_actuals, on="job_no", how="left")
+    job_level = job_level.merge(cohort_df, on="job_no", how="left")
+    job_level["quoted_hours"] = job_level["quoted_hours"].fillna(0)
+    job_level["quoted_amount"] = job_level["quoted_amount"].fillna(0)
+    job_level["actual_hours"] = job_level["actual_hours"].fillna(0)
+    job_level["underquoted_hours"] = (job_level["actual_hours"] - job_level["quoted_hours"]).clip(lower=0)
+    job_level["underquoted_ratio"] = np.where(
+        job_level["actual_hours"] > 0,
+        job_level["quoted_hours"] / job_level["actual_hours"],
+        np.nan,
+    )
+    job_level["cohort_month"] = pd.to_datetime(job_level["cohort_month"])
+    job_level = filter_by_time_window(job_level, time_window, date_col="cohort_month")
     
     # =========================================================================
     # SECTION A: KPI STRIP
@@ -352,6 +390,14 @@ def main():
                 line=dict(color="#b279a2", width=2),
             )
         )
+        fig.add_trace(
+            go.Bar(
+                x=monthly_metrics["cohort_month"],
+                y=monthly_metrics["underquoted_hours"],
+                name="Under-Quoted Hours",
+                marker_color="rgba(228,87,86,0.35)",
+            )
+        )
         fig.update_layout(
             title="Total Hours: Quoted vs Actual",
             yaxis=dict(title="Hours"),
@@ -367,6 +413,35 @@ def main():
             y_title="$/hr",
         )
         st.plotly_chart(fig, use_container_width=True)
+
+    if len(job_level) > 0:
+        top_depts = (
+            job_level.groupby("department_final")["underquoted_hours"]
+            .sum()
+            .sort_values(ascending=False)
+            .head(4)
+            .index
+            .tolist()
+        )
+        dept_month = job_level[job_level["department_final"].isin(top_depts)].groupby(
+            ["cohort_month", "department_final"]
+        )["underquoted_hours"].sum().reset_index()
+        if len(dept_month) > 0:
+            fig = go.Figure()
+            for dept in top_depts:
+                dept_slice = dept_month[dept_month["department_final"] == dept]
+                fig.add_bar(
+                    x=dept_slice["cohort_month"],
+                    y=dept_slice["underquoted_hours"],
+                    name=dept,
+                )
+            fig.update_layout(
+                title="Under-Quoted Hours by Department (Top 4)",
+                yaxis=dict(title="Under-Quoted Hours"),
+                barmode="stack",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig, use_container_width=True)
     
     st.markdown("---")
     
@@ -375,16 +450,9 @@ def main():
     # =========================================================================
     section_header("Job Value vs Effort", "Identify 'high value / low hours' segment")
     
-    # Get job-level data
-    job_task = safe_quote_job_task(df_all)
-    if len(job_task) > 0:
-        job_quotes = job_task.groupby("job_no").agg(
-            quoted_hours=("quoted_time_total", "sum"),
-            quoted_amount=("quoted_amount_total", "sum"),
-        ).reset_index()
-        
-        job_quotes = job_quotes[(job_quotes["quoted_hours"] > 0) & (job_quotes["quoted_amount"] > 0)]
-        
+    if len(job_level) > 0:
+        job_quotes = job_level[(job_level["quoted_hours"] > 0) & (job_level["quoted_amount"] > 0)].copy()
+
         if len(job_quotes) > 5:
             fig = quadrant_scatter(
                 job_quotes,
@@ -393,14 +461,14 @@ def main():
                 hover_name="job_no",
                 title="Job Portfolio: Value vs Effort",
                 x_title="Quoted Hours",
-                y_title="Quoted Amount ($)"
+                y_title="Quoted Amount ($)",
             )
             st.plotly_chart(fig, use_container_width=True)
-            
+
             # Summary stats by quadrant
             med_hours = job_quotes["quoted_hours"].median()
             med_amount = job_quotes["quoted_amount"].median()
-            
+
             job_quotes["quadrant"] = np.where(
                 (job_quotes["quoted_hours"] < med_hours) & (job_quotes["quoted_amount"] > med_amount),
                 "High Value / Low Effort",
@@ -410,30 +478,89 @@ def main():
                     np.where(
                         (job_quotes["quoted_hours"] < med_hours) & (job_quotes["quoted_amount"] <= med_amount),
                         "Low Value / Low Effort",
-                        "Low Value / High Effort"
-                    )
-                )
+                        "Low Value / High Effort",
+                    ),
+                ),
             )
-            
+
             quadrant_summary = job_quotes.groupby("quadrant").agg(
                 jobs=("job_no", "count"),
                 avg_hours=("quoted_hours", "mean"),
                 avg_value=("quoted_amount", "mean"),
             ).reset_index()
-            
+
             st.dataframe(
                 quadrant_summary.rename(columns={
                     "quadrant": "Quadrant",
                     "jobs": "Jobs",
                     "avg_hours": "Avg Hours",
-                    "avg_value": "Avg Value"
+                    "avg_value": "Avg Value",
                 }),
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Avg Hours": st.column_config.NumberColumn(format="%.0f"),
                     "Avg Value": st.column_config.NumberColumn(format="$%.0f"),
-                }
+                },
+            )
+
+            quadrant_options = [
+                "High Value / Low Effort",
+                "High Value / High Effort",
+                "Low Value / Low Effort",
+                "Low Value / High Effort",
+            ]
+            selected_quadrant = st.selectbox(
+                "Inspect Jobs in Quadrant",
+                options=quadrant_options,
+                index=0,
+            )
+
+            quadrant_jobs = job_quotes[job_quotes["quadrant"] == selected_quadrant].copy()
+            quadrant_jobs["quoted_vs_actual"] = np.where(
+                quadrant_jobs["actual_hours"] > 0,
+                quadrant_jobs["quoted_hours"] / quadrant_jobs["actual_hours"],
+                np.nan,
+            )
+
+            st.dataframe(
+                quadrant_jobs.sort_values("quoted_amount", ascending=False)[
+                    [
+                        "job_no",
+                        "department_final",
+                        "job_category",
+                        "quoted_amount",
+                        "quoted_hours",
+                        "actual_hours",
+                        "quoted_vs_actual",
+                    ]
+                ].rename(columns={
+                    "job_no": "Job",
+                    "department_final": "Department",
+                    "job_category": "Category",
+                    "quoted_amount": "Quoted $",
+                    "quoted_hours": "Quoted Hours",
+                    "actual_hours": "Actual Hours",
+                    "quoted_vs_actual": "Quoted/Actual",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Quoted $": st.column_config.NumberColumn(format="$%.0f"),
+                    "Quoted Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Quoted/Actual": st.column_config.NumberColumn(format="%.2fx"),
+                },
+            )
+
+            st.info(
+                """
+Operational signals:
+- High Value / Low Effort: productize and standardize; protect scope and pricing.
+- High Value / High Effort: review estimation, resourcing, and margin guardrails.
+- Low Value / Low Effort: automate or bundle; consider off-peak capacity.
+- Low Value / High Effort: strong candidates for re-pricing or exit.
+                """
             )
     
     st.markdown("---")
@@ -545,6 +672,66 @@ def main():
             - Prioritizing higher-value work
             """)
 
+        with st.expander("Methodology and reconciliation", expanded=False):
+            st.markdown(
+                """
+**Demand (Quoted)**
+- Total Quoted Hours = Σ(quoted_time_total) by job in cohort month
+- Implied FTE (Quoted) = Total Quoted Hours / (4.33 × 38)
+
+**Demand (Actual)**
+- Total Actual Hours = Σ(hours_raw) by job in cohort month
+- Implied FTE (Actual) = Total Actual Hours / (4.33 × 38)
+
+**Supply**
+- Staff Count = unique staff_name with time in month_key
+- Avg FTE = mean fte_hours_scaling (default 1.0 if missing)
+- Supply Capacity Hours = Staff Count × Avg FTE × 4.33 × 38
+
+**Utilisation & Slack**
+- Capacity Use = Demand Hours / Supply Capacity Hours
+- Slack = 100% − Capacity Use
+
+Note: demand uses cohort month (job intake timing) while supply uses staffing in the same calendar month.
+Interpret this as intake pressure vs available capacity at that time.
+                """
+            )
+
+            latest = demand_supply.sort_values("cohort_month").tail(1)
+            if len(latest) > 0:
+                st.dataframe(
+                    latest[[
+                        "cohort_month",
+                        "total_quoted_hours",
+                        "total_actual_hours",
+                        "staff_count",
+                        "avg_fte",
+                        "supply_capacity_hours",
+                        "implied_utilisation_quoted",
+                        "implied_utilisation_actual",
+                    ]].rename(columns={
+                        "cohort_month": "Month",
+                        "total_quoted_hours": "Quoted Hours",
+                        "total_actual_hours": "Actual Hours",
+                        "staff_count": "Staff",
+                        "avg_fte": "Avg FTE",
+                        "supply_capacity_hours": "Supply Capacity Hours",
+                        "implied_utilisation_quoted": "Capacity Use (Quoted)",
+                        "implied_utilisation_actual": "Capacity Use (Actual)",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Month": st.column_config.DateColumn(format="YYYY-MM"),
+                        "Quoted Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Avg FTE": st.column_config.NumberColumn(format="%.2f"),
+                        "Supply Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Capacity Use (Quoted)": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Capacity Use (Actual)": st.column_config.NumberColumn(format="%.1f%%"),
+                    },
+                )
+
     st.markdown("---")
 
     # =========================================================================
@@ -591,6 +778,69 @@ def main():
 - If quoted vs actual ratio is > 1.0, quotes exceed delivery (potential slack/underutilisation).
             """
         )
+
+        loss_dept = job_level.groupby("department_final").agg(
+            jobs=("job_no", "nunique"),
+            actual_hours=("actual_hours", "sum"),
+            underquoted_hours=("underquoted_hours", "sum"),
+        ).reset_index()
+        loss_dept["underquoted_share"] = np.where(
+            loss_dept["actual_hours"] > 0,
+            loss_dept["underquoted_hours"] / loss_dept["actual_hours"],
+            np.nan,
+        )
+        loss_dept = loss_dept.sort_values("underquoted_hours", ascending=False).head(5)
+
+        loss_cat = job_level.groupby("job_category").agg(
+            jobs=("job_no", "nunique"),
+            actual_hours=("actual_hours", "sum"),
+            underquoted_hours=("underquoted_hours", "sum"),
+        ).reset_index()
+        loss_cat["underquoted_share"] = np.where(
+            loss_cat["actual_hours"] > 0,
+            loss_cat["underquoted_hours"] / loss_cat["actual_hours"],
+            np.nan,
+        )
+        loss_cat = loss_cat.sort_values("underquoted_hours", ascending=False).head(5)
+
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Loss Hotspots by Department")
+            st.dataframe(
+                loss_dept.rename(columns={
+                    "department_final": "Department",
+                    "jobs": "Jobs",
+                    "actual_hours": "Actual Hours",
+                    "underquoted_hours": "Under-Quoted Hours",
+                    "underquoted_share": "Under-Quoted Share",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Under-Quoted Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Under-Quoted Share": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+
+        with col2:
+            st.subheader("Loss Hotspots by Job Category")
+            st.dataframe(
+                loss_cat.rename(columns={
+                    "job_category": "Category",
+                    "jobs": "Jobs",
+                    "actual_hours": "Actual Hours",
+                    "underquoted_hours": "Under-Quoted Hours",
+                    "underquoted_share": "Under-Quoted Share",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Under-Quoted Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Under-Quoted Share": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
     else:
         st.caption("Need at least 6 months of data to compute the trend comparison.")
 
