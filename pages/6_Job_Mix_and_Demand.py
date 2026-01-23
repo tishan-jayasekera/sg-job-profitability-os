@@ -919,6 +919,10 @@ and prevents double counting staff who work across multiple areas.
     # SECTION E: OPERATIONAL DRILLDOWN (DEPARTMENT → CATEGORY → STAFF → BREAKDOWN → TASK)
     # =========================================================================
     section_header("Operational Drilldown", "Follow the delivery chain to locate slack or overload")
+    st.caption(
+        "This view allocates each staff member's capacity based on where their hours were spent, "
+        "so totals reconcile from company down the chain."
+    )
 
     category_col = "category_rev_job" if "category_rev_job" in df_window.columns else get_category_col(df_window)
     chain = [
@@ -1026,6 +1030,66 @@ and prevents double counting staff who work across multiple areas.
                         "Avg Staff": st.column_config.NumberColumn(format="%.2f"),
                     },
                 )
+
+                fig = go.Figure()
+                fig.add_trace(
+                    go.Bar(
+                        x=summary[next_level[0]],
+                        y=summary["actual_hours"],
+                        name="Actual Hours",
+                        marker_color="#4c78a8",
+                    )
+                )
+                fig.add_trace(
+                    go.Bar(
+                        x=summary[next_level[0]],
+                        y=summary["slack_hours"],
+                        name="Slack Hours",
+                        marker_color="#e45756",
+                    )
+                )
+                fig.update_layout(
+                    title=f"Capacity Composition by {next_level[1]}",
+                    yaxis=dict(title="Hours"),
+                    barmode="stack",
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                )
+                st.plotly_chart(fig, use_container_width=True, key=f"drill_stack_{next_level[0]}")
+
+        st.subheader("Slack Hotspots (Current Selection)")
+        hotspot_levels = [
+            ("department_final", "Department"),
+            (category_col, "Category"),
+            ("staff_name", "Staff"),
+            ("task_name", "Job Task"),
+        ]
+        for col, label in hotspot_levels:
+            if col not in drill_df.columns:
+                continue
+            hotspot = compute_capacity_summary(drill_df, col, df_base=df_window)
+            if len(hotspot) == 0:
+                continue
+            top_hotspot = hotspot.sort_values("slack_hours", ascending=False).head(8)
+            st.markdown(f"**Top Slack by {label}**")
+            st.dataframe(
+                top_hotspot.rename(columns={
+                    col: label,
+                    "capacity_hours": "Capacity Hours",
+                    "actual_hours": "Actual Hours",
+                    "slack_hours": "Slack Hours",
+                    "slack_pct": "Slack %",
+                    "utilisation_pct": "Utilisation",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Slack %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Utilisation": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
 
     # =========================================================================
     # SECTION F: SO WHAT (CONSULTANT VIEW)
