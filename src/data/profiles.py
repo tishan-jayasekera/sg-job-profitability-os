@@ -420,6 +420,10 @@ def build_staff_profiles(df: pd.DataFrame,
         profile["expected_load_hours"] = profile["expected_load_hours"].fillna(0)
     else:
         profile["expected_load_hours"] = 0
+    if "capacity_hours_window" not in profile.columns:
+        profile["capacity_hours_window"] = 0
+    if "capacity_hours_week" not in profile.columns:
+        profile["capacity_hours_week"] = 0
     if "headroom_hours" in profile.columns:
         profile["headroom_hours"] = profile["headroom_hours"].fillna(0)
     else:
