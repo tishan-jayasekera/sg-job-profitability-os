@@ -306,17 +306,14 @@ def compute_capacity_summary(
         monthly["billable_hours"] = 0
         monthly["nonbillable_hours"] = 0
 
-    agg_dict = {
-        "months": ("month_key", "nunique"),
-        "avg_staff": ("staff_count", "mean"),
-        "capacity_hours": ("capacity_hours", "sum"),
-        "actual_hours": ("actual_hours", "sum"),
-        "billable_hours": ("billable_hours", "sum"),
-        "nonbillable_hours": ("nonbillable_hours", "sum"),
-    }
-    if "job_no" in df.columns:
-        agg_dict["job_count"] = ("job_no", "nunique")
-    summary = monthly.groupby(group_col).agg(**agg_dict).reset_index()
+    summary = monthly.groupby(group_col).agg(
+        months=("month_key", "nunique"),
+        avg_staff=("staff_count", "mean"),
+        capacity_hours=("capacity_hours", "sum"),
+        actual_hours=("actual_hours", "sum"),
+        billable_hours=("billable_hours", "sum"),
+        nonbillable_hours=("nonbillable_hours", "sum"),
+    ).reset_index()
 
     summary["utilisation_pct"] = np.where(
         summary["capacity_hours"] > 0,
