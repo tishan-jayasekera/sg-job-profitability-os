@@ -263,7 +263,12 @@ def compute_capacity_summary(
         config.DEFAULT_FTE_SCALING
     )
 
-    slice_hours = df.groupby([group_col, "staff_name", "month_key"]).agg(
+    group_cols = []
+    for col in [group_col, "staff_name", "month_key"]:
+        if col not in group_cols:
+            group_cols.append(col)
+
+    slice_hours = df.groupby(group_cols).agg(
         slice_hours=("hours_raw", "sum"),
     ).reset_index()
     allocation = slice_hours.merge(
