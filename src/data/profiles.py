@@ -416,7 +416,13 @@ def build_staff_profiles(df: pd.DataFrame,
     profile = profile.merge(archetype, on="staff_name", how="left")
     profile = profile.merge(context, on="staff_name", how="left")
     
-    profile["expected_load_hours"] = profile["expected_load_hours"].fillna(0)
-    profile["headroom_hours"] = profile["headroom_hours"].fillna(0)
+    if "expected_load_hours" in profile.columns:
+        profile["expected_load_hours"] = profile["expected_load_hours"].fillna(0)
+    else:
+        profile["expected_load_hours"] = 0
+    if "headroom_hours" in profile.columns:
+        profile["headroom_hours"] = profile["headroom_hours"].fillna(0)
+    else:
+        profile["headroom_hours"] = 0
     
     return profile
