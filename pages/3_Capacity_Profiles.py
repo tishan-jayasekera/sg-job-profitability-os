@@ -47,7 +47,7 @@ def build_profile_data(df: pd.DataFrame, window_weeks: int, training_months: int
     capacity = compute_staff_capacity(df_window, window_weeks)
     expected = compute_expected_load(df_window, window_weeks, window_weeks)
     headroom = compute_headroom(capacity, expected)
-    return profiles, task_expertise, category_expertise, headroom
+    return profiles, task_expertise, category_expertise, headroom, capacity, expected, df_window
 
 
 def _staff_weekly_series(df: pd.DataFrame, staff_name: str) -> pd.DataFrame:
@@ -81,37 +81,47 @@ def main():
     if selected_dept != "All":
         df = df[df["department_final"] == selected_dept]
     
-    profiles, task_expertise, category_expertise, headroom_df = build_profile_data(
+    profiles, task_expertise, category_expertise, headroom_df, capacity_df, expected_df, df_window = build_profile_data(
         df, window, config.PROFILE_TRAINING_MONTHS
     )
     
+    if len(df_window) == 0:
+        st.warning("No activity found in the selected window.")
+        return
+    
     if len(profiles) == 0:
-        st.warning("No staff data available for this selection.")
+        st.warning("No active staff found in the selected window.")
         return
     
     # Team capacity KPIs
     st.subheader("Team Capacity")
-    kpi_cols = st.columns(4)
+    kpi_cols = st.columns(5)
     total_staff = profiles["staff_name"].nunique()
     total_staff_all = df["staff_name"].nunique() if "staff_name" in df.columns else total_staff
-    total_capacity = profiles["capacity_hours_window"].sum() if "capacity_hours_window" in profiles.columns else 0
-    total_expected = profiles["expected_load_hours"].sum() if "expected_load_hours" in profiles.columns else 0
-    total_headroom = profiles["headroom_hours"].sum() if "headroom_hours" in profiles.columns else 0
+    total_fte = capacity_df["fte_scaling"].sum() if len(capacity_df) > 0 else 0
+    total_capacity_week = total_fte * config.CAPACITY_HOURS_PER_WEEK
+    total_capacity = total_capacity_week * window
+    total_expected = expected_df["expected_load_hours"].sum() if len(expected_df) > 0 else 0
+    total_expected_week = expected_df["avg_weekly_hours"].sum() if len(expected_df) > 0 else 0
+    total_headroom = total_capacity - total_expected
     
     with kpi_cols[0]:
         st.metric("Staff Count", f"{total_staff:,}")
     with kpi_cols[1]:
-        st.metric("Total Capacity", fmt_hours(total_capacity))
+        st.metric("Total FTE", f"{total_fte:.1f}")
     with kpi_cols[2]:
-        st.metric("Expected Load", fmt_hours(total_expected))
+        st.metric("Capacity (Window)", fmt_hours(total_capacity))
     with kpi_cols[3]:
+        st.metric("Expected Load", fmt_hours(total_expected))
+    with kpi_cols[4]:
         st.metric("Headroom", fmt_hours(total_headroom))
     
     with st.expander("Methodology"):
         st.markdown(
             """
             **Capacity = pure supply.**  
-            `Capacity (window) = 38 × fte_hours_scaling × weeks`
+            `Capacity (week) = 38 × fte_hours_scaling`
+            `Capacity (window) = Capacity/week × weeks`
             
             **Expected Load = trailing average.**  
             `Expected Load = avg weekly hours (trailing) × weeks`
@@ -122,6 +132,7 @@ def main():
             """
         )
         st.caption(f"Active staff: {total_staff} of {total_staff_all} in selected department and window.")
+        st.caption(f"Capacity/week: {fmt_hours(total_capacity_week)} | Expected load/week: {fmt_hours(total_expected_week)}")
     
     st.divider()
     

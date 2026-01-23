@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import sys
+import plotly.express as px
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -18,7 +19,7 @@ from src.ui.charts import horizontal_bar, grouped_bar
 from src.data.loader import load_fact_timesheet
 from src.data.semantic import safe_quote_job_task, profitability_rollup, get_category_col
 from src.data.cohorts import get_active_jobs, filter_active_jobs
-from src.metrics.rate_capture import compute_rate_variance_diagnosis
+from src.metrics.rate_capture import compute_rate_variance_diagnosis, compute_rate_metrics
 from src.config import config
 
 
@@ -294,7 +295,67 @@ def main():
     st.markdown("---")
     
     # =========================================================================
-    # SECTION C: RATE VARIANCE DIAGNOSIS
+    # SECTION C: RATE VARIANCE (TOP-DOWN)
+    # =========================================================================
+    section_header("Rate Variance - Top-Down View", "Department -> Category -> Job -> Task -> Staff")
+    
+    category_col = get_category_col(df)
+    keys = ["department_final", category_col, "job_no", "task_name", "staff_name"]
+    rate_tree = compute_rate_metrics(df, keys)
+    if len(rate_tree) > 0:
+        rate_tree["rate_gap"] = rate_tree["rate_variance"] * rate_tree["hours"]
+        rate_tree["rate_gap_abs"] = rate_tree["rate_gap"].abs()
+        rate_tree = rate_tree.rename(columns={category_col: "category"})
+        
+        total_gap = rate_tree["rate_gap"].sum()
+        total_hours = rate_tree["hours"].sum()
+        avg_variance = rate_tree["rate_variance"].mean()
+        
+        kpi_cols = st.columns(3)
+        with kpi_cols[0]:
+            st.metric("Total Rate Gap", fmt_currency(total_gap))
+        with kpi_cols[1]:
+            st.metric("Total Hours", fmt_hours(total_hours))
+        with kpi_cols[2]:
+            st.metric("Avg Rate Var", fmt_rate(avg_variance))
+        
+        tab1, tab2 = st.tabs(["Visual Map", "Driver Tables"])
+        
+        with tab1:
+            fig = px.treemap(
+                rate_tree,
+                path=["department_final", "category", "job_no", "task_name", "staff_name"],
+                values="rate_gap_abs",
+                color="rate_variance",
+                color_continuous_scale="RdBu",
+                color_continuous_midpoint=0,
+            )
+            fig.update_layout(margin=dict(t=30, l=10, r=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with tab2:
+            def top_by(level_keys, label):
+                summary = rate_tree.groupby(level_keys).agg(
+                    rate_gap=("rate_gap", "sum"),
+                    hours=("hours", "sum"),
+                ).reset_index()
+                summary["rate_variance"] = summary["rate_gap"] / summary["hours"].replace(0, np.nan)
+                summary = summary.nsmallest(10, "rate_gap")
+                st.markdown(f"**{label}**")
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+            
+            top_by(["department_final"], "Worst Departments")
+            top_by(["department_final", "category"], "Worst Categories")
+            top_by(["department_final", "category", "job_no"], "Worst Jobs")
+            top_by(["department_final", "category", "job_no", "task_name"], "Worst Tasks")
+            top_by(["department_final", "category", "job_no", "task_name", "staff_name"], "Worst Staff")
+    else:
+        st.info("No rate variance data available.")
+    
+    st.markdown("---")
+    
+    # =========================================================================
+    # SECTION D: RATE VARIANCE DIAGNOSIS
     # =========================================================================
     section_header("Rate Variance Diagnosis", "Identify root causes and actions")
     
@@ -346,7 +407,7 @@ def main():
     st.markdown("---")
     
     # =========================================================================
-    # SECTION D: JOB DETAILS (when selected)
+    # SECTION E: JOB DETAILS (when selected)
     # =========================================================================
     if selection and selection.selection and selection.selection.rows:
         selected_idx = selection.selection.rows[0]
