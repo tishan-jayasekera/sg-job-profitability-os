@@ -1,7 +1,7 @@
 """
 Capacity metrics pack.
 
-Single source of truth for: weekly capacity, billable capacity, load, headroom.
+Single source of truth for: weekly capacity, load, headroom.
 """
 import pandas as pd
 import numpy as np
@@ -21,9 +21,9 @@ def compute_staff_capacity(df: pd.DataFrame,
     Returns DataFrame with:
     - weekly_capacity: 38 * fte_hours_scaling
     - period_capacity: weekly_capacity * weeks
-    - billable_capacity: period_capacity * utilisation_target
-    - trailing_load: actual hours in trailing window
-    - headroom: billable_capacity - trailing_load
+    - billable_load: billable hours in trailing window
+    - total_load: total hours in trailing window
+    - headroom: period_capacity - total_load
     """
     if "staff_name" not in df.columns:
         return pd.DataFrame()
@@ -31,24 +31,17 @@ def compute_staff_capacity(df: pd.DataFrame,
     # Get staff attributes
     staff_info = df.groupby("staff_name").agg(
         fte_scaling=("fte_hours_scaling", "first") if "fte_hours_scaling" in df.columns else ("staff_name", lambda x: 1.0),
-        util_target=("utilisation_target", "first") if "utilisation_target" in df.columns else ("staff_name", lambda x: 0.8),
         department=("department_final", "first") if "department_final" in df.columns else ("staff_name", "first"),
     ).reset_index()
     
     # Handle missing FTE scaling
     if "fte_hours_scaling" not in df.columns:
         staff_info["fte_scaling"] = 1.0
-    staff_info["fte_scaling"] = staff_info["fte_scaling"].fillna(config.default_fte_scaling)
-    
-    # Handle missing utilisation target
-    if "utilisation_target" not in df.columns:
-        staff_info["util_target"] = 0.8
-    staff_info["util_target"] = staff_info["util_target"].fillna(config.default_utilisation_target)
+    staff_info["fte_scaling"] = staff_info["fte_scaling"].fillna(config.DEFAULT_FTE_SCALING)
     
     # Calculate capacity
-    staff_info["weekly_capacity"] = config.standard_weekly_hours * staff_info["fte_scaling"]
+    staff_info["weekly_capacity"] = config.CAPACITY_HOURS_PER_WEEK * staff_info["fte_scaling"]
     staff_info["period_capacity"] = staff_info["weekly_capacity"] * weeks
-    staff_info["billable_capacity"] = staff_info["period_capacity"] * staff_info["util_target"]
     
     # Calculate trailing load
     if reference_date is None:
@@ -91,7 +84,7 @@ def compute_staff_capacity(df: pd.DataFrame,
     staff_info["total_load"] = staff_info["total_load"].fillna(0)
     
     # Headroom
-    staff_info["headroom"] = staff_info["billable_capacity"] - staff_info["billable_load"]
+    staff_info["headroom"] = staff_info["period_capacity"] - staff_info["total_load"]
     
     # Utilisation in trailing period
     staff_info["trailing_utilisation"] = np.where(
@@ -126,7 +119,6 @@ def compute_capacity_summary(df: pd.DataFrame,
     return {
         "total_staff": len(staff),
         "total_supply": staff["period_capacity"].sum(),
-        "billable_capacity": staff["billable_capacity"].sum(),
         "billable_load": staff["billable_load"].sum(),
         "total_load": staff["total_load"].sum(),
         "headroom": staff["headroom"].sum(),
@@ -148,7 +140,6 @@ def compute_department_capacity(df: pd.DataFrame,
     result = staff.groupby("department").agg(
         staff_count=("staff_name", "count"),
         period_capacity=("period_capacity", "sum"),
-        billable_capacity=("billable_capacity", "sum"),
         billable_load=("billable_load", "sum"),
         total_load=("total_load", "sum"),
         headroom=("headroom", "sum"),
@@ -200,7 +191,7 @@ def compute_capacity_forecast(df: pd.DataFrame,
     # Project load forward
     staff["weekly_load_rate"] = staff["billable_load"] / trailing_weeks
     staff["forecast_load"] = staff["weekly_load_rate"] * forecast_weeks
-    staff["forecast_capacity"] = staff["weekly_capacity"] * forecast_weeks * staff["util_target"]
+    staff["forecast_capacity"] = staff["weekly_capacity"] * forecast_weeks
     staff["forecast_headroom"] = staff["forecast_capacity"] - staff["forecast_load"]
     
     return staff

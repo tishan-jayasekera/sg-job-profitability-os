@@ -91,7 +91,7 @@ def ensure_column_types(df: pd.DataFrame) -> pd.DataFrame:
     numeric_cols = [
         "hours_raw", "base_cost", "rev_alloc", "base_rate", "billable_rate",
         "quoted_time_total", "quoted_amount_total", "quote_rate",
-        "utilisation_target", "fte_hours_scaling", "realised_rate_alloc"
+        "fte_hours_scaling", "realised_rate_alloc"
     ]
     for col in numeric_cols:
         if col in df.columns:

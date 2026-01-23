@@ -150,7 +150,7 @@ def format_metric_df(df: pd.DataFrame) -> pd.DataFrame:
     
     # Percent columns
     percent_cols = [
-        "margin_pct", "utilisation", "utilisation_target_pct", "util_gap",
+        "margin_pct", "utilisation",
         "hours_variance_pct", "unquoted_share", "scope_creep_pct",
         "inclusion_rate", "overrun_rate", "severe_overrun_rate",
         "pct_quote_consumed"

@@ -113,12 +113,11 @@ def compute_job_mix(df: pd.DataFrame,
 def compute_implied_fte_demand(df: pd.DataFrame,
                                group_keys: Optional[List[str]] = None,
                                cohort_definition: str = "first_activity",
-                               util_target: float = 0.8,
                                weeks_per_month: float = 4.33) -> pd.DataFrame:
     """
     Compute implied FTE demand from job mix.
     
-    FTE = demand_hours / (38 * weeks * util_target)
+    FTE = demand_hours / (38 * weeks)
     
     Returns DataFrame with:
     - demand_hours (total quoted hours)
@@ -131,9 +130,9 @@ def compute_implied_fte_demand(df: pd.DataFrame,
         return pd.DataFrame()
     
     # Monthly capacity per FTE
-    monthly_billable_capacity = config.standard_weekly_hours * weeks_per_month * util_target
+    monthly_capacity = config.CAPACITY_HOURS_PER_WEEK * weeks_per_month
     
-    mix["implied_fte_quoted"] = mix["total_quoted_hours"] / monthly_billable_capacity
+    mix["implied_fte_quoted"] = mix["total_quoted_hours"] / monthly_capacity
     
     # Also compute from actuals
     agg_keys = ["cohort_month"]
@@ -148,7 +147,7 @@ def compute_implied_fte_demand(df: pd.DataFrame,
         actual_hours=("hours_raw", "sum"),
     ).reset_index()
     
-    actuals["implied_fte_actual"] = actuals["actual_hours"] / monthly_billable_capacity
+    actuals["implied_fte_actual"] = actuals["actual_hours"] / monthly_capacity
     
     mix = mix.merge(actuals, on=agg_keys, how="left")
     
@@ -156,8 +155,7 @@ def compute_implied_fte_demand(df: pd.DataFrame,
 
 
 def compute_demand_vs_supply(df: pd.DataFrame,
-                             weeks: int = 4,
-                             util_target: float = 0.8) -> pd.DataFrame:
+                             weeks: int = 4) -> pd.DataFrame:
     """
     Compare implied demand vs supply capacity.
     
@@ -183,10 +181,9 @@ def compute_demand_vs_supply(df: pd.DataFrame,
     from src.data.semantic import safe_quote_rollup
     quote = safe_quote_rollup(df_recent, [])
     
-    monthly_capacity = config.standard_weekly_hours * 4.33 * util_target
+    monthly_capacity = config.CAPACITY_HOURS_PER_WEEK * 4.33
     
     result = pd.DataFrame([{
-        "supply_billable_capacity": supply.get("billable_capacity", 0),
         "supply_total_capacity": supply.get("total_supply", 0),
         "demand_quoted_hours": quote["quoted_hours"].iloc[0] if len(quote) > 0 else 0,
         "demand_actual_hours": df_recent["hours_raw"].sum(),
@@ -194,14 +191,14 @@ def compute_demand_vs_supply(df: pd.DataFrame,
     }])
     
     result["implied_utilisation_quoted"] = np.where(
-        result["supply_billable_capacity"] > 0,
-        result["demand_quoted_hours"] / result["supply_billable_capacity"] * 100,
+        result["supply_total_capacity"] > 0,
+        result["demand_quoted_hours"] / result["supply_total_capacity"] * 100,
         0
     )
     
     result["implied_utilisation_actual"] = np.where(
-        result["supply_billable_capacity"] > 0,
-        result["demand_actual_hours"] / result["supply_billable_capacity"] * 100,
+        result["supply_total_capacity"] > 0,
+        result["demand_actual_hours"] / result["supply_total_capacity"] * 100,
         0
     )
     

@@ -432,7 +432,7 @@ def main():
                 )
                 
                 set_quote_plan(plan)
-                st.switch_page("pages/3_Capacity_Staffing.py")
+                st.switch_page("pages/3_Capacity_Profiles.py")
         
         with action_cols[2]:
             # Export as CSV

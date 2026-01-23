@@ -33,10 +33,26 @@ class AppConfig:
     active_staff_recency_months: int = field(default_factory=lambda: int(os.getenv("ACTIVE_STAFF_RECENCY_MONTHS", "6")))
     recency_half_life_months: int = field(default_factory=lambda: int(os.getenv("RECENCY_HALF_LIFE_MONTHS", "6")))
     
-    # Capacity model
-    standard_weekly_hours: float = 38.0
-    default_utilisation_target: float = 0.8
-    default_fte_scaling: float = 1.0
+    # Capacity model (empirical)
+    CAPACITY_HOURS_PER_WEEK: float = 38.0
+    DEFAULT_FTE_SCALING: float = 1.0
+    PROFILE_TRAINING_MONTHS: int = 12
+    LOAD_TRAILING_WEEKS: int = 4
+    RECENCY_HALF_LIFE_MONTHS: int = 6
+    ELIGIBILITY_RECENCY_MONTHS: int = 6
+    ELIGIBILITY_MIN_HOURS: int = 10
+    ELIGIBILITY_MIN_JOBS: int = 2
+    ARCHETYPE_OPS_HEAVY_THRESHOLD: float = 0.50
+    ARCHETYPE_SPECIALIST_THRESHOLD: float = 0.70
+    ARCHETYPE_GENERALIST_MIN_CATEGORIES: int = 3
+    ARCHETYPE_GENERALIST_MAX_SHARE: float = 0.50
+    ARCHETYPE_SENIOR_MAX_HOURS_WEEK: float = 25.0
+    CROWDOUT_ADMIN_THRESHOLD: float = 0.20
+    CROWDOUT_INTERNAL_THRESHOLD: float = 0.30
+    CROWDOUT_UNASSIGNED_THRESHOLD: float = 0.15
+    COVERAGE_CRITICAL: int = 1
+    COVERAGE_LOW: int = 2
+    COVERAGE_GOOD: int = 3
     
     # Thresholds
     severe_overrun_threshold: float = 1.2  # 120% of quoted hours
@@ -91,7 +107,6 @@ REQUIRED_COLUMNS = {
         "quoted_amount_total",
         "quote_match_flag",
         "is_billable",
-        "utilisation_target",
         "fte_hours_scaling",
         "breakdown",
     ],

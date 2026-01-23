@@ -16,7 +16,7 @@ from src.ui.layout import section_header
 from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent, fmt_count
 from src.ui.charts import time_series, quadrant_scatter, horizontal_bar
 from src.data.loader import load_fact_timesheet
-from src.data.semantic import safe_quote_job_task, utilisation_metrics, get_category_col
+from src.data.semantic import safe_quote_job_task, get_category_col
 from src.data.cohorts import filter_by_time_window
 from src.config import config
 
@@ -98,10 +98,9 @@ def calculate_job_mix_metrics(df: pd.DataFrame, cohort_df: pd.DataFrame) -> pd.D
     )
     
     # Implied FTE demand
-    # FTE = quoted_hours / (weeks_in_month * 38 * util_target)
+    # FTE = quoted_hours / (weeks_in_month * 38)
     weeks_per_month = 4.33
-    util_target = config.default_utilisation_target
-    monthly["implied_fte"] = monthly["total_quoted_hours"] / (weeks_per_month * 38 * util_target)
+    monthly["implied_fte"] = monthly["total_quoted_hours"] / (weeks_per_month * config.CAPACITY_HOURS_PER_WEEK)
     
     return monthly.sort_values("cohort_month")
 
@@ -113,19 +112,17 @@ def calculate_demand_vs_supply(df: pd.DataFrame, monthly_metrics: pd.DataFrame) 
     # Count unique staff per month and their capacity
     staff_months = df.groupby(["month_key", "staff_name"]).agg(
         fte_scaling=("fte_hours_scaling", "first"),
-        util_target=("utilisation_target", "first"),
     ).reset_index()
     
     supply = staff_months.groupby("month_key").agg(
         staff_count=("staff_name", "nunique"),
         avg_fte=("fte_scaling", "mean"),
-        avg_util_target=("util_target", "mean"),
     ).reset_index()
     
     # Supply capacity
     weeks_per_month = 4.33
     supply["supply_fte"] = supply["staff_count"] * supply["avg_fte"]
-    supply["supply_billable_hours"] = supply["supply_fte"] * weeks_per_month * 38 * supply["avg_util_target"]
+    supply["supply_capacity_hours"] = supply["supply_fte"] * weeks_per_month * config.CAPACITY_HOURS_PER_WEEK
     
     # Merge with demand
     comparison = monthly_metrics.merge(
@@ -136,8 +133,8 @@ def calculate_demand_vs_supply(df: pd.DataFrame, monthly_metrics: pd.DataFrame) 
     
     # Calculate slack
     comparison["implied_utilisation"] = np.where(
-        comparison["supply_billable_hours"] > 0,
-        comparison["total_quoted_hours"] / comparison["supply_billable_hours"] * 100,
+        comparison["supply_capacity_hours"] > 0,
+        comparison["total_quoted_hours"] / comparison["supply_capacity_hours"] * 100,
         np.nan
     )
     
@@ -349,7 +346,7 @@ def main():
     # =========================================================================
     # SECTION D: DEMAND VS SUPPLY
     # =========================================================================
-    section_header("Demand vs Supply", "Implied utilisation and slack")
+    section_header("Demand vs Supply", "Implied capacity use and slack")
     
     if len(demand_supply) > 0 and "implied_utilisation" in demand_supply.columns:
         col1, col2 = st.columns(2)
@@ -366,19 +363,19 @@ def main():
             st.plotly_chart(fig, use_container_width=True)
         
         with col2:
-            # Implied utilisation
+            # Implied capacity use
             demand_supply_valid = demand_supply.dropna(subset=["implied_utilisation"])
             if len(demand_supply_valid) > 0:
                 fig = time_series(
                     demand_supply_valid,
                     x="cohort_month",
                     y="implied_utilisation",
-                    title="Implied Utilisation (%)",
+                    title="Implied Capacity Use (%)",
                     y_title="%"
                 )
                 # Add 100% reference line
                 fig.add_hline(y=100, line_dash="dash", line_color="red",
-                              annotation_text="Full Utilisation")
+                              annotation_text="Full Capacity")
                 st.plotly_chart(fig, use_container_width=True)
         
         # Summary
@@ -388,7 +385,7 @@ def main():
         slack_cols = st.columns(2)
         
         with slack_cols[0]:
-            st.metric("Avg Implied Utilisation", fmt_percent(avg_implied_util))
+            st.metric("Avg Capacity Use", fmt_percent(avg_implied_util))
         
         with slack_cols[1]:
             st.metric("Avg Slack", fmt_percent(avg_slack))

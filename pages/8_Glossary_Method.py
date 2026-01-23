@@ -121,62 +121,95 @@ def main():
     st.markdown("---")
     
     # =========================================================================
-    # UTILISATION
+    # CAPACITY (EMPIRICAL)
     # =========================================================================
-    section_header("Utilisation Metrics")
+    section_header("Capacity Model")
     
     st.markdown("""
-    ### Leave Exclusion
+    **Capacity is pure supply - no targets.**
     
-    **Default:** Exclude rows where `task_name` contains 'leave' (case-insensitive) from utilisation calculations.
+    | Metric | Formula |
+    |--------|---------|
+    | **Capacity (week)** | `38 × fte_hours_scaling` |
+    | **Capacity (window)** | `Capacity/week × weeks` |
+    | **Expected Load** | `Trailing 4-week avg × forecast weeks` |
+    | **Headroom** | `Capacity - Expected Load` |
     
-    ### Definitions
-    
-    | Metric | Formula | Notes |
-    |--------|---------|-------|
-    | **Utilisation** | `Billable Hours / Total Hours × 100` | Excluding leave |
-    | **Target** | `utilisation_target × 100` | Staff-level target |
-    | **Util Gap** | `Target - Utilisation` | Positive = underperforming |
-    
-    ### Rolling Up Targets
-    
-    When aggregating across staff, use **hours-weighted average** for target:
-    
-    ```python
-    weighted_target = (utilisation_target × hours_raw).sum() / hours_raw.sum()
-    ```
+    Headroom interpretation:
+    - Positive = available bandwidth
+    - Negative = overloaded (working beyond contracted hours)
+    - Near zero = fully utilized (empirically)
     """)
     
     st.markdown("---")
     
     # =========================================================================
-    # CAPACITY
+    # CAPABILITY PROFILES
     # =========================================================================
-    section_header("Capacity Model")
+    section_header("Capability Profiles")
     
     st.markdown("""
-    ### Base Assumptions
+    Staff profiles are built from observed timesheet data.
     
-    | Parameter | Default | Notes |
-    |-----------|---------|-------|
-    | **Standard Weekly Hours** | 38 | Full-time equivalent |
-    | **FTE Scaling** | `fte_hours_scaling` | 1.0 = full-time, 0.5 = part-time |
-    | **Utilisation Target** | `utilisation_target` | Typically 0.8 (80%) |
+    ### Expertise Scoring
     
-    ### Formulas
+    For each staff × task (or category):
+    - `hours_weighted = Σ(hours × recency_weight)`
+    - `recency_weight = 0.5^(months_ago / 6)`
+    - `capability_score = normalized 0-100 vs peers`
     
-    | Metric | Formula |
-    |--------|---------|
-    | **Weekly Capacity** | `38 × fte_hours_scaling` |
-    | **Period Capacity** | `Weekly Capacity × weeks_in_period` |
-    | **Billable Capacity** | `Period Capacity × utilisation_target` |
-    | **Headroom** | `Billable Capacity - Trailing Billable Load` |
+    ### Archetypes
     
-    ### Implied FTE Demand
+    | Archetype | Rule |
+    |-----------|------|
+    | Ops-Heavy | billable_ratio < 50% |
+    | Specialist | top_category_share > 70% |
+    | Generalist | 3+ categories, none > 50% |
+    | Senior | < 25 hrs/week, high-leverage tasks |
+    | Balanced | default |
+    """)
     
-    ```
-    Implied FTE = Quoted Hours / (weeks × 38 × util_target)
-    ```
+    st.markdown("---")
+    
+    # =========================================================================
+    # STAFFING ENGINE
+    # =========================================================================
+    section_header("Staffing Recommendations")
+    
+    st.markdown("""
+    ### Eligibility (hard filters)
+    - Touched task/category in last 6 months
+    - At least 10 hours on task/category
+    - At least 2 jobs touched
+    
+    ### Scoring
+    `match_score = (capability × 0.6) + (availability × 0.4)`
+    
+    **Capability** = expertise score (0-100)  
+    **Availability** = headroom / hours_needed (capped at 100)
+    """)
+    
+    st.markdown("---")
+    
+    # =========================================================================
+    # TIME ALLOCATION
+    # =========================================================================
+    section_header("Time Allocation")
+    
+    st.markdown("""
+    **Descriptive, not prescriptive.** No targets.
+    
+    ### Metrics
+    - **Billable Ratio** = billable_hours / total_hours
+    - **HHI (concentration)** = Σ(task_share²)
+      - 1.0 = concentrated
+      - 0.0 = fragmented
+    
+    ### Crowd-Out Flags
+    Patterns that may indicate issues:
+    - Admin > 20% of non-billable
+    - Internal projects > 30%
+    - Very low billable without Ops-Heavy role
     """)
     
     st.markdown("---")
@@ -282,8 +315,8 @@ def main():
     
     | Status | Condition |
     |--------|-----------|
-    | **On Track** | Quote consumed < 80% |
-    | **Watch** | 80% ≤ Quote consumed < 100% |
+    | **On Track** | Quote consumed < 0.8 |
+    | **Watch** | 0.8 <= Quote consumed < 1.0 |
     | **At Risk** | Quote consumed ≥ 100% |
     
     ### Overrun Definitions

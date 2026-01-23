@@ -407,19 +407,17 @@ def render_action_shortlist(df: pd.DataFrame):
                     "page": "Executive Summary"
                 })
     
-    # Find low utilisation
+    # Flag low billable share (descriptive)
     if "department_final" in df.columns:
         util = utilisation_metrics(df, ["department_final"], exclude_leave=True)
-        util["util_gap"] = util["utilisation_target_pct"] - util["utilisation"]
-        
-        low_util = util.nlargest(3, "util_gap")
-        for _, row in low_util.iterrows():
-            if row["util_gap"] > 10:
+        low_billable = util.nsmallest(3, "utilisation")
+        for _, row in low_billable.iterrows():
+            if row["utilisation"] < 40:
                 actions.append({
-                    "type": "Low Utilisation",
+                    "type": "Low Billable Share",
                     "location": row["department_final"],
-                    "detail": f"{row['util_gap']:.1f}pp below target",
-                    "page": "Utilisation & Time Use"
+                    "detail": f"{row['utilisation']:.1f}% billable",
+                    "page": "Time Allocation"
                 })
     
     if not actions:

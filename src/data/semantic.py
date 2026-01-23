@@ -327,7 +327,7 @@ def quote_delivery_metrics(df: pd.DataFrame, group_keys: Optional[List[str]] = N
 def utilisation_metrics(df: pd.DataFrame, group_keys: Optional[List[str]] = None, 
                         exclude_leave: bool = True) -> pd.DataFrame:
     """
-    Compute utilisation metrics.
+    Compute descriptive utilisation metrics (no targets).
     """
     df = df.copy()
     
@@ -343,14 +343,12 @@ def utilisation_metrics(df: pd.DataFrame, group_keys: Optional[List[str]] = None
         result = df.groupby(group_keys).agg(
             total_hours=("hours_raw", "sum"),
             billable_hours=("billable_hours", "sum"),
-            utilisation_target=("utilisation_target", lambda x: (x * df.loc[x.index, "hours_raw"]).sum() / df.loc[x.index, "hours_raw"].sum() if df.loc[x.index, "hours_raw"].sum() > 0 else 0.8),
         ).reset_index()
     else:
         total_hrs = df["hours_raw"].sum()
         result = pd.DataFrame([{
             "total_hours": total_hrs,
             "billable_hours": df["billable_hours"].sum(),
-            "utilisation_target": (df["utilisation_target"] * df["hours_raw"]).sum() / total_hrs if total_hrs > 0 else 0.8,
         }])
     
     result["utilisation"] = np.where(
@@ -358,9 +356,6 @@ def utilisation_metrics(df: pd.DataFrame, group_keys: Optional[List[str]] = None
         result["billable_hours"] / result["total_hours"] * 100,
         0
     )
-    result["utilisation_target_pct"] = result["utilisation_target"] * 100
-    result["util_gap"] = result["utilisation_target_pct"] - result["utilisation"]
-    
     return result
 
 

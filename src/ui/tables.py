@@ -190,8 +190,7 @@ def staff_capacity_table(df: pd.DataFrame,
     
     display_cols = [
         "staff_name", "department", "period_capacity",
-        "billable_capacity", "billable_load", "headroom",
-        "trailing_utilisation", "active_job_count"
+        "billable_load", "headroom", "active_job_count"
     ]
     
     display_df = df[[c for c in display_cols if c in df.columns]].copy()
@@ -201,10 +200,8 @@ def staff_capacity_table(df: pd.DataFrame,
         "staff_name": "Staff",
         "department": "Department",
         "period_capacity": "Capacity",
-        "billable_capacity": "Billable Cap",
         "billable_load": "Load",
         "headroom": "Headroom",
-        "trailing_utilisation": "Util %",
         "active_job_count": "Active Jobs",
     }
     display_df = display_df.rename(columns=col_names)
@@ -218,10 +215,8 @@ def staff_capacity_table(df: pd.DataFrame,
         hide_index=True,
         column_config={
             "Capacity": st.column_config.NumberColumn(format="%.0f"),
-            "Billable Cap": st.column_config.NumberColumn(format="%.0f"),
             "Load": st.column_config.NumberColumn(format="%.0f"),
             "Headroom": st.column_config.NumberColumn(format="%.0f"),
-            "Util %": st.column_config.NumberColumn(format="%.1f%%"),
         },
         key=key,
     )

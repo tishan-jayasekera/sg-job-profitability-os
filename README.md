@@ -75,9 +75,9 @@ job-profitability-os/
 ├── pages/                      # Page modules
 │   ├── 1_Executive_Summary.py
 │   ├── 2_Quote_Builder.py
-│   ├── 3_Capacity_Staffing.py
+│   ├── 3_Capacity_Profiles.py
 │   ├── 4_Active_Delivery.py
-│   ├── 5_Utilisation_Time_Use.py
+│   ├── 5_Time_Allocation.py
 │   ├── 6_Job_Mix_and_Demand.py
 │   ├── 7_Data_Quality_QA.py
 │   └── 8_Glossary_Method.py
