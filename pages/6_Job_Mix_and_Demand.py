@@ -218,12 +218,69 @@ def calculate_capacity_vs_delivery(df: pd.DataFrame) -> pd.DataFrame:
     return capacity.sort_values("month_key")
 
 
+def compute_capacity_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """Summarize capacity and delivery by group across the selected time window."""
+    if group_col not in df.columns:
+        return pd.DataFrame()
+
+    weeks_per_month = 4.33
+    monthly = df.groupby([group_col, "month_key"]).agg(
+        staff_count=("staff_name", "nunique"),
+        avg_fte=("fte_hours_scaling", "mean"),
+        actual_hours=("hours_raw", "sum"),
+    ).reset_index()
+    monthly["avg_fte"] = monthly["avg_fte"].fillna(config.DEFAULT_FTE_SCALING)
+    monthly["capacity_hours"] = (
+        monthly["staff_count"] * monthly["avg_fte"] * weeks_per_month * config.CAPACITY_HOURS_PER_WEEK
+    )
+
+    if "is_billable" in df.columns:
+        billable = df[df["is_billable"] == True].groupby([group_col, "month_key"])[
+            "hours_raw"
+        ].sum().rename("billable_hours")
+        nonbillable = df[df["is_billable"] == False].groupby([group_col, "month_key"])[
+            "hours_raw"
+        ].sum().rename("nonbillable_hours")
+        monthly = monthly.merge(billable, on=[group_col, "month_key"], how="left")
+        monthly = monthly.merge(nonbillable, on=[group_col, "month_key"], how="left")
+        monthly["billable_hours"] = monthly["billable_hours"].fillna(0)
+        monthly["nonbillable_hours"] = monthly["nonbillable_hours"].fillna(0)
+    else:
+        monthly["billable_hours"] = 0
+        monthly["nonbillable_hours"] = 0
+
+    summary = monthly.groupby(group_col).agg(
+        months=("month_key", "nunique"),
+        avg_staff=("staff_count", "mean"),
+        capacity_hours=("capacity_hours", "sum"),
+        actual_hours=("actual_hours", "sum"),
+        billable_hours=("billable_hours", "sum"),
+        nonbillable_hours=("nonbillable_hours", "sum"),
+    ).reset_index()
+
+    summary["utilisation_pct"] = np.where(
+        summary["capacity_hours"] > 0,
+        summary["actual_hours"] / summary["capacity_hours"] * 100,
+        np.nan,
+    )
+    summary["slack_hours"] = summary["capacity_hours"] - summary["actual_hours"]
+    summary["slack_pct"] = 100 - summary["utilisation_pct"]
+    summary["billable_ratio"] = np.where(
+        summary["actual_hours"] > 0,
+        summary["billable_hours"] / summary["actual_hours"],
+        np.nan,
+    )
+
+    return summary.sort_values("slack_hours", ascending=False)
+
+
 def main():
     st.title("Job Mix & Implied FTE Demand")
     st.caption("Analyze job intake patterns and capacity implications")
     
     # Load data
     df_all = load_fact_timesheet()
+    df_all["month_key"] = pd.to_datetime(df_all["month_key"])
     
     # Sidebar controls
     st.sidebar.header("Controls")
@@ -268,6 +325,8 @@ def main():
     ).clip(lower=0)
     capacity_delivery = calculate_capacity_vs_delivery(df_all)
     capacity_delivery = filter_by_time_window(capacity_delivery, time_window, date_col="month_key")
+
+    df_window = filter_by_time_window(df_all, time_window, date_col="month_key")
 
     # Job-level data for loss diagnosis and quadrant drill
     category_col = get_category_col(df_all)
@@ -767,7 +826,119 @@ Decision guide:
     st.markdown("---")
 
     # =========================================================================
-    # SECTION E: SO WHAT (CONSULTANT VIEW)
+    # SECTION E: OPERATIONAL DRILLDOWN (DEPARTMENT → CATEGORY → STAFF → BREAKDOWN → TASK)
+    # =========================================================================
+    section_header("Operational Drilldown", "Follow the delivery chain to locate slack or overload")
+
+    category_col = "category_rev_job" if "category_rev_job" in df_window.columns else get_category_col(df_window)
+    chain = [
+        ("department_final", "Department"),
+        (category_col, "Category"),
+        ("staff_name", "Staff"),
+        ("breakdown", "Breakdown"),
+        ("task_name", "Job Task"),
+    ]
+
+    drill_df = df_window.copy()
+    selections = {}
+    cols = st.columns(len(chain))
+    for idx, (col, label) in enumerate(chain):
+        if col not in drill_df.columns:
+            continue
+        options = ["All"] + sorted(drill_df[col].dropna().unique().tolist())
+        with cols[idx]:
+            choice = st.selectbox(label, options, key=f"cap_chain_{col}")
+        if choice != "All":
+            drill_df = drill_df[drill_df[col] == choice]
+            selections[col] = choice
+
+    if len(drill_df) == 0:
+        st.warning("No data available for the selected drilldown filters.")
+    else:
+        drill_capacity = calculate_capacity_vs_delivery(drill_df)
+        drill_capacity = filter_by_time_window(drill_capacity, time_window, date_col="month_key")
+
+        total_capacity = drill_capacity["capacity_hours"].sum()
+        total_actual = drill_capacity["actual_hours"].sum()
+        total_slack = total_capacity - total_actual
+        utilisation = (total_actual / total_capacity * 100) if total_capacity > 0 else np.nan
+
+        kpi_cols = st.columns(4)
+        with kpi_cols[0]:
+            st.metric("Capacity Hours", fmt_hours(total_capacity))
+        with kpi_cols[1]:
+            st.metric("Actual Hours", fmt_hours(total_actual))
+        with kpi_cols[2]:
+            st.metric("Slack Hours", fmt_hours(total_slack))
+        with kpi_cols[3]:
+            st.metric("Utilisation", fmt_percent(utilisation))
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=drill_capacity["month_key"],
+                y=drill_capacity["capacity_hours"],
+                name="Capacity Hours",
+                mode="lines+markers",
+                line=dict(color="#4c78a8", width=2),
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=drill_capacity["month_key"],
+                y=drill_capacity["actual_hours"],
+                name="Actual Hours",
+                mode="lines+markers",
+                line=dict(color="#f58518", width=2),
+            )
+        )
+        fig.update_layout(
+            title="Capacity vs Delivery (Filtered)",
+            yaxis=dict(title="Hours"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        next_level = None
+        for col, label in chain:
+            if col not in selections and col in drill_df.columns:
+                next_level = (col, label)
+                break
+
+        if next_level:
+            summary = compute_capacity_summary(drill_df, next_level[0])
+            if len(summary) > 0:
+                st.subheader(f"Next Level Breakdown: {next_level[1]}")
+                st.dataframe(
+                    summary.rename(columns={
+                        next_level[0]: next_level[1],
+                        "avg_staff": "Avg Staff",
+                        "capacity_hours": "Capacity Hours",
+                        "actual_hours": "Actual Hours",
+                        "billable_hours": "Billable Hours",
+                        "nonbillable_hours": "Non‑Billable Hours",
+                        "utilisation_pct": "Utilisation",
+                        "slack_hours": "Slack Hours",
+                        "slack_pct": "Slack %",
+                        "billable_ratio": "Billable Ratio",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Non‑Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Utilisation": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Slack %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Billable Ratio": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Avg Staff": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+
+    # =========================================================================
+    # SECTION F: SO WHAT (CONSULTANT VIEW)
     # =========================================================================
     section_header("So What", "What the trend implies about pricing vs delivery")
 
