@@ -119,7 +119,9 @@ def safe_quote_rollup(df: pd.DataFrame, group_keys: List[str]) -> pd.DataFrame:
     # Now we need to join group_keys back from original df
     # Get unique job_no + task_name + group_keys mapping
     if group_keys:
-        key_mapping = df[["job_no", "task_name"] + group_keys].drop_duplicates()
+        key_cols = ["job_no", "task_name"] + group_keys
+        key_cols = list(dict.fromkeys(key_cols))
+        key_mapping = df[key_cols].drop_duplicates()
         job_task = job_task.merge(key_mapping, on=["job_no", "task_name"], how="left")
     
     # Aggregate

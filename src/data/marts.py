@@ -9,7 +9,7 @@ from pathlib import Path
 from src.config import config
 from src.data.semantic import (
     full_metric_pack, safe_quote_job_task, leave_exclusion_mask,
-    profitability_rollup, utilisation_metrics
+    profitability_rollup, utilisation_metrics, get_category_col
 )
 from src.data.cohorts import get_active_jobs, compute_recency_weights
 
@@ -36,7 +36,8 @@ def build_cube_dept_category_month(df: pd.DataFrame) -> pd.DataFrame:
     
     Grain: department_final × job_category × month_key
     """
-    group_keys = ["department_final", "job_category", "month_key"]
+    category_col = get_category_col(df)
+    group_keys = ["department_final", category_col, "month_key"]
     
     for col in group_keys:
         if col not in df.columns:
@@ -51,7 +52,8 @@ def build_cube_dept_category_task(df: pd.DataFrame) -> pd.DataFrame:
     
     Grain: department_final × job_category × task_name
     """
-    group_keys = ["department_final", "job_category", "task_name"]
+    category_col = get_category_col(df)
+    group_keys = ["department_final", category_col, "task_name"]
     
     for col in group_keys:
         if col not in df.columns:
@@ -65,7 +67,9 @@ def build_cube_dept_category_task(df: pd.DataFrame) -> pd.DataFrame:
     job_task = safe_quote_job_task(df)
     
     # Map group keys to job-task
-    key_mapping = df[["job_no", "task_name"] + group_keys].drop_duplicates()
+    key_cols = ["job_no", "task_name"] + group_keys
+    key_cols = list(dict.fromkeys(key_cols))
+    key_mapping = df[key_cols].drop_duplicates()
     job_task = job_task.merge(key_mapping, on=["job_no", "task_name"], how="left")
     
     # Compute inclusion rate (% of jobs containing this task)
@@ -150,7 +154,8 @@ def build_cube_dept_category_staff(df: pd.DataFrame) -> pd.DataFrame:
     
     Grain: department_final × job_category × staff_name
     """
-    group_keys = ["department_final", "job_category", "staff_name"]
+    category_col = get_category_col(df)
+    group_keys = ["department_final", category_col, "staff_name"]
     
     for col in group_keys:
         if col not in df.columns:
@@ -200,9 +205,10 @@ def build_active_jobs_snapshot(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     
     # Job-level aggregation
+    category_col = get_category_col(df_active)
     job_agg = df_active.groupby("job_no").agg(
         department_final=("department_final", "first"),
-        job_category=("job_category", "first"),
+        job_category=(category_col, "first"),
         client=("client", "first") if "client" in df_active.columns else ("job_no", "first"),
         job_status=("job_status", "first") if "job_status" in df_active.columns else ("job_no", "first"),
         job_due_date=("job_due_date", "first") if "job_due_date" in df_active.columns else ("job_no", "first"),
