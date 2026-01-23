@@ -397,24 +397,30 @@ def compute_context_switching(df: pd.DataFrame,
 
 def build_staff_profiles(df: pd.DataFrame,
                          window_weeks: int = 4,
-                         training_months: int = 12) -> pd.DataFrame:
+                         training_months: int = 12,
+                         df_window: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """
     Master function: build complete staff profiles.
     """
-    capacity = compute_staff_capacity(df, window_weeks)
-    load = compute_staff_load(df, window_weeks)
-    expected = compute_expected_load(df, trailing_weeks=window_weeks, forecast_weeks=window_weeks)
+    df_window = df if df_window is None else df_window
+    
+    capacity = compute_staff_capacity(df_window, window_weeks)
+    load = compute_staff_load(df_window, window_weeks)
+    expected = compute_expected_load(df_window, trailing_weeks=window_weeks, forecast_weeks=window_weeks)
     headroom = compute_headroom(capacity, expected)
     task_expertise = compute_task_expertise(df, training_months, config.RECENCY_HALF_LIFE_MONTHS)
     category_expertise = compute_category_expertise(df, training_months, config.RECENCY_HALF_LIFE_MONTHS)
     archetype = assign_archetype(load, category_expertise)
-    context = compute_context_switching(df, window_weeks)
+    context = compute_context_switching(df_window, window_weeks)
     
     profile = capacity.merge(load, on="staff_name", how="left")
     profile = profile.merge(expected, on="staff_name", how="left")
     profile = profile.merge(headroom, on="staff_name", how="left")
     profile = profile.merge(archetype, on="staff_name", how="left")
     profile = profile.merge(context, on="staff_name", how="left")
+    
+    if "load_total_hours" in profile.columns:
+        profile = profile[profile["load_total_hours"].fillna(0) > 0]
     
     if "expected_load_hours" in profile.columns:
         profile["expected_load_hours"] = profile["expected_load_hours"].fillna(0)

@@ -8,6 +8,8 @@ import numpy as np
 from typing import Optional, List, Dict
 
 from src.data.semantic import safe_quote_rollup
+from src.data.semantic import quote_delivery_metrics, utilisation_metrics
+from src.data.semantic import get_category_col
 
 
 def compute_rate_metrics(df: pd.DataFrame,
@@ -180,3 +182,47 @@ def get_top_rate_leakage(df: pd.DataFrame,
     leakage["total_leakage"] = leakage["rate_variance"] * leakage["hours"]
     
     return leakage.nsmallest(n, "total_leakage")
+
+
+def compute_rate_variance_diagnosis(df: pd.DataFrame,
+                                    group_key: str = "job_no",
+                                    min_hours: float = 5) -> pd.DataFrame:
+    """
+    Diagnose rate variance drivers with actionable labels.
+    """
+    if group_key not in df.columns:
+        return pd.DataFrame()
+    
+    rates = compute_rate_metrics(df, [group_key])
+    delivery = quote_delivery_metrics(df, [group_key])
+    util = utilisation_metrics(df, [group_key], exclude_leave=True)
+    
+    result = rates.merge(delivery[[group_key, "hours_variance_pct", "unquoted_share"]], on=group_key, how="left")
+    result = result.merge(util[[group_key, "utilisation"]], on=group_key, how="left")
+    result["billable_ratio"] = result["utilisation"] / 100.0
+    
+    if "quoted_amount" not in result.columns:
+        result["quoted_amount"] = 0
+    if "revenue" not in result.columns:
+        result["revenue"] = 0
+    
+    def classify(row: pd.Series) -> str:
+        if pd.isna(row.get("quote_rate")) or row.get("quoted_hours", 0) == 0:
+            return "No quote"
+        if row.get("hours", 0) < min_hours:
+            return "Low volume"
+        if row.get("unquoted_share", 0) >= 20:
+            return "Scope creep"
+        if row.get("hours_variance_pct", 0) >= 20:
+            return "Overrun hours"
+        if row.get("revenue", 0) < row.get("quoted_amount", 0) * 0.9:
+            return "Revenue shortfall"
+        if row.get("billable_ratio", 1) < 0.6:
+            return "Non-billable mix"
+        if row.get("rate_variance", 0) < 0:
+            return "Rate leakage"
+        return "Above quote"
+    
+    result["driver"] = result.apply(classify, axis=1)
+    
+    return result

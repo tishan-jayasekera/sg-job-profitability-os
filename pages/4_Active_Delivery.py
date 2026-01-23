@@ -18,6 +18,7 @@ from src.ui.charts import horizontal_bar, grouped_bar
 from src.data.loader import load_fact_timesheet
 from src.data.semantic import safe_quote_job_task, profitability_rollup, get_category_col
 from src.data.cohorts import get_active_jobs, filter_active_jobs
+from src.metrics.rate_capture import compute_rate_variance_diagnosis
 from src.config import config
 
 
@@ -293,7 +294,59 @@ def main():
     st.markdown("---")
     
     # =========================================================================
-    # SECTION C: JOB DETAILS (when selected)
+    # SECTION C: RATE VARIANCE DIAGNOSIS
+    # =========================================================================
+    section_header("Rate Variance Diagnosis", "Identify root causes and actions")
+    
+    diagnosis = compute_rate_variance_diagnosis(df)
+    if len(diagnosis) > 0:
+        job_attrs = df.groupby("job_no").agg(
+            department_final=("department_final", "first"),
+            category=(get_category_col(df), "first"),
+        ).reset_index()
+        diagnosis = diagnosis.merge(job_attrs, on="job_no", how="left")
+        diagnosis["rate_gap"] = diagnosis["rate_variance"] * diagnosis["hours"]
+        diagnosis = diagnosis.sort_values("rate_gap").head(15)
+        action_map = {
+            "No quote": "Backfill quote or flag as non-quoted work",
+            "Low volume": "Review with next period data",
+            "Scope creep": "Re-scope, change request, or re-quote",
+            "Overrun hours": "Adjust delivery plan or scope",
+            "Revenue shortfall": "Check invoicing/discounts",
+            "Non-billable mix": "Reduce internal/overhead allocation",
+            "Rate leakage": "Review rate card vs actuals",
+            "Above quote": "Validate rate capture and margin",
+        }
+        diagnosis["action"] = diagnosis["driver"].map(action_map).fillna("Review variance")
+        
+        display_cols = [
+            "job_no", "department_final", "category",
+            "quote_rate", "realised_rate", "rate_variance",
+            "unquoted_share", "hours_variance_pct", "billable_ratio",
+            "driver", "action",
+        ]
+        show = diagnosis[[c for c in display_cols if c in diagnosis.columns]].copy()
+        show = show.rename(columns={
+            "job_no": "Job",
+            "department_final": "Department",
+            "category": "Category",
+            "quote_rate": "Quote Rate",
+            "realised_rate": "Realised Rate",
+            "rate_variance": "Rate Var",
+            "unquoted_share": "Unquoted %",
+            "hours_variance_pct": "Hours Var %",
+            "billable_ratio": "Billable Ratio",
+            "driver": "Driver",
+            "action": "Action",
+        })
+        st.dataframe(show, use_container_width=True, hide_index=True)
+    else:
+        st.info("No rate variance data available.")
+    
+    st.markdown("---")
+    
+    # =========================================================================
+    # SECTION D: JOB DETAILS (when selected)
     # =========================================================================
     if selection and selection.selection and selection.selection.rows:
         selected_idx = selection.selection.rows[0]

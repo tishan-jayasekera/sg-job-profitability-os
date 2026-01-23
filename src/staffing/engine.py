@@ -76,7 +76,10 @@ def score_staff_for_task(task_name: str,
     """
     Score all eligible staff for a task.
     """
-    staff_names = sorted(set(task_expertise_df["staff_name"].tolist() + category_expertise_df["staff_name"].tolist()))
+    if len(headroom_df) > 0 and "staff_name" in headroom_df.columns:
+        staff_names = sorted(headroom_df["staff_name"].unique().tolist())
+    else:
+        staff_names = sorted(set(task_expertise_df["staff_name"].tolist() + category_expertise_df["staff_name"].tolist()))
     rows = []
     
     for staff in staff_names:

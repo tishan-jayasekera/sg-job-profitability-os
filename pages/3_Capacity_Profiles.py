@@ -34,11 +34,18 @@ init_state()
 
 @st.cache_data(show_spinner=False)
 def build_profile_data(df: pd.DataFrame, window_weeks: int, training_months: int):
-    profiles = build_staff_profiles(df, window_weeks, training_months)
+    date_col = "work_date" if "work_date" in df.columns else "month_key"
+    df_window = df.copy()
+    if date_col in df_window.columns:
+        ref = pd.to_datetime(df_window[date_col]).max()
+        cutoff = ref - pd.DateOffset(weeks=window_weeks)
+        df_window = df_window[pd.to_datetime(df_window[date_col]) >= cutoff]
+    
+    profiles = build_staff_profiles(df, window_weeks, training_months, df_window=df_window)
     task_expertise = compute_task_expertise(df, training_months, config.RECENCY_HALF_LIFE_MONTHS)
     category_expertise = compute_category_expertise(df, training_months, config.RECENCY_HALF_LIFE_MONTHS)
-    capacity = compute_staff_capacity(df, window_weeks)
-    expected = compute_expected_load(df, window_weeks, window_weeks)
+    capacity = compute_staff_capacity(df_window, window_weeks)
+    expected = compute_expected_load(df_window, window_weeks, window_weeks)
     headroom = compute_headroom(capacity, expected)
     return profiles, task_expertise, category_expertise, headroom
 
@@ -86,9 +93,10 @@ def main():
     st.subheader("Team Capacity")
     kpi_cols = st.columns(4)
     total_staff = profiles["staff_name"].nunique()
-    total_capacity = profiles["capacity_hours_window"].sum()
-    total_expected = profiles["expected_load_hours"].sum()
-    total_headroom = profiles["headroom_hours"].sum()
+    total_staff_all = df["staff_name"].nunique() if "staff_name" in df.columns else total_staff
+    total_capacity = profiles["capacity_hours_window"].sum() if "capacity_hours_window" in profiles.columns else 0
+    total_expected = profiles["expected_load_hours"].sum() if "expected_load_hours" in profiles.columns else 0
+    total_headroom = profiles["headroom_hours"].sum() if "headroom_hours" in profiles.columns else 0
     
     with kpi_cols[0]:
         st.metric("Staff Count", f"{total_staff:,}")
@@ -108,9 +116,12 @@ def main():
             **Expected Load = trailing average.**  
             `Expected Load = avg weekly hours (trailing) × weeks`
             
-            **Headroom = Capacity − Expected Load**
+            **Headroom = Capacity - Expected Load**
+            
+            **Active staff:** only staff with hours in the selected window appear.
             """
         )
+        st.caption(f"Active staff: {total_staff} of {total_staff_all} in selected department and window.")
     
     st.divider()
     
