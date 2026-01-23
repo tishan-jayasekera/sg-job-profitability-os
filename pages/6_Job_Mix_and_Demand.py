@@ -306,14 +306,17 @@ def compute_capacity_summary(
         monthly["billable_hours"] = 0
         monthly["nonbillable_hours"] = 0
 
-    summary = monthly.groupby(group_col).agg(
-        months=("month_key", "nunique"),
-        avg_staff=("staff_count", "mean"),
-        capacity_hours=("capacity_hours", "sum"),
-        actual_hours=("actual_hours", "sum"),
-        billable_hours=("billable_hours", "sum"),
-        nonbillable_hours=("nonbillable_hours", "sum"),
-    ).reset_index()
+    agg_dict = {
+        "months": ("month_key", "nunique"),
+        "avg_staff": ("staff_count", "mean"),
+        "capacity_hours": ("capacity_hours", "sum"),
+        "actual_hours": ("actual_hours", "sum"),
+        "billable_hours": ("billable_hours", "sum"),
+        "nonbillable_hours": ("nonbillable_hours", "sum"),
+    }
+    if "job_no" in df.columns:
+        agg_dict["job_count"] = ("job_no", "nunique")
+    summary = monthly.groupby(group_col).agg(**agg_dict).reset_index()
 
     summary["utilisation_pct"] = np.where(
         summary["capacity_hours"] > 0,
@@ -329,6 +332,52 @@ def compute_capacity_summary(
     )
 
     return summary.sort_values("slack_hours", ascending=False)
+
+
+def compute_job_volume_deltas(
+    df: pd.DataFrame, group_col: str, time_window: str
+) -> pd.DataFrame:
+    """Compute job volume change vs prior period for a group."""
+    if group_col not in df.columns or "job_no" not in df.columns:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df["month_key"] = pd.to_datetime(df["month_key"])
+    available = sorted(df["month_key"].dropna().unique())
+    if len(available) < 2:
+        return pd.DataFrame()
+
+    if time_window == "6m":
+        months = 6
+    elif time_window == "12m":
+        months = 12
+    elif time_window == "24m":
+        months = 24
+    else:
+        months = min(12, len(available))
+
+    if len(available) < months:
+        months = len(available)
+    if months < 2:
+        return pd.DataFrame()
+
+    mid = months // 2
+    recent_months = available[-mid:]
+    prior_months = available[-(2 * mid):-mid] if len(available) >= 2 * mid else available[:mid]
+
+    recent = df[df["month_key"].isin(recent_months)]
+    prior = df[df["month_key"].isin(prior_months)]
+
+    recent_jobs = recent.groupby(group_col)["job_no"].nunique().rename("recent_jobs")
+    prior_jobs = prior.groupby(group_col)["job_no"].nunique().rename("prior_jobs")
+    deltas = pd.concat([recent_jobs, prior_jobs], axis=1).fillna(0).reset_index()
+    deltas["job_volume_delta"] = np.where(
+        deltas["prior_jobs"] > 0,
+        (deltas["recent_jobs"] - deltas["prior_jobs"]) / deltas["prior_jobs"],
+        np.nan,
+    )
+
+    return deltas
 
 
 def main():
@@ -1090,6 +1139,42 @@ and prevents double counting staff who work across multiple areas.
                     "Utilisation": st.column_config.NumberColumn(format="%.1f%%"),
                 },
             )
+
+            deltas = compute_job_volume_deltas(drill_df, col, time_window)
+            if len(deltas) > 0:
+                actionable = top_hotspot.merge(deltas, on=col, how="left")
+                actionable["why_flag"] = np.where(
+                    (actionable["job_volume_delta"] < -0.1) & (actionable["billable_ratio"] > 0.6),
+                    "Low job volume",
+                    np.where(
+                        (actionable["billable_ratio"] < 0.5) & (actionable["job_volume_delta"] > -0.05),
+                        "High non‑billable load",
+                        np.where(
+                            (actionable["billable_ratio"] < 0.5) & (actionable["job_volume_delta"] < -0.1),
+                            "Both: volume + non‑billable",
+                            "Mixed / investigate",
+                        ),
+                    ),
+                )
+                st.markdown(f"**Actionable Why: {label}**")
+                st.dataframe(
+                    actionable.rename(columns={
+                        col: label,
+                        "job_volume_delta": "Job Volume Δ",
+                        "billable_ratio": "Billable Ratio",
+                        "why_flag": "Likely Driver",
+                    })[
+                        [label, "Slack Hours", "Slack %", "Job Volume Δ", "Billable Ratio", "Likely Driver"]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Slack %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Job Volume Δ": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Billable Ratio": st.column_config.NumberColumn(format="%.1f%%"),
+                    },
+                )
 
     # =========================================================================
     # SECTION F: SO WHAT (CONSULTANT VIEW)
