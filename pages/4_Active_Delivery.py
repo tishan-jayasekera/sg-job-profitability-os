@@ -276,7 +276,7 @@ def main():
     display_df = display_df.rename(columns=col_rename)
     
     # Selection
-    selection = st.dataframe(
+    job_selection = st.dataframe(
         display_df,
         use_container_width=True,
         hide_index=True,
@@ -335,7 +335,7 @@ def main():
                 custom_data=["department_final", "category", "job_no", "task_name", "staff_name"],
             )
             fig.update_layout(margin=dict(t=30, l=10, r=10, b=10))
-            selection = st.plotly_chart(
+            tree_selection = st.plotly_chart(
                 fig,
                 use_container_width=True,
                 on_select="rerun",
@@ -343,8 +343,8 @@ def main():
             )
             
             selected_path = None
-            if selection and selection.selection and selection.selection.points:
-                point = selection.selection.points[0]
+            if tree_selection and tree_selection.selection and tree_selection.selection.points:
+                point = tree_selection.selection.points[0]
                 if "customdata" in point:
                     selected_path = point["customdata"]
                 elif "label" in point:
@@ -478,8 +478,8 @@ def main():
     # =========================================================================
     # SECTION E: JOB DETAILS (when selected)
     # =========================================================================
-    if selection and selection.selection and selection.selection.rows:
-        selected_idx = selection.selection.rows[0]
+    if job_selection and job_selection.selection and job_selection.selection.rows:
+        selected_idx = job_selection.selection.rows[0]
         selected_job = jobs_df.iloc[selected_idx]["job_no"]
         
         section_header(f"Job Details: {selected_job}")
