@@ -9,6 +9,7 @@ import numpy as np
 from pathlib import Path
 import sys
 import plotly.express as px
+import plotly.graph_objects as go
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -319,7 +320,7 @@ def main():
         with kpi_cols[2]:
             st.metric("Avg Rate Var", fmt_rate(avg_variance))
         
-        tab1, tab2 = st.tabs(["Visual Map", "Driver Tables"])
+        tab1, tab2, tab3 = st.tabs(["Visual Map", "Driver Tables", "Waterfalls"])
         
         with tab1:
             fig = px.treemap(
@@ -329,9 +330,53 @@ def main():
                 color="rate_variance",
                 color_continuous_scale="RdBu",
                 color_continuous_midpoint=0,
+                custom_data=["department_final", "category", "job_no", "task_name", "staff_name"],
             )
             fig.update_layout(margin=dict(t=30, l=10, r=10, b=10))
-            st.plotly_chart(fig, use_container_width=True)
+            selection = st.plotly_chart(
+                fig,
+                use_container_width=True,
+                on_select="rerun",
+                selection_mode="points",
+            )
+            
+            selected_path = None
+            if selection and selection.selection and selection.selection.points:
+                point = selection.selection.points[0]
+                if "customdata" in point:
+                    selected_path = point["customdata"]
+                elif "label" in point:
+                    selected_path = [point["label"]]
+            
+            st.markdown("**Selected Path**")
+            if selected_path:
+                st.code(" > ".join([p for p in selected_path if p]))
+            else:
+                st.caption("Click a node in the treemap to drill into details.")
+            
+            st.markdown("**Detail Panel (Job / Task / Staff)**")
+            detail = rate_tree.copy()
+            if selected_path:
+                dept, cat, job, task, staff = selected_path
+                if dept:
+                    detail = detail[detail["department_final"] == dept]
+                if cat:
+                    detail = detail[detail["category"] == cat]
+                if job:
+                    detail = detail[detail["job_no"] == job]
+                if task:
+                    detail = detail[detail["task_name"] == task]
+                if staff:
+                    detail = detail[detail["staff_name"] == staff]
+            detail = detail.sort_values("rate_gap").head(20)
+            st.dataframe(
+                detail[[
+                    "department_final", "category", "job_no", "task_name", "staff_name",
+                    "quote_rate", "realised_rate", "rate_variance", "rate_gap", "hours",
+                ]],
+                use_container_width=True,
+                hide_index=True,
+            )
         
         with tab2:
             def top_by(level_keys, label):
@@ -349,6 +394,28 @@ def main():
             top_by(["department_final", "category", "job_no"], "Worst Jobs")
             top_by(["department_final", "category", "job_no", "task_name"], "Worst Tasks")
             top_by(["department_final", "category", "job_no", "task_name", "staff_name"], "Worst Staff")
+        
+        with tab3:
+            def waterfall_for(group_cols, label):
+                summary = rate_tree.groupby(group_cols).agg(
+                    quoted_amount=("quoted_amount", "sum"),
+                    rate_gap=("rate_gap", "sum"),
+                ).reset_index()
+                summary["actual_revenue"] = summary["quoted_amount"] + summary["rate_gap"]
+                summary = summary.nsmallest(3, "rate_gap")
+                
+                for _, row in summary.iterrows():
+                    title = f\"{label}: {row[group_cols[-1]]}\"
+                    fig = go.Figure(go.Waterfall(
+                        x=["Quoted Revenue", "Rate Gap", "Actual Revenue"],
+                        y=[row["quoted_amount"], row["rate_gap"], row["actual_revenue"]],
+                        measure=["absolute", "relative", "total"],
+                    ))
+                    fig.update_layout(title=title, height=260, margin=dict(t=40, l=10, r=10, b=10))
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            waterfall_for(["department_final"], "Department")
+            waterfall_for(["department_final", "category"], "Category")
     else:
         st.info("No rate variance data available.")
     
