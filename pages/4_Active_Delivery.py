@@ -306,6 +306,8 @@ def main():
     if len(rate_tree) > 0:
         rate_tree["rate_gap"] = rate_tree["rate_variance"] * rate_tree["hours"]
         rate_tree["rate_gap_abs"] = rate_tree["rate_gap"].abs()
+        rate_tree["node_weight"] = rate_tree["rate_gap_abs"].replace(0, np.nan)
+        rate_tree = rate_tree.dropna(subset=["node_weight"])
         rate_tree = rate_tree.rename(columns={category_col: "category"})
         
         total_gap = rate_tree["rate_gap"].sum()
@@ -326,7 +328,7 @@ def main():
             fig = px.treemap(
                 rate_tree,
                 path=["department_final", "category", "job_no", "task_name", "staff_name"],
-                values="rate_gap_abs",
+                values="node_weight",
                 color="rate_variance",
                 color_continuous_scale="RdBu",
                 color_continuous_midpoint=0,
@@ -405,7 +407,7 @@ def main():
                 summary = summary.nsmallest(3, "rate_gap")
                 
                 for _, row in summary.iterrows():
-                    title = f\"{label}: {row[group_cols[-1]]}\"
+                    title = f"{label}: {row[group_cols[-1]]}"
                     fig = go.Figure(go.Waterfall(
                         x=["Quoted Revenue", "Rate Gap", "Actual Revenue"],
                         y=[row["quoted_amount"], row["rate_gap"], row["actual_revenue"]],
