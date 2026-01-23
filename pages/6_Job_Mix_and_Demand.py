@@ -173,21 +173,48 @@ def calculate_demand_vs_supply(df: pd.DataFrame, monthly_metrics: pd.DataFrame) 
     return comparison
 
 
-def calculate_capacity_vs_delivery(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate operational capacity vs delivered hours by calendar month."""
-    staff_months = df.groupby(["month_key", "staff_name"]).agg(
-        fte_scaling=("fte_hours_scaling", "first"),
-    ).reset_index()
-    staff_months["fte_scaling"] = staff_months["fte_scaling"].fillna(config.DEFAULT_FTE_SCALING)
+def calculate_capacity_vs_delivery(df: pd.DataFrame, df_base: pd.DataFrame = None) -> pd.DataFrame:
+    """Calculate operational capacity vs delivered hours by calendar month.
 
-    supply = staff_months.groupby("month_key").agg(
-        staff_count=("staff_name", "nunique"),
-        avg_fte=("fte_scaling", "mean"),
-    ).reset_index()
+    Capacity is allocated by staff-month share to avoid double counting across groups.
+    """
+    if df_base is None:
+        df_base = df
 
     weeks_per_month = 4.33
-    supply["supply_fte"] = supply["staff_count"] * supply["avg_fte"]
-    supply["capacity_hours"] = supply["supply_fte"] * weeks_per_month * config.CAPACITY_HOURS_PER_WEEK
+    staff_month_totals = df_base.groupby(["staff_name", "month_key"]).agg(
+        total_hours=("hours_raw", "sum"),
+        fte_scaling=("fte_hours_scaling", "first"),
+    ).reset_index()
+    staff_month_totals["fte_scaling"] = staff_month_totals["fte_scaling"].fillna(
+        config.DEFAULT_FTE_SCALING
+    )
+
+    slice_hours = df.groupby(["staff_name", "month_key"]).agg(
+        slice_hours=("hours_raw", "sum"),
+    ).reset_index()
+
+    allocation = slice_hours.merge(staff_month_totals, on=["staff_name", "month_key"], how="left")
+    allocation["hour_share"] = np.where(
+        allocation["total_hours"] > 0,
+        allocation["slice_hours"] / allocation["total_hours"],
+        0,
+    )
+    allocation["supply_fte"] = allocation["fte_scaling"] * allocation["hour_share"]
+    allocation["capacity_hours"] = (
+        allocation["supply_fte"] * weeks_per_month * config.CAPACITY_HOURS_PER_WEEK
+    )
+
+    supply = allocation.groupby("month_key").agg(
+        staff_count=("staff_name", "nunique"),
+        supply_fte=("supply_fte", "sum"),
+        capacity_hours=("capacity_hours", "sum"),
+    ).reset_index()
+    supply["avg_fte"] = np.where(
+        supply["staff_count"] > 0,
+        supply["supply_fte"] / supply["staff_count"],
+        np.nan,
+    )
 
     delivery = df.groupby("month_key").agg(
         actual_hours=("hours_raw", "sum"),
@@ -218,21 +245,46 @@ def calculate_capacity_vs_delivery(df: pd.DataFrame) -> pd.DataFrame:
     return capacity.sort_values("month_key")
 
 
-def compute_capacity_summary(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """Summarize capacity and delivery by group across the selected time window."""
+def compute_capacity_summary(
+    df: pd.DataFrame, group_col: str, df_base: pd.DataFrame = None
+) -> pd.DataFrame:
+    """Summarize allocated capacity and delivery by group across the selected time window."""
     if group_col not in df.columns:
         return pd.DataFrame()
+    if df_base is None:
+        df_base = df
 
     weeks_per_month = 4.33
-    monthly = df.groupby([group_col, "month_key"]).agg(
-        staff_count=("staff_name", "nunique"),
-        avg_fte=("fte_hours_scaling", "mean"),
-        actual_hours=("hours_raw", "sum"),
+    staff_month_totals = df_base.groupby(["staff_name", "month_key"]).agg(
+        total_hours=("hours_raw", "sum"),
+        fte_scaling=("fte_hours_scaling", "first"),
     ).reset_index()
-    monthly["avg_fte"] = monthly["avg_fte"].fillna(config.DEFAULT_FTE_SCALING)
-    monthly["capacity_hours"] = (
-        monthly["staff_count"] * monthly["avg_fte"] * weeks_per_month * config.CAPACITY_HOURS_PER_WEEK
+    staff_month_totals["fte_scaling"] = staff_month_totals["fte_scaling"].fillna(
+        config.DEFAULT_FTE_SCALING
     )
+
+    slice_hours = df.groupby([group_col, "staff_name", "month_key"]).agg(
+        slice_hours=("hours_raw", "sum"),
+    ).reset_index()
+    allocation = slice_hours.merge(
+        staff_month_totals, on=["staff_name", "month_key"], how="left"
+    )
+    allocation["hour_share"] = np.where(
+        allocation["total_hours"] > 0,
+        allocation["slice_hours"] / allocation["total_hours"],
+        0,
+    )
+    allocation["supply_fte"] = allocation["fte_scaling"] * allocation["hour_share"]
+    allocation["capacity_hours"] = (
+        allocation["supply_fte"] * weeks_per_month * config.CAPACITY_HOURS_PER_WEEK
+    )
+
+    monthly = allocation.groupby([group_col, "month_key"]).agg(
+        staff_count=("staff_name", "nunique"),
+        supply_fte=("supply_fte", "sum"),
+        capacity_hours=("capacity_hours", "sum"),
+        actual_hours=("slice_hours", "sum"),
+    ).reset_index()
 
     if "is_billable" in df.columns:
         billable = df[df["is_billable"] == True].groupby([group_col, "month_key"])[
@@ -323,10 +375,8 @@ def main():
     monthly_metrics["underquoted_hours"] = (
         monthly_metrics["total_actual_hours"] - monthly_metrics["total_quoted_hours"]
     ).clip(lower=0)
-    capacity_delivery = calculate_capacity_vs_delivery(df_all)
-    capacity_delivery = filter_by_time_window(capacity_delivery, time_window, date_col="month_key")
-
     df_window = filter_by_time_window(df_all, time_window, date_col="month_key")
+    capacity_delivery = calculate_capacity_vs_delivery(df_window, df_base=df_window)
 
     # Job-level data for loss diagnosis and quadrant drill
     category_col = get_category_col(df_all)
@@ -772,9 +822,11 @@ Decision guide:
             st.markdown(
                 """
 **Supply (Capacity)**
-- Staff Count = unique staff_name with time in month_key
-- Avg FTE = mean fte_hours_scaling (default 1.0 if missing)
-- Capacity Hours = Staff Count × Avg FTE × 4.33 × 38
+- Staff capacity is allocated by month based on where each staff member spent hours.
+- Staff-month total hours = Σ(hours_raw) for each staff_name × month_key
+- Hour share for slice = slice_hours / staff_month_total
+- Allocated FTE = fte_hours_scaling × hour share
+- Capacity Hours = Σ(allocated FTE) × 4.33 × 38
 
 **Demand (Actual Delivery)**
 - Actual Hours = Σ(hours_raw) by month_key
@@ -784,6 +836,9 @@ Decision guide:
 - Utilisation = Actual Hours / Capacity Hours
 - Slack Hours = Capacity Hours − Actual Hours
 - Slack % = 100% − Utilisation
+
+This allocation ensures the sum of all departments/categories equals the company total
+and prevents double counting staff who work across multiple areas.
                 """
             )
 
@@ -855,7 +910,7 @@ Decision guide:
     if len(drill_df) == 0:
         st.warning("No data available for the selected drilldown filters.")
     else:
-        drill_capacity = calculate_capacity_vs_delivery(drill_df)
+        drill_capacity = calculate_capacity_vs_delivery(drill_df, df_base=df_window)
         drill_capacity = filter_by_time_window(drill_capacity, time_window, date_col="month_key")
 
         total_capacity = drill_capacity["capacity_hours"].sum()
@@ -906,7 +961,7 @@ Decision guide:
                 break
 
         if next_level:
-            summary = compute_capacity_summary(drill_df, next_level[0])
+            summary = compute_capacity_summary(drill_df, next_level[0], df_base=df_window)
             if len(summary) > 0:
                 st.subheader(f"Next Level Breakdown: {next_level[1]}")
                 st.dataframe(
