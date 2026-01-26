@@ -26,6 +26,39 @@ st.set_page_config(page_title="Job Mix & Demand", page_icon="📊", layout="wide
 
 init_state()
 
+def _compute_staff_month_totals(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute staff-month totals with effective FTE scaling from timesheets."""
+    if "staff_name" not in df.columns or "month_key" not in df.columns:
+        return pd.DataFrame()
+
+    df_base = df.copy()
+    if "hours_raw" not in df_base.columns:
+        df_base["hours_raw"] = 0.0
+
+    if "fte_hours_scaling" in df_base.columns:
+        df_base["fte_hours_scaling"] = df_base["fte_hours_scaling"].fillna(
+            config.DEFAULT_FTE_SCALING
+        )
+
+        def _weighted_fte(group: pd.DataFrame) -> float:
+            weights = group["hours_raw"].fillna(0)
+            total = weights.sum()
+            if total > 0:
+                return float(np.average(group["fte_hours_scaling"], weights=weights))
+            return float(group["fte_hours_scaling"].mean())
+
+        grouped = df_base.groupby(["staff_name", "month_key"])
+        total_hours = grouped["hours_raw"].sum().rename("total_hours")
+        fte_scaling = grouped.apply(_weighted_fte).rename("fte_scaling")
+        staff_month_totals = pd.concat([total_hours, fte_scaling], axis=1).reset_index()
+    else:
+        staff_month_totals = df_base.groupby(["staff_name", "month_key"]).agg(
+            total_hours=("hours_raw", "sum"),
+        ).reset_index()
+        staff_month_totals["fte_scaling"] = config.DEFAULT_FTE_SCALING
+
+    return staff_month_totals
+
 
 def calculate_job_cohorts(df: pd.DataFrame, cohort_type: str = "first_activity") -> pd.DataFrame:
     """
@@ -129,23 +162,23 @@ def calculate_job_mix_metrics(df: pd.DataFrame, cohort_df: pd.DataFrame) -> pd.D
 
 def calculate_demand_vs_supply(df: pd.DataFrame, monthly_metrics: pd.DataFrame) -> pd.DataFrame:
     """Calculate demand vs supply comparison."""
-    
-    # Get supply capacity by month
-    # Count unique staff per month and their capacity
-    staff_months = df.groupby(["month_key", "staff_name"]).agg(
-        fte_scaling=("fte_hours_scaling", "first"),
-    ).reset_index()
-    staff_months["fte_scaling"] = staff_months["fte_scaling"].fillna(config.DEFAULT_FTE_SCALING)
-    
-    supply = staff_months.groupby("month_key").agg(
+
+    # Get supply capacity by month using effective FTE from timesheets
+    staff_month_totals = _compute_staff_month_totals(df)
+    if len(staff_month_totals) == 0:
+        return pd.DataFrame()
+
+    supply = staff_month_totals.groupby("month_key").agg(
         staff_count=("staff_name", "nunique"),
         avg_fte=("fte_scaling", "mean"),
+        supply_fte=("fte_scaling", "sum"),
     ).reset_index()
-    
+
     # Supply capacity
     weeks_per_month = 4.33
-    supply["supply_fte"] = supply["staff_count"] * supply["avg_fte"]
-    supply["supply_capacity_hours"] = supply["supply_fte"] * weeks_per_month * config.CAPACITY_HOURS_PER_WEEK
+    supply["supply_capacity_hours"] = (
+        supply["supply_fte"] * weeks_per_month * config.CAPACITY_HOURS_PER_WEEK
+    )
     
     # Merge with demand
     comparison = monthly_metrics.merge(
@@ -182,13 +215,9 @@ def calculate_capacity_vs_delivery(df: pd.DataFrame, df_base: pd.DataFrame = Non
         df_base = df
 
     weeks_per_month = 4.33
-    staff_month_totals = df_base.groupby(["staff_name", "month_key"]).agg(
-        total_hours=("hours_raw", "sum"),
-        fte_scaling=("fte_hours_scaling", "first"),
-    ).reset_index()
-    staff_month_totals["fte_scaling"] = staff_month_totals["fte_scaling"].fillna(
-        config.DEFAULT_FTE_SCALING
-    )
+    staff_month_totals = _compute_staff_month_totals(df_base)
+    if len(staff_month_totals) == 0:
+        return pd.DataFrame()
 
     slice_hours = df.groupby(["staff_name", "month_key"]).agg(
         slice_hours=("hours_raw", "sum"),
@@ -255,13 +284,9 @@ def compute_capacity_summary(
         df_base = df
 
     weeks_per_month = 4.33
-    staff_month_totals = df_base.groupby(["staff_name", "month_key"]).agg(
-        total_hours=("hours_raw", "sum"),
-        fte_scaling=("fte_hours_scaling", "first"),
-    ).reset_index()
-    staff_month_totals["fte_scaling"] = staff_month_totals["fte_scaling"].fillna(
-        config.DEFAULT_FTE_SCALING
-    )
+    staff_month_totals = _compute_staff_month_totals(df_base)
+    if len(staff_month_totals) == 0:
+        return pd.DataFrame()
 
     group_cols = []
     for col in [group_col, "staff_name", "month_key"]:
@@ -507,11 +532,17 @@ def main():
     with st.expander("How these are calculated", expanded=False):
         st.markdown(
             """
-- Total Quoted Hours = sum of `quoted_time_total` by job
-- Total Actual Hours = sum of `hours_raw` by job
-- Avg $/Job = Total Quoted $ / Jobs
-- $/Quoted Hr = Total Quoted $ / Total Quoted Hours
-- Quoted vs Actual = Total Quoted Hours / Total Actual Hours
+**Job counts and quote sizing**
+- **Jobs**: count of unique `job_no` within the selected time window.
+- **Total Quoted Hours**: safe sum of `quoted_time_total` at the job‑task level to avoid double counting.
+- **Total Actual Hours**: sum of `hours_raw` across all rows in the window.
+- **Avg $/Job**: Total Quoted $ ÷ Jobs.
+- **$/Quoted Hr**: Total Quoted $ ÷ Total Quoted Hours.
+- **Quoted vs Actual**: Total Quoted Hours ÷ Total Actual Hours (values < 1.0 indicate under‑quoting).
+
+**Why “safe” totals matter**
+Quote fields repeat on each timesheet row. We dedupe at (job_no, task_name) before summing so
+quotes aren’t inflated by multiple rows.
             """
         )
     
@@ -900,22 +931,26 @@ Decision guide:
         )
 
         st.caption(
-            "Plain-English method: we only count staff who actually logged time in the month. "
-            "Each person has a weekly capacity (38 × FTE). We convert that to monthly hours, "
-            "then compare it to the hours they actually delivered. Slack is the gap. "
-            "When staff work across departments, their capacity is split in proportion to "
-            "where their timesheet hours went, so totals reconcile cleanly."
+            "Plain‑English method: we only count staff who logged time in the month. "
+            "If `fte_hours_scaling` is present, we use it to compute each staff member’s effective FTE "
+            "(weighted by their logged hours if it varies within a month). That FTE becomes capacity "
+            "(38 hours/week × 4.33 weeks). We then compare capacity to actual hours delivered. "
+            "Slack is the gap. When staff work across departments, we split their capacity in proportion "
+            "to where their timesheet hours went so totals reconcile cleanly."
         )
 
         with st.expander("Methodology and reconciliation (operational view)", expanded=False):
             st.markdown(
                 """
 **Supply (Capacity)**
-- Staff capacity is allocated by month based on where each staff member spent hours.
-- Staff-month total hours = Σ(hours_raw) for each staff_name × month_key
-- Hour share for slice = slice_hours / staff_month_total
-- Allocated FTE = fte_hours_scaling × hour share
-- Capacity Hours = Σ(allocated FTE) × 4.33 × 38
+- We only count staff who logged time in the month.
+- **Effective FTE (staff‑month)**:
+  - If `fte_hours_scaling` exists, we compute a **weighted average** by `hours_raw` for that staff‑month.
+  - If it doesn’t exist, we fall back to 1.0.
+- **Staff‑month total hours** = Σ(`hours_raw`) for each (staff_name, month_key).
+- **Hour share for a slice** = slice_hours ÷ staff‑month total hours.
+- **Allocated FTE** = effective FTE × hour share.
+- **Capacity Hours** = Σ(allocated FTE) × 4.33 × 38.
 
 **Demand (Actual Delivery)**
 - Actual Hours = Σ(hours_raw) by month_key
@@ -1114,8 +1149,9 @@ and prevents double counting staff who work across multiple areas.
         st.subheader("Slack Hotspots (Current Selection)")
         st.caption(
             "Slack is derived from timesheet hours. Each staff member's monthly capacity is allocated "
-            "across departments/categories/tasks based on where their hours went, so cross‑department work "
-            "is captured and totals reconcile."
+            "across departments/categories/tasks based on where their hours went. If `fte_hours_scaling` is "
+            "available, it determines each staff member’s effective monthly capacity; otherwise we assume 1.0. "
+            "This captures cross‑department work and keeps totals reconciling."
         )
         hotspot_levels = [
             ("department_final", "Department"),
@@ -1133,11 +1169,14 @@ and prevents double counting staff who work across multiple areas.
                 st.markdown(
                     """
 **How slack is allocated**
-- Staff-month capacity = 38 × FTE (default 1.0) × 4.33 weeks
-- Hour share = slice hours / total hours for each staff-month
-- Allocated capacity = staff-month capacity × hour share
-- Slack Hours = allocated capacity − actual hours
-- Slack % = 100% − utilisation
+- **Effective staff‑month FTE**:
+  - If `fte_hours_scaling` exists, we compute a weighted average by `hours_raw` for that staff‑month.
+  - Otherwise, we assume FTE = 1.0.
+- **Staff‑month capacity** = 38 × Effective FTE × 4.33 weeks.
+- **Hour share** = slice hours ÷ total hours for each staff‑month.
+- **Allocated capacity** = staff‑month capacity × hour share.
+- **Slack Hours** = allocated capacity − actual hours.
+- **Slack %** = 100% − utilisation.
 
 **Why this works**
 - Uses timesheets, so cross‑department work is included.
