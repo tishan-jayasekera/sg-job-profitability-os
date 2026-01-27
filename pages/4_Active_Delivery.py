@@ -424,6 +424,8 @@ def main():
         <style>
         .sg-band {background:#f7f7f2;border:1px solid #eceae3;border-radius:18px;padding:22px 24px;margin:10px 0 22px;}
         .sg-band h3 {margin:0 0 6px 0;}
+        .sg-section-title {font-size:1.2rem;font-weight:700;margin:0;}
+        .sg-section-sub {color:#6b6b6b;font-size:0.95rem;margin:4px 0 12px 0;}
         .sg-subtle {color:#6b6b6b;font-size:0.95rem;}
         .sg-divider {height:1px;background:#eceae3;margin:16px 0;}
         .sg-card {background:#ffffff;border:1px solid #eceae3;border-radius:14px;padding:14px 16px;margin:6px 0;}
@@ -530,8 +532,14 @@ def main():
     # SECTION 1 — RISK QUEUE
     # ======================================================================
     st.markdown('<div class="sg-band">', unsafe_allow_html=True)
-    st.markdown("### Section 1 — Risk Queue")
-    st.markdown('<div class="sg-subtle">Prioritised list of jobs with the highest intervention value.</div>', unsafe_allow_html=True)
+    st.markdown("<div class='sg-section-title'>Section 1 — Risk Queue</div>", unsafe_allow_html=True)
+    st.markdown("<div class='sg-section-sub'>Prioritised list of jobs with the highest intervention value.</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='sg-card'><div class='sg-kpi-title'>So what</div>"
+        "<div class='sg-kpi-sub'>Start with Red bands and the top two drivers. "
+        "These are the highest‑impact intervention candidates.</div></div>",
+        unsafe_allow_html=True,
+    )
 
     left, right = st.columns([0.72, 0.28])
     with left:
@@ -591,8 +599,14 @@ def main():
     # SECTION 2 — FORECAST & INTERVENTION
     # ======================================================================
     st.markdown('<div class="sg-band">', unsafe_allow_html=True)
-    st.markdown("### Section 2 — Forecast & Intervention")
-    st.markdown('<div class="sg-subtle">Mechanics are explicit. Outputs tie to intervention levers.</div>', unsafe_allow_html=True)
+    st.markdown("<div class='sg-section-title'>Section 2 — Forecast & Intervention</div>", unsafe_allow_html=True)
+    st.markdown("<div class='sg-section-sub'>Mechanics are explicit. Outputs tie to intervention levers.</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='sg-card'><div class='sg-kpi-title'>So what</div>"
+        "<div class='sg-kpi-sub'>Forecast tells you where the job lands vs quote; "
+        "interventions explain how to correct course.</div></div>",
+        unsafe_allow_html=True,
+    )
 
     forecast_col, action_col = st.columns(2)
     with forecast_col:
@@ -616,6 +630,7 @@ def main():
         remaining = job_row.get("remaining_hours")
         eac = job_row["actual_hours"] + (remaining if pd.notna(remaining) else 0)
 
+        st.markdown("<div class='sg-card'>", unsafe_allow_html=True)
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=cum_actual.index,
@@ -634,7 +649,9 @@ def main():
             yaxis_title="Cumulative Hours",
         )
         st.plotly_chart(fig, use_container_width=True, key=f"forecast_burndown_{selected_job}")
+        st.markdown("</div>", unsafe_allow_html=True)
 
+        st.markdown("<div class='sg-card'>", unsafe_allow_html=True)
         kpi_cols = st.columns(3)
         with kpi_cols[0]:
             st.markdown(_kpi_card("EAC Hours", fmt_hours(eac), "Forecast total"), unsafe_allow_html=True)
@@ -644,6 +661,7 @@ def main():
         with kpi_cols[2]:
             eta_label = f"{eta_days:.0f}" if pd.notna(eta_days) else "—"
             st.markdown(_kpi_card("ETA Completion (days)", eta_label, "From burn rate"), unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
         # Inputs panel for traceability
         actual_hours = job_row.get("actual_hours", np.nan)
@@ -762,8 +780,14 @@ def main():
     # SECTION 3 — JOB DEEP-DIVE
     # ======================================================================
     st.markdown('<div class="sg-band">', unsafe_allow_html=True)
-    st.markdown("### Section 3 — Job Deep‑Dive")
-    st.markdown('<div class="sg-subtle">Traceability from job health → tasks → staff.</div>', unsafe_allow_html=True)
+    st.markdown("<div class='sg-section-title'>Section 3 — Job Deep‑Dive</div>", unsafe_allow_html=True)
+    st.markdown("<div class='sg-section-sub'>Traceability from job health → tasks → staff.</div>", unsafe_allow_html=True)
+    st.markdown(
+        "<div class='sg-card'><div class='sg-kpi-title'>So what</div>"
+        "<div class='sg-kpi-sub'>Use this to pinpoint what’s driving margin erosion and "
+        "where to intervene (task or staff).</div></div>",
+        unsafe_allow_html=True,
+    )
 
     tab_a, tab_b, tab_c = st.tabs(["Delivery Health", "Profitability", "Drivers"])
 
