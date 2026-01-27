@@ -267,6 +267,11 @@ def calculate_capacity_vs_delivery(df: pd.DataFrame, df_base: pd.DataFrame = Non
         capacity["actual_hours"] / capacity["capacity_hours"] * 100,
         np.nan,
     )
+    capacity["billable_utilisation_pct"] = np.where(
+        capacity["capacity_hours"] > 0,
+        capacity["billable_hours"] / capacity["capacity_hours"] * 100,
+        np.nan,
+    )
     capacity["slack_hours"] = capacity["capacity_hours"] - capacity["actual_hours"]
     capacity["slack_pct"] = 100 - capacity["utilisation_pct"]
     capacity["month_key"] = pd.to_datetime(capacity["month_key"])
@@ -333,7 +338,7 @@ def compute_capacity_summary(
 
     summary = monthly.groupby(group_col).agg(
         months=("month_key", "nunique"),
-        avg_staff=("staff_count", "mean"),
+        avg_fte_equiv=("supply_fte", "mean"),
         capacity_hours=("capacity_hours", "sum"),
         actual_hours=("actual_hours", "sum"),
         billable_hours=("billable_hours", "sum"),
@@ -343,6 +348,11 @@ def compute_capacity_summary(
     summary["utilisation_pct"] = np.where(
         summary["capacity_hours"] > 0,
         summary["actual_hours"] / summary["capacity_hours"] * 100,
+        np.nan,
+    )
+    summary["billable_utilisation_pct"] = np.where(
+        summary["capacity_hours"] > 0,
+        summary["billable_hours"] / summary["capacity_hours"] * 100,
         np.nan,
     )
     summary["slack_hours"] = summary["capacity_hours"] - summary["actual_hours"]
@@ -532,22 +542,24 @@ def main():
     with st.expander("How these are calculated", expanded=False):
         st.markdown(
             """
-**The story these KPIs tell**
-We start by counting how many unique jobs entered the system in the chosen period.  
-Then we size those jobs using the quotes (what we planned to deliver) and compare that to what
-actually happened in the timesheets (what we truly delivered).
+**Executive question**  
+Are we quoting the right amount of work, and does actual delivery track what we planned?
 
-**What each number means**
-- **Jobs**: unique job count in the period.
-- **Total Quoted Hours**: the hours originally promised, summed safely at job‑task level.
-- **Total Actual Hours**: the hours actually worked.
-- **Avg $/Job**: average quoted value per job.
-- **$/Quoted Hr**: value per quoted hour (a pricing signal).
-- **Quoted vs Actual**: planned hours divided by actual hours (below 1.0 means we under‑quoted).
+**Approach**  
+We count distinct jobs, use quotes to measure planned scope, and compare that plan to real timesheet
+hours. This yields a clean view of pricing and workload sizing.
 
-**Why we use “safe” quote totals**
-Quotes are repeated on every timesheet row. If we simply sum them, we overstate demand.
-So we first dedupe at (job_no, task_name) to keep the quote numbers honest.
+**Key calculations (plain English)**  
+- **Jobs**: unique job count in the period.  
+- **Total Quoted Hours**: promised hours, summed safely at job‑task level.  
+- **Total Actual Hours**: hours actually worked.  
+- **Avg $/Job**: quoted dollars per job.  
+- **$/Quoted Hr**: value per quoted hour (pricing signal).  
+- **Quoted vs Actual**: planned hours ÷ actual hours (below 1.0 = under‑quoted).
+
+**Why “safe” totals matter**  
+Quotes repeat on each timesheet row. We dedupe at (job_no, task_name) before summing so the
+planned hours aren’t inflated.
             """
         )
     
@@ -886,7 +898,7 @@ Operational signals:
                 go.Scatter(
                     x=capacity_delivery["month_key"],
                     y=capacity_delivery["utilisation_pct"],
-                    name="Utilisation (Actual)",
+                    name="Utilisation (Total Hours)",
                     mode="lines+markers",
                     line=dict(color="#54a24b", width=2),
                 )
@@ -895,13 +907,13 @@ Operational signals:
                 go.Scatter(
                     x=capacity_delivery["month_key"],
                     y=capacity_delivery["scenario_utilisation"],
-                    name=f"Utilisation (+{growth_pct}%)",
+                    name=f"Utilisation (Total, +{growth_pct}%)",
                     mode="lines+markers",
                     line=dict(color="#e45756", width=2, dash="dash"),
                 )
             )
             fig.update_layout(
-                title="Utilisation Under Growth Scenario",
+                title="Total Utilisation Under Growth Scenario",
                 yaxis=dict(title="%"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
@@ -912,7 +924,7 @@ Operational signals:
         latest = capacity_delivery.sort_values("month_key").tail(1)
         if len(latest) > 0:
             latest_row = latest.iloc[0]
-            kpi_cols = st.columns(6)
+            kpi_cols = st.columns(7)
             with kpi_cols[0]:
                 st.metric("Staff Count", fmt_count(latest_row["staff_count"]))
             with kpi_cols[1]:
@@ -924,14 +936,16 @@ Operational signals:
             with kpi_cols[4]:
                 st.metric("Slack Hours", fmt_hours(latest_row["slack_hours"]))
             with kpi_cols[5]:
-                st.metric("Utilisation", fmt_percent(latest_row["utilisation_pct"]))
+                st.metric("Utilisation (Total)", fmt_percent(latest_row["utilisation_pct"]))
+            with kpi_cols[6]:
+                st.metric("Billable Utilisation", fmt_percent(latest_row["billable_utilisation_pct"]))
 
         st.info(
             """
 Decision guide:
-- If utilisation is consistently low and slack is high, you have capacity — sales/BD focus.
-- If utilisation is near 100% and slack is low/negative, you need hiring or reprioritisation.
-- If utilisation is moderate but billable hours are low, this is a resourcing/ops mix issue.
+- If total utilisation is consistently low and slack is high, you have capacity — sales/BD focus.
+- If total utilisation is near 100% and slack is low/negative, you need hiring or reprioritisation.
+- If total utilisation is moderate but billable utilisation is low, this is a resourcing/ops mix issue.
             """
         )
 
@@ -944,30 +958,32 @@ Decision guide:
         with st.expander("Methodology and reconciliation (operational view)", expanded=False):
             st.markdown(
                 """
-**Why this model exists**
-Leaders need a clean, apples‑to‑apples view of capacity versus delivery. But staff split time across teams,
-which can inflate totals if you simply sum each team’s hours. This method avoids double counting while
-staying grounded in actual timesheets.
+**Executive question**  
+Do we have true spare capacity, or are we fully loaded once we account for how people actually work?
 
-**How we build capacity (supply)**
-1) **Start with real people**: only staff who logged time that month are counted.  
-2) **Determine effective FTE**:
-   - If `fte_hours_scaling` is present, we compute a weighted average (weighted by hours worked that month).
-   - If it’s missing, we assume 1.0.  
-3) **Translate to monthly capacity**: 38 hours/week × 4.33 weeks × effective FTE.  
-4) **Allocate capacity fairly**: if a person splits time across areas, their capacity is split in the same
-   proportion as their timesheet hours.
+**Design principle**  
+Capacity must reconcile across teams. If a person splits time across multiple areas, we split their capacity
+the same way — so totals add up cleanly and no one is double‑counted.
 
-**How we measure demand**
-- **Actual Hours**: total hours worked in the month.  
+**How we build supply (capacity)**  
+1) **Start with real activity**: only staff who logged time in the month are counted.  
+2) **Compute effective FTE**:  
+   - If `fte_hours_scaling` exists, use a hours‑weighted average for that staff‑month.  
+   - If it doesn’t, assume 1.0.  
+3) **Convert to monthly capacity**: 38 hours/week × 4.33 weeks × effective FTE.  
+4) **Allocate capacity across slices**: split a person’s capacity in proportion to their timesheet hours.
+
+**How we measure demand**  
+- **Actual Hours**: total hours delivered in the month.  
 - **Billable vs Non‑Billable**: split using the `is_billable` flag.
 
-**How we interpret the result**
-- **Utilisation** = Actual Hours ÷ Capacity Hours.  
+**How to read the output**  
+- **Utilisation (Total)** = (Billable + Non‑Billable Hours) ÷ Capacity Hours.  
+- **Billable Utilisation** = Billable Hours ÷ Capacity Hours.  
 - **Slack Hours** = Capacity Hours − Actual Hours.  
-- **Slack %** = 100% − Utilisation.  
+- **Slack %** = 100% − Utilisation (Total).  
 
-This guarantees roll‑ups reconcile at company level without overstating supply or demand.
+This produces an apples‑to‑apples view of capacity vs delivery that reconciles at the company total.
                 """
             )
 
@@ -981,6 +997,7 @@ This guarantees roll‑ups reconcile at company level without overstating supply
                     "billable_hours",
                     "nonbillable_hours",
                     "utilisation_pct",
+                    "billable_utilisation_pct",
                     "slack_hours",
                 ]].rename(columns={
                     "month_key": "Month",
@@ -990,7 +1007,8 @@ This guarantees roll‑ups reconcile at company level without overstating supply
                     "actual_hours": "Actual Hours",
                     "billable_hours": "Billable Hours",
                     "nonbillable_hours": "Non‑Billable Hours",
-                    "utilisation_pct": "Utilisation",
+                    "utilisation_pct": "Utilisation (Total)",
+                    "billable_utilisation_pct": "Billable Utilisation",
                     "slack_hours": "Slack Hours",
                 }),
                 use_container_width=True,
@@ -1002,7 +1020,8 @@ This guarantees roll‑ups reconcile at company level without overstating supply
                     "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
                     "Billable Hours": st.column_config.NumberColumn(format="%.1f"),
                     "Non‑Billable Hours": st.column_config.NumberColumn(format="%.1f"),
-                    "Utilisation": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Utilisation (Total)": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Billable Utilisation": st.column_config.NumberColumn(format="%.1f%%"),
                     "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
                 },
             )
@@ -1014,9 +1033,9 @@ This guarantees roll‑ups reconcile at company level without overstating supply
     # =========================================================================
     section_header("Operational Drilldown", "Follow the delivery chain to locate slack or overload")
     st.caption(
-        "Plain-English method: we only count staff who logged time in the selected period. "
-        "Capacity is allocated based on their timesheet hour share across the chain, "
-        "so the sum of departments/categories equals the company total."
+        "How to read this drilldown: capacity is allocated using real timesheet shares, so when you move "
+        "from department → category → staff → task, the totals always reconcile. "
+        "“Avg FTE (equiv)” reflects capacity‑weighted staffing, not simple headcount."
     )
 
     category_col = "category_rev_job" if "category_rev_job" in df_window.columns else get_category_col(df_window)
@@ -1049,10 +1068,12 @@ This guarantees roll‑ups reconcile at company level without overstating supply
 
         total_capacity = drill_capacity["capacity_hours"].sum()
         total_actual = drill_capacity["actual_hours"].sum()
+        total_billable = drill_capacity["billable_hours"].sum() if "billable_hours" in drill_capacity.columns else 0
         total_slack = total_capacity - total_actual
-        utilisation = (total_actual / total_capacity * 100) if total_capacity > 0 else np.nan
+        utilisation_total = (total_actual / total_capacity * 100) if total_capacity > 0 else np.nan
+        utilisation_billable = (total_billable / total_capacity * 100) if total_capacity > 0 else np.nan
 
-        kpi_cols = st.columns(4)
+        kpi_cols = st.columns(5)
         with kpi_cols[0]:
             st.metric("Capacity Hours", fmt_hours(total_capacity))
         with kpi_cols[1]:
@@ -1060,7 +1081,9 @@ This guarantees roll‑ups reconcile at company level without overstating supply
         with kpi_cols[2]:
             st.metric("Slack Hours", fmt_hours(total_slack))
         with kpi_cols[3]:
-            st.metric("Utilisation", fmt_percent(utilisation))
+            st.metric("Utilisation (Total)", fmt_percent(utilisation_total))
+        with kpi_cols[4]:
+            st.metric("Billable Utilisation", fmt_percent(utilisation_billable))
 
         fig = go.Figure()
         fig.add_trace(
@@ -1101,12 +1124,13 @@ This guarantees roll‑ups reconcile at company level without overstating supply
                 st.dataframe(
                     summary.rename(columns={
                         next_level[0]: next_level[1],
-                        "avg_staff": "Avg Staff",
+                        "avg_fte_equiv": "Avg FTE (equiv)",
                         "capacity_hours": "Capacity Hours",
                         "actual_hours": "Actual Hours",
                         "billable_hours": "Billable Hours",
                         "nonbillable_hours": "Non‑Billable Hours",
-                        "utilisation_pct": "Utilisation",
+                        "utilisation_pct": "Utilisation (Total)",
+                        "billable_utilisation_pct": "Billable Utilisation",
                         "slack_hours": "Slack Hours",
                         "slack_pct": "Slack %",
                         "billable_ratio": "Billable Ratio",
@@ -1118,11 +1142,12 @@ This guarantees roll‑ups reconcile at company level without overstating supply
                         "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
                         "Billable Hours": st.column_config.NumberColumn(format="%.1f"),
                         "Non‑Billable Hours": st.column_config.NumberColumn(format="%.1f"),
-                        "Utilisation": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Utilisation (Total)": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Billable Utilisation": st.column_config.NumberColumn(format="%.1f%%"),
                         "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
                         "Slack %": st.column_config.NumberColumn(format="%.1f%%"),
                         "Billable Ratio": st.column_config.NumberColumn(format="%.1f%%"),
-                        "Avg Staff": st.column_config.NumberColumn(format="%.2f"),
+                        "Avg FTE (equiv)": st.column_config.NumberColumn(format="%.2f"),
                     },
                 )
 
@@ -1153,10 +1178,10 @@ This guarantees roll‑ups reconcile at company level without overstating supply
 
         st.subheader("Slack Hotspots (Current Selection)")
         st.caption(
-            "Slack is derived from timesheet hours. Each staff member's monthly capacity is allocated "
-            "across departments/categories/tasks based on where their hours went. "
-            "If `fte_hours_scaling` is available, it drives each person’s effective capacity; "
-            "otherwise we assume 1.0. This captures cross‑team work while keeping totals honest."
+            "Slack hotspots highlight where capacity exists after accounting for actual work. "
+            "We allocate each person’s capacity based on where they spent their time, using "
+            "`fte_hours_scaling` when available (otherwise assuming 1.0). "
+            "This avoids double counting and makes hotspots comparable across levels."
         )
         hotspot_levels = [
             ("department_final", "Department"),
@@ -1173,23 +1198,26 @@ This guarantees roll‑ups reconcile at company level without overstating supply
             with st.expander(f"Methodology: {label} slack calculation", expanded=False):
                 st.markdown(
                     """
-**The story behind slack**
-We’re not guessing capacity — we anchor it to real timesheet behavior, then distribute it fairly.
+**Executive question**  
+Where is real spare capacity once we account for how people actually spent their time?
 
-**How it’s calculated**
-1) **Find each staff‑month’s effective FTE**  
-   - Weighted by hours if `fte_hours_scaling` is available  
-   - Otherwise assume 1.0  
-2) **Convert to capacity**  
-   - 38 hours/week × 4.33 weeks × effective FTE  
+**Why this method is fair**  
+We anchor capacity to real timesheets and then split it across the same slices of work.  
+That way, people who work across areas aren’t counted twice.
+
+**How we calculate slack (in four steps)**  
+1) **Estimate effective FTE per staff‑month**  
+   - Use hours‑weighted `fte_hours_scaling` when available; otherwise assume 1.0.  
+2) **Convert FTE to monthly capacity**  
+   - 38 hours/week × 4.33 weeks × effective FTE.  
 3) **Allocate capacity to the slice**  
-   - Split by the share of hours that slice represents  
+   - Based on each slice’s share of that person’s hours.  
 4) **Compute slack**  
-   - Slack = allocated capacity − actual hours  
-   - Slack % = 100% − utilisation  
+   - Slack = allocated capacity − actual hours.  
+   - Slack % = 100% − utilisation.  
 
-**Why you can trust it**
-It respects cross‑team work and avoids double counting, so totals reconcile cleanly.
+**Interpretation**  
+High slack means unutilised capacity; negative slack indicates overload.
                     """
                 )
             top_hotspot = hotspot.sort_values("slack_hours", ascending=False).head(8)
@@ -1201,7 +1229,8 @@ It respects cross‑team work and avoids double counting, so totals reconcile cl
                     "actual_hours": "Actual Hours",
                     "slack_hours": "Slack Hours",
                     "slack_pct": "Slack %",
-                    "utilisation_pct": "Utilisation",
+                    "utilisation_pct": "Utilisation (Total)",
+                    "billable_utilisation_pct": "Billable Utilisation",
                 }),
                 use_container_width=True,
                 hide_index=True,
@@ -1210,7 +1239,8 @@ It respects cross‑team work and avoids double counting, so totals reconcile cl
                     "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
                     "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
                     "Slack %": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Utilisation": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Utilisation (Total)": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Billable Utilisation": st.column_config.NumberColumn(format="%.1f%%"),
                 },
             )
 

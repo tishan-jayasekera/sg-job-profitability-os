@@ -131,7 +131,9 @@ def main():
         st.metric("Realised Rate", fmt_rate(prof["realised_rate"].iloc[0]))
     
     with kpi_cols[6]:
-        st.metric("Utilisation", fmt_percent(util["utilisation"].iloc[0]))
+        st.metric("Billable Share", fmt_percent(util["utilisation"].iloc[0]))
+
+    st.caption("Billable Share = billable hours ÷ total hours (excl. leave). This is not capacity-based utilisation.")
     
     st.markdown("---")
     
@@ -329,7 +331,7 @@ def render_drill_table_section(df: pd.DataFrame, group_col: str, can_drill: bool
         "realised_rate": "Rate",
         "hours_variance_pct": "Hrs Var %",
         "unquoted_share": "Scope Creep",
-        "utilisation": "Util %",
+        "utilisation": "Billable %",
     }
     formatted_df = formatted_df.rename(columns=col_names)
     
@@ -416,7 +418,7 @@ def render_action_shortlist(df: pd.DataFrame):
                 actions.append({
                     "type": "Low Billable Share",
                     "location": row["department_final"],
-                    "detail": f"{row['utilisation']:.1f}% billable",
+                    "detail": f"{row['utilisation']:.1f}% billable share of hours",
                     "page": "Time Allocation"
                 })
     

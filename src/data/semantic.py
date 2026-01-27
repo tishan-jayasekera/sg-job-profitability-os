@@ -327,7 +327,10 @@ def quote_delivery_metrics(df: pd.DataFrame, group_keys: Optional[List[str]] = N
 def utilisation_metrics(df: pd.DataFrame, group_keys: Optional[List[str]] = None, 
                         exclude_leave: bool = True) -> pd.DataFrame:
     """
-    Compute descriptive utilisation metrics (no targets).
+    Compute descriptive billable share metrics (no capacity targets).
+
+    NOTE: This is billable hours as a share of total hours,
+    not capacity-based utilisation.
     """
     df = df.copy()
     
@@ -356,6 +359,7 @@ def utilisation_metrics(df: pd.DataFrame, group_keys: Optional[List[str]] = None
         result["billable_hours"] / result["total_hours"] * 100,
         0
     )
+    result["billable_share_pct"] = result["utilisation"]
     return result
 
 

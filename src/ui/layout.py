@@ -195,7 +195,7 @@ def render_kpi_strip(metrics: dict):
         "margin_pct": ("Margin %", lambda x: fmt_percent(x)),
         "hours": ("Hours", fmt_hours),
         "realised_rate": ("Realised Rate", fmt_rate),
-        "utilisation": ("Utilisation", lambda x: fmt_percent(x)),
+        "utilisation": ("Billable Share", lambda x: fmt_percent(x)),
     }
     
     for i, (key, value) in enumerate(metrics.items()):

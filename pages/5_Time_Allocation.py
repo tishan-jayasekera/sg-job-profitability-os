@@ -98,6 +98,7 @@ def main():
         st.metric("Billable Ratio", fmt_percent(billable_ratio * 100))
     
     st.info("This is descriptive - how time was actually spent. There is no target.")
+    st.caption("Billable Ratio = billable hours ÷ total hours (actual). This is not capacity-based utilisation.")
     
     st.divider()
     
