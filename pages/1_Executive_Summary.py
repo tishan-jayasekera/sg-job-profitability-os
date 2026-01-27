@@ -186,6 +186,27 @@ def main():
     </div>
     """
     st.markdown(kpi_html, unsafe_allow_html=True)
+    with st.expander("Metric Definitions (Executive Summary)", expanded=False):
+        st.markdown(
+            """
+**KPI Snapshot**
+- **Revenue** = Σ `rev_alloc`
+- **Cost** = Σ `base_cost`
+- **Margin** = Revenue − Cost
+- **Margin %** = Margin ÷ Revenue
+- **Hours** = Σ `hours_raw`
+- **Realised Rate** = Revenue ÷ Hours
+- **Billable Share** = Billable Hours ÷ Total Hours (excl. leave)
+- **Quoted/Actual Hrs** = Quoted Hours ÷ Actual Hours (safe quote rollup)
+
+**Health Snapshot**
+- **Hours Variance** = (Actual Hours − Quoted Hours) ÷ Quoted Hours
+- **Scope Creep** = Unquoted Hours ÷ Total Hours
+- **Quote Rate** = Quoted Amount ÷ Quoted Hours (safe rollup)
+- **Rate Variance** = Realised Rate − Quote Rate
+- **Jobs at Risk** = jobs with a majority of job‑tasks exceeding quoted hours
+            """
+        )
 
     # =========================================================================
     # SECTION B: HEALTH SNAPSHOT
@@ -241,9 +262,9 @@ def main():
 
         col1, col2 = st.columns(2)
         st.caption(
-            "Margin % by department is calculated as (Σ revenue − Σ cost) ÷ Σ revenue, "
-            "using `rev_alloc` and `base_cost` summed within each department. "
-            "This is an aggregate margin, not a simple average of job margins."
+            "Margin % by department = (Σ revenue − Σ cost) ÷ Σ revenue. "
+            "Revenue is `rev_alloc` and cost is `base_cost`, summed within each department "
+            "(aggregate margin, not a simple average)."
         )
         with col1:
             fig = px.bar(
@@ -327,6 +348,7 @@ def main():
                 max_val = max(job_level["quoted_hours"].max(), job_level["actual_hours"].max())
                 fig.add_shape(type="line", x0=0, y0=0, x1=max_val, y1=max_val, line=dict(color="gray", dash="dash"))
                 st.plotly_chart(fig, use_container_width=True)
+                st.caption("Dots above the diagonal indicate jobs exceeding quoted hours.")
     st.markdown("</div>", unsafe_allow_html=True)
 
     # =========================================================================
