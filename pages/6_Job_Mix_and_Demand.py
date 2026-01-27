@@ -417,8 +417,8 @@ def main():
     st.caption("Analyze job intake patterns and capacity implications")
     
     # Load data
-    df_all = load_fact_timesheet()
-    df_all["month_key"] = pd.to_datetime(df_all["month_key"])
+    df_all_raw = load_fact_timesheet()
+    df_all_raw["month_key"] = pd.to_datetime(df_all_raw["month_key"])
     
     # Sidebar controls
     st.sidebar.header("Controls")
@@ -442,11 +442,13 @@ def main():
         index=1
     )
     
-    departments = ["All"] + sorted(df_all["department_final"].dropna().unique().tolist())
+    departments = ["All"] + sorted(df_all_raw["department_final"].dropna().unique().tolist())
     selected_dept = st.sidebar.selectbox("Department", departments)
     
     if selected_dept != "All":
-        df_all = df_all[df_all["department_final"] == selected_dept]
+        df_all = df_all_raw[df_all_raw["department_final"] == selected_dept]
+    else:
+        df_all = df_all_raw
     
     # Calculate cohorts
     cohort_df = calculate_job_cohorts(df_all, cohort_type)
@@ -455,6 +457,9 @@ def main():
         st.warning("No job data available for analysis.")
         return
     
+    # Base window for capacity allocation (always full company, time-windowed)
+    df_base_window = filter_by_time_window(df_all_raw, time_window, date_col="month_key")
+
     # Calculate metrics
     monthly_metrics = calculate_job_mix_metrics(df_all, cohort_df)
     monthly_metrics = filter_by_time_window(monthly_metrics, time_window, date_col="cohort_month")
@@ -462,7 +467,7 @@ def main():
         monthly_metrics["total_actual_hours"] - monthly_metrics["total_quoted_hours"]
     ).clip(lower=0)
     df_window = filter_by_time_window(df_all, time_window, date_col="month_key")
-    capacity_delivery = calculate_capacity_vs_delivery(df_window, df_base=df_window)
+    capacity_delivery = calculate_capacity_vs_delivery(df_window, df_base=df_base_window)
 
     # Job-level data for loss diagnosis and quadrant drill
     category_col = get_category_col(df_all)
@@ -708,6 +713,26 @@ planned hours aren’t inflated.
         job_quotes = job_level[(job_level["quoted_hours"] > 0) & (job_level["quoted_amount"] > 0)].copy()
 
         if len(job_quotes) > 5:
+            # Chain filter for this section
+            chain_cols = [
+                ("department_final", "Department"),
+                ("job_category", "Category"),
+            ]
+            chain_filters = {}
+            chain_box = st.columns(len(chain_cols))
+            for idx, (col, label) in enumerate(chain_cols):
+                if col not in job_quotes.columns:
+                    continue
+                options = ["All"] + sorted(job_quotes[col].dropna().unique().tolist())
+                with chain_box[idx]:
+                    choice = st.selectbox(f"{label} (this section)", options, key=f"job_value_chain_{col}")
+                if choice != "All":
+                    chain_filters[col] = choice
+
+            if chain_filters:
+                for col, value in chain_filters.items():
+                    job_quotes = job_quotes[job_quotes[col] == value]
+
             fig = quadrant_scatter(
                 job_quotes,
                 x="quoted_hours",
@@ -777,35 +802,357 @@ planned hours aren’t inflated.
                 np.nan,
             )
 
+            st.subheader("Quadrant Portfolio: Jobs + Profitability Context")
+            st.caption(
+                "This table converts the quadrant into a decision list: who the client is, how much was quoted, "
+                "what has been earned so far, and whether margin is holding up."
+            )
+
+            job_financials = df_window.groupby("job_no").agg(
+                revenue_to_date=("rev_alloc", "sum") if "rev_alloc" in df_window.columns else ("job_no", "count"),
+                cost_to_date=("base_cost", "sum") if "base_cost" in df_window.columns else ("job_no", "count"),
+                hours_to_date=("hours_raw", "sum"),
+            ).reset_index()
+            job_financials["margin_to_date"] = job_financials["revenue_to_date"] - job_financials["cost_to_date"]
+            job_financials["margin_pct_to_date"] = np.where(
+                job_financials["revenue_to_date"] > 0,
+                job_financials["margin_to_date"] / job_financials["revenue_to_date"] * 100,
+                np.nan,
+            )
+
+            job_meta = df_all.groupby("job_no").agg(
+                client=("client", "first") if "client" in df_all.columns else ("job_no", "first"),
+                job_status=("job_status", "first") if "job_status" in df_all.columns else ("job_no", "first"),
+                job_completed_date=("job_completed_date", "first") if "job_completed_date" in df_all.columns else ("job_no", "first"),
+            ).reset_index()
+            if "job_completed_date" in job_meta.columns:
+                job_meta["is_active"] = job_meta["job_completed_date"].isna()
+            elif "job_status" in job_meta.columns:
+                job_meta["is_active"] = ~job_meta["job_status"].str.lower().str.contains("completed", na=False)
+            else:
+                job_meta["is_active"] = True
+
+            quadrant_detail = quadrant_jobs.merge(job_financials, on="job_no", how="left")
+            quadrant_detail = quadrant_detail.merge(job_meta, on="job_no", how="left")
+            quadrant_detail["quote_to_revenue"] = np.where(
+                quadrant_detail["quoted_amount"] > 0,
+                quadrant_detail["revenue_to_date"] / quadrant_detail["quoted_amount"],
+                np.nan,
+            )
+            quadrant_detail["hours_overrun_pct"] = np.where(
+                quadrant_detail["quoted_hours"] > 0,
+                (quadrant_detail["actual_hours"] - quadrant_detail["quoted_hours"]) / quadrant_detail["quoted_hours"] * 100,
+                np.nan,
+            )
+            quadrant_detail["quote_rate"] = np.where(
+                quadrant_detail["quoted_hours"] > 0,
+                quadrant_detail["quoted_amount"] / quadrant_detail["quoted_hours"],
+                np.nan,
+            )
+            quadrant_detail["realised_rate"] = np.where(
+                quadrant_detail["actual_hours"] > 0,
+                quadrant_detail["revenue_to_date"] / quadrant_detail["actual_hours"],
+                np.nan,
+            )
+
+            st.subheader("Active Jobs at Risk (Margin Erosion)")
+            st.caption(
+                "Focus list for delivery leaders. These are active jobs where margins are under pressure "
+                "or trending below quote economics."
+            )
+
+            def _risk_reasons(row: pd.Series) -> str:
+                reasons = []
+                if pd.notna(row.get("margin_pct_to_date")) and row["margin_pct_to_date"] < 15:
+                    reasons.append("Low margin % to date")
+                if pd.notna(row.get("quote_to_revenue")) and row["quote_to_revenue"] < 0.7:
+                    reasons.append("Revenue lagging quote")
+                if pd.notna(row.get("hours_overrun_pct")) and row["hours_overrun_pct"] > 10:
+                    reasons.append("Hours overrun vs quote")
+                if pd.notna(row.get("realised_rate")) and pd.notna(row.get("quote_rate")):
+                    if row["realised_rate"] < row["quote_rate"] * 0.85:
+                        reasons.append("Realised rate below quote rate")
+                return "; ".join(reasons)
+
+            active_risk = quadrant_detail[quadrant_detail["is_active"] == True].copy()
+            active_risk["risk_reason"] = active_risk.apply(_risk_reasons, axis=1)
+            active_risk = active_risk[active_risk["risk_reason"] != ""]
+            active_risk = active_risk.sort_values(["margin_pct_to_date", "quote_to_revenue"], ascending=[True, True])
+
+            if len(active_risk) > 0:
+                st.dataframe(
+                    active_risk.head(12)[
+                        [
+                            "job_no",
+                            "client",
+                            "department_final",
+                            "job_category",
+                            "margin_pct_to_date",
+                            "quote_to_revenue",
+                            "hours_overrun_pct",
+                            "realised_rate",
+                            "quote_rate",
+                            "risk_reason",
+                        ]
+                    ].rename(columns={
+                        "job_no": "Job",
+                        "client": "Client",
+                        "department_final": "Department",
+                        "job_category": "Category",
+                        "margin_pct_to_date": "Margin %",
+                        "quote_to_revenue": "Revenue / Quote",
+                        "hours_overrun_pct": "Hours Overrun %",
+                        "realised_rate": "Realised Rate",
+                        "quote_rate": "Quote Rate",
+                        "risk_reason": "Why At Risk",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Revenue / Quote": st.column_config.NumberColumn(format="%.2fx"),
+                        "Hours Overrun %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Realised Rate": st.column_config.NumberColumn(format="$%.0f"),
+                        "Quote Rate": st.column_config.NumberColumn(format="$%.0f"),
+                    },
+                )
+            else:
+                st.success("No active jobs flagged for margin erosion in this quadrant.")
+
             st.dataframe(
-                quadrant_jobs.sort_values("quoted_amount", ascending=False)[
+                quadrant_detail.sort_values("quoted_amount", ascending=False)[
                     [
                         "job_no",
+                        "client",
                         "department_final",
                         "job_category",
                         "quoted_amount",
+                        "revenue_to_date",
+                        "margin_to_date",
+                        "margin_pct_to_date",
                         "quoted_hours",
                         "actual_hours",
-                        "quoted_vs_actual",
+                        "hours_overrun_pct",
+                        "quote_to_revenue",
+                        "is_active",
                     ]
                 ].rename(columns={
                     "job_no": "Job",
+                    "client": "Client",
                     "department_final": "Department",
                     "job_category": "Category",
                     "quoted_amount": "Quoted $",
+                    "revenue_to_date": "Revenue to Date",
+                    "margin_to_date": "Margin to Date",
+                    "margin_pct_to_date": "Margin %",
                     "quoted_hours": "Quoted Hours",
                     "actual_hours": "Actual Hours",
-                    "quoted_vs_actual": "Quoted/Actual",
+                    "hours_overrun_pct": "Hours Overrun %",
+                    "quote_to_revenue": "Revenue / Quote",
+                    "is_active": "Active",
                 }),
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Quoted $": st.column_config.NumberColumn(format="$%.0f"),
+                    "Revenue to Date": st.column_config.NumberColumn(format="$%.0f"),
+                    "Margin to Date": st.column_config.NumberColumn(format="$%.0f"),
+                    "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
                     "Quoted Hours": st.column_config.NumberColumn(format="%.1f"),
                     "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
-                    "Quoted/Actual": st.column_config.NumberColumn(format="%.2fx"),
+                    "Hours Overrun %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Revenue / Quote": st.column_config.NumberColumn(format="%.2fx"),
+                    "Active": st.column_config.CheckboxColumn(),
                 },
             )
+
+            st.subheader("Job Deep‑Dive: Margin Drivers and Overruns")
+            job_options = quadrant_detail["job_no"].dropna().unique().tolist()
+            if job_options:
+                selected_job = st.selectbox("Select a job to trace margin drivers", job_options, key="job_value_job_select")
+                df_job = df_window[df_window["job_no"] == selected_job].copy()
+
+                st.markdown("**1) Profitability to Date (Selected Window)**")
+                job_fin = quadrant_detail[quadrant_detail["job_no"] == selected_job].iloc[0]
+                kpi_cols = st.columns(5)
+                with kpi_cols[0]:
+                    st.metric("Revenue to Date", fmt_currency(job_fin["revenue_to_date"]))
+                with kpi_cols[1]:
+                    st.metric("Cost to Date", fmt_currency(job_fin["cost_to_date"]))
+                with kpi_cols[2]:
+                    st.metric("Margin to Date", fmt_currency(job_fin["margin_to_date"]))
+                with kpi_cols[3]:
+                    st.metric("Margin %", fmt_percent(job_fin["margin_pct_to_date"]))
+                with kpi_cols[4]:
+                    st.metric("Revenue / Quote", f"{job_fin['quote_to_revenue']:.2f}x" if pd.notna(job_fin["quote_to_revenue"]) else "—")
+
+                st.markdown("**2) Task Cost Leaders & Overruns**")
+                if len(df_job) > 0:
+                    task_cost = df_job.groupby("task_name").agg(
+                        hours=("hours_raw", "sum"),
+                        cost=("base_cost", "sum") if "base_cost" in df_job.columns else ("hours_raw", "sum"),
+                        revenue=("rev_alloc", "sum") if "rev_alloc" in df_job.columns else ("hours_raw", "sum"),
+                    ).reset_index()
+
+                    jt = safe_quote_job_task(df_job)
+                    if len(jt) > 0 and "quoted_time_total" in jt.columns:
+                        task_cost = task_cost.merge(
+                            jt[["task_name", "quoted_time_total"]].rename(columns={"quoted_time_total": "quoted_hours"}),
+                            on="task_name",
+                            how="left",
+                        )
+                    else:
+                        task_cost["quoted_hours"] = np.nan
+
+                    task_cost["hours_overrun"] = task_cost["hours"] - task_cost["quoted_hours"]
+                    task_cost["hours_overrun_pct"] = np.where(
+                        task_cost["quoted_hours"] > 0,
+                        task_cost["hours_overrun"] / task_cost["quoted_hours"] * 100,
+                        np.nan,
+                    )
+                    task_cost["margin"] = task_cost["revenue"] - task_cost["cost"]
+                    task_cost["margin_pct"] = np.where(
+                        task_cost["revenue"] > 0,
+                        task_cost["margin"] / task_cost["revenue"] * 100,
+                        np.nan,
+                    )
+
+                    st.dataframe(
+                        task_cost.sort_values("cost", ascending=False).head(12).rename(columns={
+                            "task_name": "Task",
+                            "hours": "Hours",
+                            "cost": "Cost",
+                            "revenue": "Revenue",
+                            "margin": "Margin",
+                            "margin_pct": "Margin %",
+                            "quoted_hours": "Quoted Hours",
+                            "hours_overrun_pct": "Hours Overrun %",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Hours": st.column_config.NumberColumn(format="%.1f"),
+                            "Cost": st.column_config.NumberColumn(format="$%.0f"),
+                            "Revenue": st.column_config.NumberColumn(format="$%.0f"),
+                            "Margin": st.column_config.NumberColumn(format="$%.0f"),
+                            "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Quoted Hours": st.column_config.NumberColumn(format="%.1f"),
+                            "Hours Overrun %": st.column_config.NumberColumn(format="%.1f%%"),
+                        },
+                    )
+
+                st.markdown("**3) Staff Drivers (FTE‑aware)**")
+                if len(df_job) > 0 and "staff_name" in df_job.columns:
+                    staff_cost = df_job.groupby("staff_name").agg(
+                        hours=("hours_raw", "sum"),
+                        cost=("base_cost", "sum") if "base_cost" in df_job.columns else ("hours_raw", "sum"),
+                        fte_scaling=("fte_hours_scaling", "first") if "fte_hours_scaling" in df_job.columns else ("staff_name", "count"),
+                    ).reset_index()
+                    staff_cost = staff_cost.sort_values("cost", ascending=False).head(10)
+                    st.dataframe(
+                        staff_cost.rename(columns={
+                            "staff_name": "Staff",
+                            "hours": "Hours",
+                            "cost": "Cost",
+                            "fte_scaling": "FTE Scaling",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Hours": st.column_config.NumberColumn(format="%.1f"),
+                            "Cost": st.column_config.NumberColumn(format="$%.0f"),
+                            "FTE Scaling": st.column_config.NumberColumn(format="%.2f"),
+                        },
+                    )
+
+            # Profitability evolution (selected quadrant + chain filters)
+            if "rev_alloc" in df_window.columns and "base_cost" in df_window.columns:
+                profit_month = df_window.groupby(["month_key", "job_no"]).agg(
+                    revenue=("rev_alloc", "sum"),
+                    cost=("base_cost", "sum"),
+                    hours=("hours_raw", "sum"),
+                ).reset_index()
+                profit_month["margin"] = profit_month["revenue"] - profit_month["cost"]
+                profit_month["margin_pct"] = np.where(
+                    profit_month["revenue"] > 0,
+                    profit_month["margin"] / profit_month["revenue"] * 100,
+                    np.nan,
+                )
+                profit_month["realised_rate"] = np.where(
+                    profit_month["hours"] > 0,
+                    profit_month["revenue"] / profit_month["hours"],
+                    np.nan,
+                )
+
+                prof_jobs = set(quadrant_jobs["job_no"].unique().tolist())
+                prof_slice = profit_month[profit_month["job_no"].isin(prof_jobs)]
+                if len(prof_slice) > 0:
+                    trend = prof_slice.groupby("month_key").agg(
+                        revenue=("revenue", "sum"),
+                        cost=("cost", "sum"),
+                        hours=("hours", "sum"),
+                    ).reset_index()
+                    trend["margin"] = trend["revenue"] - trend["cost"]
+                    trend["margin_pct"] = np.where(
+                        trend["revenue"] > 0,
+                        trend["margin"] / trend["revenue"] * 100,
+                        np.nan,
+                    )
+                    trend["realised_rate"] = np.where(
+                        trend["hours"] > 0,
+                        trend["revenue"] / trend["hours"],
+                        np.nan,
+                    )
+
+                    st.subheader("Profitability Evolution (Selected Quadrant)")
+                    fig = go.Figure()
+                    fig.add_trace(
+                        go.Scatter(
+                            x=trend["month_key"],
+                            y=trend["margin_pct"],
+                            name="Margin %",
+                            mode="lines+markers",
+                            line=dict(color="#54a24b", width=2),
+                        )
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=trend["month_key"],
+                            y=trend["realised_rate"],
+                            name="Realised Rate",
+                            mode="lines+markers",
+                            yaxis="y2",
+                            line=dict(color="#4c78a8", width=2),
+                        )
+                    )
+                    fig.update_layout(
+                        yaxis=dict(title="Margin %"),
+                        yaxis2=dict(title="Realised Rate", overlaying="y", side="right"),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        title="Margin % and Realised Rate Over Time",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    st.dataframe(
+                        trend.rename(columns={
+                            "month_key": "Month",
+                            "revenue": "Revenue",
+                            "cost": "Cost",
+                            "margin": "Margin",
+                            "margin_pct": "Margin %",
+                            "realised_rate": "Realised Rate",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Month": st.column_config.DateColumn(format="YYYY-MM"),
+                            "Revenue": st.column_config.NumberColumn(format="$%.0f"),
+                            "Cost": st.column_config.NumberColumn(format="$%.0f"),
+                            "Margin": st.column_config.NumberColumn(format="$%.0f"),
+                            "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Realised Rate": st.column_config.NumberColumn(format="$%.0f"),
+                        },
+                    )
 
             st.info(
                 """
@@ -836,7 +1183,7 @@ Operational signals:
         col1, col2 = st.columns(2)
 
         with col1:
-            dept_summary = compute_capacity_summary(df_window, "department_final", df_base=df_window)
+            dept_summary = compute_capacity_summary(df_window, "department_final", df_base=df_base_window)
             if len(dept_summary) > 0:
                 fig = go.Figure()
                 fig.add_trace(
@@ -926,7 +1273,7 @@ Operational signals:
             latest_row = latest.iloc[0]
             kpi_cols = st.columns(7)
             with kpi_cols[0]:
-                st.metric("Staff Count", fmt_count(latest_row["staff_count"]))
+                st.metric("FTE Equiv", f"{latest_row['supply_fte']:.2f}")
             with kpi_cols[1]:
                 st.metric("Avg FTE", f"{latest_row['avg_fte']:.2f}")
             with kpi_cols[2]:
@@ -990,7 +1337,7 @@ This produces an apples‑to‑apples view of capacity vs delivery that reconcil
             st.dataframe(
                 capacity_delivery[[
                     "month_key",
-                    "staff_count",
+                    "supply_fte",
                     "avg_fte",
                     "capacity_hours",
                     "actual_hours",
@@ -1001,7 +1348,7 @@ This produces an apples‑to‑apples view of capacity vs delivery that reconcil
                     "slack_hours",
                 ]].rename(columns={
                     "month_key": "Month",
-                    "staff_count": "Staff",
+                    "supply_fte": "FTE Equiv",
                     "avg_fte": "Avg FTE",
                     "capacity_hours": "Capacity Hours",
                     "actual_hours": "Actual Hours",
@@ -1015,6 +1362,7 @@ This produces an apples‑to‑apples view of capacity vs delivery that reconcil
                 hide_index=True,
                 column_config={
                     "Month": st.column_config.DateColumn(format="YYYY-MM"),
+                    "FTE Equiv": st.column_config.NumberColumn(format="%.2f"),
                     "Avg FTE": st.column_config.NumberColumn(format="%.2f"),
                     "Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
                     "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
@@ -1063,7 +1411,7 @@ This produces an apples‑to‑apples view of capacity vs delivery that reconcil
     if len(drill_df) == 0:
         st.warning("No data available for the selected drilldown filters.")
     else:
-        drill_capacity = calculate_capacity_vs_delivery(drill_df, df_base=df_window)
+        drill_capacity = calculate_capacity_vs_delivery(drill_df, df_base=df_base_window)
         drill_capacity = filter_by_time_window(drill_capacity, time_window, date_col="month_key")
 
         total_capacity = drill_capacity["capacity_hours"].sum()
@@ -1118,7 +1466,7 @@ This produces an apples‑to‑apples view of capacity vs delivery that reconcil
                 break
 
         if next_level:
-            summary = compute_capacity_summary(drill_df, next_level[0], df_base=df_window)
+            summary = compute_capacity_summary(drill_df, next_level[0], df_base=df_base_window)
             if len(summary) > 0:
                 st.subheader(f"Next Level Breakdown: {next_level[1]}")
                 st.dataframe(
@@ -1192,7 +1540,7 @@ This produces an apples‑to‑apples view of capacity vs delivery that reconcil
         for col, label in hotspot_levels:
             if col not in drill_df.columns:
                 continue
-            hotspot = compute_capacity_summary(drill_df, col, df_base=df_window)
+            hotspot = compute_capacity_summary(drill_df, col, df_base=df_base_window)
             if len(hotspot) == 0:
                 continue
             with st.expander(f"Methodology: {label} slack calculation", expanded=False):

@@ -29,14 +29,18 @@ def compute_staff_capacity(df: pd.DataFrame,
         return pd.DataFrame()
     
     # Get staff attributes
-    staff_info = df.groupby("staff_name").agg(
-        fte_scaling=("fte_hours_scaling", "first") if "fte_hours_scaling" in df.columns else ("staff_name", lambda x: 1.0),
-        department=("department_final", "first") if "department_final" in df.columns else ("staff_name", "first"),
-    ).reset_index()
+    if "fte_hours_scaling" in df.columns:
+        staff_info = df.groupby("staff_name").agg(
+            fte_scaling=("fte_hours_scaling", lambda x: x.dropna().iloc[0] if x.dropna().size > 0 else np.nan),
+            department=("department_final", "first") if "department_final" in df.columns else ("staff_name", "first"),
+        ).reset_index()
+    else:
+        staff_info = df.groupby("staff_name").agg(
+            fte_scaling=("staff_name", lambda x: 1.0),
+            department=("department_final", "first") if "department_final" in df.columns else ("staff_name", "first"),
+        ).reset_index()
     
     # Handle missing FTE scaling
-    if "fte_hours_scaling" not in df.columns:
-        staff_info["fte_scaling"] = 1.0
     staff_info["fte_scaling"] = staff_info["fte_scaling"].fillna(config.DEFAULT_FTE_SCALING)
     
     # Calculate capacity

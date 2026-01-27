@@ -44,11 +44,17 @@ def compute_staff_capacity(df: pd.DataFrame, window_weeks: int = 4) -> pd.DataFr
     if "staff_name" not in df.columns:
         return pd.DataFrame()
     
-    staff_info = df.groupby("staff_name").agg(
-        department_final=("department_final", "first") if "department_final" in df.columns else ("staff_name", "first"),
-        fte_scaling=("fte_hours_scaling", "first") if "fte_hours_scaling" in df.columns else ("staff_name", lambda x: 1.0),
-    ).reset_index()
-    
+    if "fte_hours_scaling" in df.columns:
+        staff_info = df.groupby("staff_name").agg(
+            department_final=("department_final", "first") if "department_final" in df.columns else ("staff_name", "first"),
+            fte_scaling=("fte_hours_scaling", lambda x: x.dropna().iloc[0] if x.dropna().size > 0 else np.nan),
+        ).reset_index()
+    else:
+        staff_info = df.groupby("staff_name").agg(
+            department_final=("department_final", "first") if "department_final" in df.columns else ("staff_name", "first"),
+            fte_scaling=("staff_name", lambda x: 1.0),
+        ).reset_index()
+
     staff_info["fte_scaling"] = staff_info["fte_scaling"].fillna(config.DEFAULT_FTE_SCALING)
     staff_info["capacity_hours_week"] = config.CAPACITY_HOURS_PER_WEEK * staff_info["fte_scaling"]
     staff_info["capacity_hours_window"] = staff_info["capacity_hours_week"] * window_weeks
