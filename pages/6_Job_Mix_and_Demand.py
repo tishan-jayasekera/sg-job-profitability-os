@@ -1162,7 +1162,8 @@ planned hours aren’t inflated.
                 deep_dept = st.selectbox("Department (Deep‑Dive)", dept_options, key="deep_dept")
             with chain_cols[1]:
                 df_cat = df_window if deep_dept == "All" else df_window[df_window["department_final"] == deep_dept]
-                cat_options = ["All"] + sorted(df_cat["job_category"].dropna().unique().tolist())
+                cat_col = "category_rev_job" if "category_rev_job" in df_cat.columns else "job_category"
+                cat_options = ["All"] + sorted(df_cat[cat_col].dropna().unique().tolist())
                 deep_cat = st.selectbox("Category (Deep‑Dive)", cat_options, key="deep_cat")
             with chain_cols[2]:
                 status_choice = st.selectbox("Status", ["Active", "Completed", "All"], key="deep_status")
@@ -1171,7 +1172,10 @@ planned hours aren’t inflated.
             if deep_dept != "All":
                 deep_df = deep_df[deep_df["department_final"] == deep_dept]
             if deep_cat != "All":
-                deep_df = deep_df[deep_df["job_category"] == deep_cat]
+                if cat_col in deep_df.columns:
+                    deep_df = deep_df[deep_df[cat_col] == deep_cat]
+                else:
+                    deep_df = deep_df[deep_df["job_category"] == deep_cat]
 
             # Job completion map
             completion = deep_df.groupby("job_no").agg(
@@ -1289,10 +1293,11 @@ planned hours aren’t inflated.
 
                 # Benchmark slice: completed jobs in same dept + category
                 df_bench = df_window.copy()
-                if job_dept in df_bench.columns:
+                if "department_final" in df_bench.columns:
                     df_bench = df_bench[df_bench["department_final"] == job_dept]
-                if job_cat in df_bench.columns:
-                    df_bench = df_bench[df_bench["job_category"] == job_cat]
+                bench_cat_col = "category_rev_job" if "category_rev_job" in df_bench.columns else "job_category"
+                if bench_cat_col in df_bench.columns:
+                    df_bench = df_bench[df_bench[bench_cat_col] == job_cat]
 
                 bench_completion = df_bench.groupby("job_no").agg(
                     completed_date=("job_completed_date", "first") if "job_completed_date" in df_bench.columns else ("job_no", "first"),
