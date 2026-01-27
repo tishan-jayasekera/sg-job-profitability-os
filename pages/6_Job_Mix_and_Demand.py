@@ -532,17 +532,22 @@ def main():
     with st.expander("How these are calculated", expanded=False):
         st.markdown(
             """
-**Job counts and quote sizing**
-- **Jobs**: count of unique `job_no` within the selected time window.
-- **Total Quoted Hours**: safe sum of `quoted_time_total` at the job‑task level to avoid double counting.
-- **Total Actual Hours**: sum of `hours_raw` across all rows in the window.
-- **Avg $/Job**: Total Quoted $ ÷ Jobs.
-- **$/Quoted Hr**: Total Quoted $ ÷ Total Quoted Hours.
-- **Quoted vs Actual**: Total Quoted Hours ÷ Total Actual Hours (values < 1.0 indicate under‑quoting).
+**The story these KPIs tell**
+We start by counting how many unique jobs entered the system in the chosen period.  
+Then we size those jobs using the quotes (what we planned to deliver) and compare that to what
+actually happened in the timesheets (what we truly delivered).
 
-**Why “safe” totals matter**
-Quote fields repeat on each timesheet row. We dedupe at (job_no, task_name) before summing so
-quotes aren’t inflated by multiple rows.
+**What each number means**
+- **Jobs**: unique job count in the period.
+- **Total Quoted Hours**: the hours originally promised, summed safely at job‑task level.
+- **Total Actual Hours**: the hours actually worked.
+- **Avg $/Job**: average quoted value per job.
+- **$/Quoted Hr**: value per quoted hour (a pricing signal).
+- **Quoted vs Actual**: planned hours divided by actual hours (below 1.0 means we under‑quoted).
+
+**Why we use “safe” quote totals**
+Quotes are repeated on every timesheet row. If we simply sum them, we overstate demand.
+So we first dedupe at (job_no, task_name) to keep the quote numbers honest.
             """
         )
     
@@ -931,38 +936,38 @@ Decision guide:
         )
 
         st.caption(
-            "Plain‑English method: we only count staff who logged time in the month. "
-            "If `fte_hours_scaling` is present, we use it to compute each staff member’s effective FTE "
-            "(weighted by their logged hours if it varies within a month). That FTE becomes capacity "
-            "(38 hours/week × 4.33 weeks). We then compare capacity to actual hours delivered. "
-            "Slack is the gap. When staff work across departments, we split their capacity in proportion "
-            "to where their timesheet hours went so totals reconcile cleanly."
+            "Executive summary: we translate real timesheet activity into a fair monthly capacity baseline, "
+            "then compare it to what was delivered. This shows true slack or overload without double counting "
+            "people who work across teams."
         )
 
         with st.expander("Methodology and reconciliation (operational view)", expanded=False):
             st.markdown(
                 """
-**Supply (Capacity)**
-- We only count staff who logged time in the month.
-- **Effective FTE (staff‑month)**:
-  - If `fte_hours_scaling` exists, we compute a **weighted average** by `hours_raw` for that staff‑month.
-  - If it doesn’t exist, we fall back to 1.0.
-- **Staff‑month total hours** = Σ(`hours_raw`) for each (staff_name, month_key).
-- **Hour share for a slice** = slice_hours ÷ staff‑month total hours.
-- **Allocated FTE** = effective FTE × hour share.
-- **Capacity Hours** = Σ(allocated FTE) × 4.33 × 38.
+**Why this model exists**
+Leaders need a clean, apples‑to‑apples view of capacity versus delivery. But staff split time across teams,
+which can inflate totals if you simply sum each team’s hours. This method avoids double counting while
+staying grounded in actual timesheets.
 
-**Demand (Actual Delivery)**
-- Actual Hours = Σ(hours_raw) by month_key
-- Billable / Non‑Billable = Σ(hours_raw) by is_billable flag
+**How we build capacity (supply)**
+1) **Start with real people**: only staff who logged time that month are counted.  
+2) **Determine effective FTE**:
+   - If `fte_hours_scaling` is present, we compute a weighted average (weighted by hours worked that month).
+   - If it’s missing, we assume 1.0.  
+3) **Translate to monthly capacity**: 38 hours/week × 4.33 weeks × effective FTE.  
+4) **Allocate capacity fairly**: if a person splits time across areas, their capacity is split in the same
+   proportion as their timesheet hours.
 
-**Utilisation & Slack**
-- Utilisation = Actual Hours / Capacity Hours
-- Slack Hours = Capacity Hours − Actual Hours
-- Slack % = 100% − Utilisation
+**How we measure demand**
+- **Actual Hours**: total hours worked in the month.  
+- **Billable vs Non‑Billable**: split using the `is_billable` flag.
 
-This allocation ensures the sum of all departments/categories equals the company total
-and prevents double counting staff who work across multiple areas.
+**How we interpret the result**
+- **Utilisation** = Actual Hours ÷ Capacity Hours.  
+- **Slack Hours** = Capacity Hours − Actual Hours.  
+- **Slack %** = 100% − Utilisation.  
+
+This guarantees roll‑ups reconcile at company level without overstating supply or demand.
                 """
             )
 
@@ -1149,9 +1154,9 @@ and prevents double counting staff who work across multiple areas.
         st.subheader("Slack Hotspots (Current Selection)")
         st.caption(
             "Slack is derived from timesheet hours. Each staff member's monthly capacity is allocated "
-            "across departments/categories/tasks based on where their hours went. If `fte_hours_scaling` is "
-            "available, it determines each staff member’s effective monthly capacity; otherwise we assume 1.0. "
-            "This captures cross‑department work and keeps totals reconciling."
+            "across departments/categories/tasks based on where their hours went. "
+            "If `fte_hours_scaling` is available, it drives each person’s effective capacity; "
+            "otherwise we assume 1.0. This captures cross‑team work while keeping totals honest."
         )
         hotspot_levels = [
             ("department_final", "Department"),
@@ -1168,20 +1173,23 @@ and prevents double counting staff who work across multiple areas.
             with st.expander(f"Methodology: {label} slack calculation", expanded=False):
                 st.markdown(
                     """
-**How slack is allocated**
-- **Effective staff‑month FTE**:
-  - If `fte_hours_scaling` exists, we compute a weighted average by `hours_raw` for that staff‑month.
-  - Otherwise, we assume FTE = 1.0.
-- **Staff‑month capacity** = 38 × Effective FTE × 4.33 weeks.
-- **Hour share** = slice hours ÷ total hours for each staff‑month.
-- **Allocated capacity** = staff‑month capacity × hour share.
-- **Slack Hours** = allocated capacity − actual hours.
-- **Slack %** = 100% − utilisation.
+**The story behind slack**
+We’re not guessing capacity — we anchor it to real timesheet behavior, then distribute it fairly.
 
-**Why this works**
-- Uses timesheets, so cross‑department work is included.
-- Prevents double counting when staff split across areas.
-- Totals roll up cleanly to company level.
+**How it’s calculated**
+1) **Find each staff‑month’s effective FTE**  
+   - Weighted by hours if `fte_hours_scaling` is available  
+   - Otherwise assume 1.0  
+2) **Convert to capacity**  
+   - 38 hours/week × 4.33 weeks × effective FTE  
+3) **Allocate capacity to the slice**  
+   - Split by the share of hours that slice represents  
+4) **Compute slack**  
+   - Slack = allocated capacity − actual hours  
+   - Slack % = 100% − utilisation  
+
+**Why you can trust it**
+It respects cross‑team work and avoids double counting, so totals reconcile cleanly.
                     """
                 )
             top_hotspot = hotspot.sort_values("slack_hours", ascending=False).head(8)
