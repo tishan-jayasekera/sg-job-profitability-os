@@ -1279,10 +1279,13 @@ planned hours aren’t inflated.
 
             if selected_job:
                 df_job = deep_df[deep_df["job_no"] == selected_job].copy()
-                job_row = quadrant_detail[quadrant_detail["job_no"] == selected_job].iloc[0]
+                if selected_job in quadrant_detail["job_no"].values:
+                    job_row = quadrant_detail[quadrant_detail["job_no"] == selected_job].iloc[0]
+                else:
+                    job_row = deep_df[deep_df["job_no"] == selected_job].iloc[0]
                 job_dept = job_row.get("department_final")
                 job_cat = job_row.get("job_category")
-                job_active = bool(job_row.get("is_active"))
+                job_active = bool(job_row.get("is_active")) if "is_active" in job_row else False
 
                 # Benchmark slice: completed jobs in same dept + category
                 df_bench = df_window.copy()
@@ -1371,7 +1374,30 @@ planned hours aren’t inflated.
                     )
                     bench_margin = bench_profit["margin_pct"].median() if len(bench_profit) > 0 else np.nan
 
-                job_fin = quadrant_detail[quadrant_detail["job_no"] == selected_job].iloc[0]
+                if selected_job in quadrant_detail["job_no"].values:
+                    job_fin = quadrant_detail[quadrant_detail["job_no"] == selected_job].iloc[0]
+                else:
+                    job_revenue = df_job["rev_alloc"].sum() if "rev_alloc" in df_job.columns else np.nan
+                    job_cost = df_job["base_cost"].sum() if "base_cost" in df_job.columns else np.nan
+                    job_margin_pct = (
+                        (job_revenue - job_cost) / job_revenue * 100
+                        if pd.notna(job_revenue) and job_revenue > 0
+                        else np.nan
+                    )
+                    jt = safe_quote_job_task(df_job)
+                    if len(jt) > 0 and "quoted_amount_total" in jt.columns:
+                        job_quote_amount = jt["quoted_amount_total"].sum()
+                    else:
+                        job_quote_amount = np.nan
+                    job_quote_to_revenue = (
+                        job_revenue / job_quote_amount
+                        if pd.notna(job_revenue) and pd.notna(job_quote_amount) and job_quote_amount > 0
+                        else np.nan
+                    )
+                    job_fin = pd.Series({
+                        "margin_pct_to_date": job_margin_pct,
+                        "quote_to_revenue": job_quote_to_revenue,
+                    })
                 margin_delta = (
                     job_fin["margin_pct_to_date"] - bench_margin
                     if pd.notna(job_fin["margin_pct_to_date"]) and pd.notna(bench_margin)
