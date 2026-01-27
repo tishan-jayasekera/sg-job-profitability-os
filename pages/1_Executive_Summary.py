@@ -7,6 +7,8 @@ quote-delivery reconciliation, and rate capture analysis.
 import streamlit as st
 import pandas as pd
 import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
 from pathlib import Path
 import sys
 
@@ -32,7 +34,7 @@ from src.ui.charts import (
 from src.data.loader import load_fact_timesheet
 from src.data.semantic import (
     full_metric_pack, profitability_rollup, quote_delivery_metrics,
-    rate_rollups, utilisation_metrics, exclude_leave, get_category_col
+    rate_rollups, utilisation_metrics, exclude_leave, get_category_col, safe_quote_job_task
 )
 from src.data.cohorts import filter_by_time_window, filter_active_jobs
 
@@ -77,6 +79,59 @@ def apply_global_filters(df: pd.DataFrame) -> pd.DataFrame:
 
 def main():
     st.title("Executive Summary")
+    st.markdown(
+        """
+        <style>
+        .exec-hero {
+            background: linear-gradient(135deg, #f6f1e8 0%, #fff7ea 100%);
+            border: 1px solid #eadfcb;
+            border-radius: 14px;
+            padding: 14px 18px;
+            margin: 8px 0 18px 0;
+        }
+        .exec-sub { color: #6b6b6b; font-size: 0.92rem; margin-top: 4px; }
+        .band {
+            border-radius: 14px;
+            padding: 14px 16px;
+            margin: 14px 0;
+            border: 1px solid #e8e2d6;
+            background: #fcfbf8;
+        }
+        .band-title { font-size: 1.05rem; font-weight: 600; margin-bottom: 6px; }
+        .band-sub { color: #6b6b6b; font-size: 0.9rem; margin-bottom: 10px; }
+        .kpi-grid {
+            display: grid;
+            grid-template-columns: repeat(4, minmax(0, 1fr));
+            gap: 10px;
+        }
+        .kpi-card {
+            background: #ffffff;
+            border: 1px solid #e6e1d5;
+            border-radius: 12px;
+            padding: 10px 12px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        }
+        .kpi-label { font-size: 0.75rem; color: #6b6b6b; text-transform: uppercase; letter-spacing: 0.04em; }
+        .kpi-value { font-size: 1.35rem; font-weight: 600; margin-top: 2px; }
+        .kpi-foot { font-size: 0.8rem; color: #8a8a8a; margin-top: 4px; }
+        .health-grid {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .health-card {
+            background: #ffffff;
+            border: 1px solid #e6e1d5;
+            border-radius: 12px;
+            padding: 12px 14px;
+        }
+        .health-title { font-weight: 600; margin-bottom: 6px; }
+        .health-metric { display: flex; justify-content: space-between; margin: 4px 0; }
+        .health-metric span:first-child { color: #6b6b6b; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     
     # Load data
     df = load_fact_timesheet()
@@ -98,88 +153,140 @@ def main():
     if len(df_drill) == 0:
         st.warning("No data matches current filters.")
         return
-    
-    st.markdown("---")
-    
-    # =========================================================================
-    # SECTION A: KPI STRIP
-    # =========================================================================
-    section_header("Key Metrics")
-    
-    # Calculate metrics
+
+    st.markdown(
+        """
+        <div class="exec-hero">
+            <div class="band-title">Executive KPI Snapshot</div>
+            <div class="exec-sub">Top-line profitability and delivery alignment</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
     prof = profitability_rollup(df_drill)
     util = utilisation_metrics(df_drill, exclude_leave=get_state("exclude_leave"))
-    
-    kpi_cols = st.columns(7)
-    
-    with kpi_cols[0]:
-        st.metric("Revenue", fmt_currency(prof["revenue"].iloc[0]))
-    
-    with kpi_cols[1]:
-        st.metric("Cost", fmt_currency(prof["cost"].iloc[0]))
-    
-    with kpi_cols[2]:
-        st.metric("Margin", fmt_currency(prof["margin"].iloc[0]))
-    
-    with kpi_cols[3]:
-        st.metric("Margin %", fmt_percent(prof["margin_pct"].iloc[0]))
-    
-    with kpi_cols[4]:
-        st.metric("Hours", fmt_hours(prof["hours"].iloc[0]))
-    
-    with kpi_cols[5]:
-        st.metric("Realised Rate", fmt_rate(prof["realised_rate"].iloc[0]))
-    
-    with kpi_cols[6]:
-        st.metric("Billable Share", fmt_percent(util["utilisation"].iloc[0]))
+    delivery = quote_delivery_metrics(df_drill)
+    quoted = delivery["quoted_hours"].iloc[0] if "quoted_hours" in delivery.columns else 0
+    actual = delivery["actual_hours"].iloc[0] if "actual_hours" in delivery.columns else 0
+    quote_vs_actual = quoted / actual if actual and actual > 0 else np.nan
 
-    st.caption("Billable Share = billable hours ÷ total hours (excl. leave). This is not capacity-based utilisation.")
-    
-    st.markdown("---")
-    
+    kpi_html = f"""
+    <div class="band">
+        <div class="kpi-grid">
+            <div class="kpi-card"><div class="kpi-label">Revenue</div><div class="kpi-value">{fmt_currency(prof['revenue'].iloc[0])}</div></div>
+            <div class="kpi-card"><div class="kpi-label">Cost</div><div class="kpi-value">{fmt_currency(prof['cost'].iloc[0])}</div></div>
+            <div class="kpi-card"><div class="kpi-label">Margin</div><div class="kpi-value">{fmt_currency(prof['margin'].iloc[0])}</div></div>
+            <div class="kpi-card"><div class="kpi-label">Margin %</div><div class="kpi-value">{fmt_percent(prof['margin_pct'].iloc[0])}</div></div>
+            <div class="kpi-card"><div class="kpi-label">Hours</div><div class="kpi-value">{fmt_hours(prof['hours'].iloc[0])}</div></div>
+            <div class="kpi-card"><div class="kpi-label">Realised Rate</div><div class="kpi-value">{fmt_rate(prof['realised_rate'].iloc[0])}</div></div>
+            <div class="kpi-card"><div class="kpi-label">Billable Share</div><div class="kpi-value">{fmt_percent(util['utilisation'].iloc[0])}</div><div class="kpi-foot">Billable ÷ Total (excl. leave)</div></div>
+            <div class="kpi-card"><div class="kpi-label">Quoted/Actual Hrs</div><div class="kpi-value">{f"{quote_vs_actual:.2f}x" if pd.notna(quote_vs_actual) else "—"}</div></div>
+        </div>
+    </div>
+    """
+    st.markdown(kpi_html, unsafe_allow_html=True)
+
     # =========================================================================
-    # SECTION B: RECONCILIATION PANELS
+    # SECTION B: HEALTH SNAPSHOT
     # =========================================================================
+    st.markdown("<div class='band'><div class='band-title'>Health Snapshot</div><div class='band-sub'>Where value is leaking and why</div>", unsafe_allow_html=True)
+
+    variance_pct = delivery["hours_variance_pct"].iloc[0] if not pd.isna(delivery["hours_variance_pct"].iloc[0]) else 0
+    scope_creep = delivery["unquoted_share"].iloc[0] if not pd.isna(delivery["unquoted_share"].iloc[0]) else 0
+    rates = rate_rollups(df_drill)
+    qr = rates["quote_rate"].iloc[0]
+    rr = rates["realised_rate"].iloc[0]
+    rv = rates["rate_variance"].iloc[0]
+    risk_count = 0
+    if "job_no" in df_drill.columns and "quoted_time_total" in df_drill.columns:
+        jt = safe_quote_job_task(df_drill)
+        if len(jt) > 0 and "quoted_time_total" in jt.columns:
+            actuals = df_drill.groupby(["job_no", "task_name"])["hours_raw"].sum().reset_index()
+            jt = jt.merge(actuals, on=["job_no", "task_name"], how="left")
+            jt["is_overrun"] = jt["hours_raw"] > jt["quoted_time_total"]
+            risk_count = int(jt.groupby("job_no")["is_overrun"].mean().gt(0.5).sum())
+
+    health_html = f"""
+    <div class="health-grid">
+        <div class="health-card">
+            <div class="health-title">Quote → Delivery</div>
+            <div class="health-metric"><span>Hours Variance</span><span>{fmt_percent(variance_pct)}</span></div>
+            <div class="health-metric"><span>Scope Creep</span><span>{fmt_percent(scope_creep)}</span></div>
+        </div>
+        <div class="health-card">
+            <div class="health-title">Rate Capture</div>
+            <div class="health-metric"><span>Quote Rate</span><span>{fmt_rate(qr) if not pd.isna(qr) else "—"}</span></div>
+            <div class="health-metric"><span>Realised Rate</span><span>{fmt_rate(rr) if not pd.isna(rr) else "—"}</span></div>
+            <div class="health-metric"><span>Rate Variance</span><span>{fmt_rate(rv) if not pd.isna(rv) else "—"}</span></div>
+        </div>
+        <div class="health-card">
+            <div class="health-title">Active Risk</div>
+            <div class="health-metric"><span>Jobs at Risk</span><span>{risk_count:,}</span></div>
+            <div class="health-metric"><span>Overrun Rate</span><span>{fmt_percent((risk_count / df_drill["job_no"].nunique() * 100) if "job_no" in df_drill.columns and df_drill["job_no"].nunique() > 0 else 0)}</span></div>
+        </div>
+    </div>
+    </div>
+    """
+    st.markdown(health_html, unsafe_allow_html=True)
+
+    # =========================================================================
+    # SECTION C: PORTFOLIO PERFORMANCE
+    # =========================================================================
+    st.markdown("<div class='band'><div class='band-title'>Portfolio Performance by Department</div><div class='band-sub'>Where margin and revenue are concentrated</div>", unsafe_allow_html=True)
+
+    if "department_final" in df_drill.columns:
+        dept_metrics = full_metric_pack(df_drill, ["department_final"], exclude_leave=get_state("exclude_leave"))
+        dept_metrics = dept_metrics.sort_values("revenue", ascending=False)
+
+        col1, col2 = st.columns(2)
+        st.caption(
+            "Margin % by department is calculated as (Σ revenue − Σ cost) ÷ Σ revenue, "
+            "using `rev_alloc` and `base_cost` summed within each department. "
+            "This is an aggregate margin, not a simple average of job margins."
+        )
+        with col1:
+            fig = px.bar(
+                dept_metrics,
+                x="department_final",
+                y="margin_pct",
+                title="Margin % by Department",
+                labels={"department_final": "Department", "margin_pct": "Margin %"},
+                text_auto=".1f",
+            )
+            fig.update_layout(yaxis_tickformat=".1f", xaxis_tickangle=-20)
+            st.plotly_chart(fig, use_container_width=True)
+
+        with col2:
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=dept_metrics["department_final"],
+                y=dept_metrics["revenue"],
+                name="Revenue",
+                marker_color="#4c78a8",
+            ))
+            fig.add_trace(go.Bar(
+                x=dept_metrics["department_final"],
+                y=dept_metrics["margin"],
+                name="Margin",
+                marker_color="#54a24b",
+            ))
+            fig.update_layout(
+                title="Revenue & Margin by Department",
+                barmode="group",
+                yaxis=dict(title="$"),
+                xaxis_tickangle=-20,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # =========================================================================
+    # SECTION D: QUOTE DISCIPLINE & DELIVERY ALIGNMENT
+    # =========================================================================
+    st.markdown("<div class='band'><div class='band-title'>Quote Discipline & Delivery Alignment</div><div class='band-sub'>Is effort tracking the plan?</div>", unsafe_allow_html=True)
+
     col1, col2 = st.columns(2)
-    
-    # -------------------------------------------------------------------------
-    # B1: Quote → Delivery
-    # -------------------------------------------------------------------------
     with col1:
-        section_header("Quote → Delivery", "Hours variance and scope creep analysis")
-        
-        delivery = quote_delivery_metrics(df_drill)
-        
-        # KPIs
-        m1, m2, m3 = st.columns(3)
-        
-        with m1:
-            quoted = delivery["quoted_hours"].iloc[0]
-            actual = delivery["actual_hours"].iloc[0]
-            variance_pct = delivery["hours_variance_pct"].iloc[0] if not pd.isna(delivery["hours_variance_pct"].iloc[0]) else 0
-            st.metric("Hours Variance", fmt_percent(variance_pct))
-        
-        with m2:
-            scope_creep = delivery["unquoted_share"].iloc[0] if not pd.isna(delivery["unquoted_share"].iloc[0]) else 0
-            st.metric("Scope Creep", fmt_percent(scope_creep))
-        
-        with m3:
-            # Calculate overrun rate at job-task level
-            if "job_no" in df_drill.columns:
-                from src.data.semantic import safe_quote_job_task
-                jt = safe_quote_job_task(df_drill)
-                if len(jt) > 0 and "quoted_time_total" in jt.columns:
-                    actuals = df_drill.groupby(["job_no", "task_name"])["hours_raw"].sum().reset_index()
-                    jt = jt.merge(actuals, on=["job_no", "task_name"], how="left")
-                    jt["is_overrun"] = jt["hours_raw"] > jt["quoted_time_total"]
-                    overrun_rate = jt["is_overrun"].mean() * 100
-                else:
-                    overrun_rate = 0
-            else:
-                overrun_rate = 0
-            st.metric("Overrun Rate", fmt_percent(overrun_rate))
-        
-        # Variance distribution (if we have job-task data)
         if "job_no" in df_drill.columns and "quoted_time_total" in df_drill.columns:
             jt_variance = df_drill.groupby(["job_no", "task_name"]).agg(
                 quoted=("quoted_time_total", "first"),
@@ -191,7 +298,6 @@ def main():
                 np.nan
             )
             jt_variance = jt_variance.dropna(subset=["variance_pct"])
-            
             if len(jt_variance) > 10:
                 fig = histogram(
                     jt_variance[jt_variance["variance_pct"].between(-100, 200)],
@@ -200,60 +306,34 @@ def main():
                     nbins=30
                 )
                 st.plotly_chart(fig, use_container_width=True)
-    
-    # -------------------------------------------------------------------------
-    # B2: Quote Rate → Realised Rate
-    # -------------------------------------------------------------------------
+
     with col2:
-        section_header("Rate Capture", "Quote rate vs realised rate analysis")
-        
-        rates = rate_rollups(df_drill)
-        
-        # KPIs
-        m1, m2, m3 = st.columns(3)
-        
-        with m1:
-            qr = rates["quote_rate"].iloc[0]
-            st.metric("Quote Rate", fmt_rate(qr) if not pd.isna(qr) else "—")
-        
-        with m2:
-            rr = rates["realised_rate"].iloc[0]
-            st.metric("Realised Rate", fmt_rate(rr) if not pd.isna(rr) else "—")
-        
-        with m3:
-            rv = rates["rate_variance"].iloc[0]
-            st.metric("Rate Variance", fmt_rate(rv) if not pd.isna(rv) else "—")
-        
-        # Rate scatter by drill level
-        level = get_drill_level()
-        
-        category_col = get_category_col(df_drill)
-        if level == "company":
-            group_col = "department_final"
-        elif level == "department":
-            group_col = category_col
-        elif level == "category":
-            group_col = "staff_name"
-        else:
-            group_col = "task_name"
-        
-        if group_col in df_drill.columns:
-            rates_by_group = rate_rollups(df_drill, [group_col])
-            rates_by_group = rates_by_group.dropna(subset=["quote_rate", "realised_rate"])
-            
-            if len(rates_by_group) > 0:
-                fig = rate_scatter(
-                    rates_by_group,
-                    group_col=group_col,
-                    title=f"Rate Capture by {group_col.replace('_', ' ').title()}"
+        if "job_no" in df_drill.columns:
+            jt = safe_quote_job_task(df_drill)
+            if len(jt) > 0 and "quoted_time_total" in jt.columns:
+                actuals = df_drill.groupby(["job_no", "task_name"])["hours_raw"].sum().reset_index()
+                jt = jt.merge(actuals, on=["job_no", "task_name"], how="left")
+                job_level = jt.groupby("job_no").agg(
+                    quoted_hours=("quoted_time_total", "sum"),
+                    actual_hours=("hours_raw", "sum"),
+                ).reset_index()
+                fig = px.scatter(
+                    job_level,
+                    x="quoted_hours",
+                    y="actual_hours",
+                    title="Quoted vs Actual Hours (by Job)",
+                    labels={"quoted_hours": "Quoted Hours", "actual_hours": "Actual Hours"},
                 )
+                max_val = max(job_level["quoted_hours"].max(), job_level["actual_hours"].max())
+                fig.add_shape(type="line", x0=0, y0=0, x1=max_val, y1=max_val, line=dict(color="gray", dash="dash"))
                 st.plotly_chart(fig, use_container_width=True)
-    
-    st.markdown("---")
-    
+    st.markdown("</div>", unsafe_allow_html=True)
+
     # =========================================================================
-    # SECTION C: DRILL TABLE
+    # SECTION E: DRILL TABLE
     # =========================================================================
+    st.markdown("<div class='band'><div class='band-title'>Drilldown View</div><div class='band-sub'>Click a row to drill into the delivery chain</div>", unsafe_allow_html=True)
+
     level = get_drill_level()
     
     category_col = get_category_col(df_drill)
@@ -278,14 +358,14 @@ def main():
     
     can_drill = level != "task"
     render_drill_table_section(df_drill, group_col, can_drill=can_drill)
+    st.markdown("</div>", unsafe_allow_html=True)
     
     # =========================================================================
-    # SECTION D: ACTION SHORTLIST
+    # SECTION F: ACTION SHORTLIST
     # =========================================================================
-    st.markdown("---")
-    section_header("Action Shortlist", "Top hotspots requiring attention")
-    
+    st.markdown("<div class='band'><div class='band-title'>Action Queue</div><div class='band-sub'>Top hotspots requiring immediate attention</div>", unsafe_allow_html=True)
     render_action_shortlist(df_drill)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def render_drill_table_section(df: pd.DataFrame, group_col: str, can_drill: bool = True):
