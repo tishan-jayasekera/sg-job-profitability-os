@@ -26,6 +26,29 @@ st.set_page_config(page_title="Active Delivery", page_icon="🎯", layout="wide"
 
 init_state()
 
+def _pill(text: str, color: str) -> str:
+    return f"<span class='sg-pill' style='background:{color};'>{text}</span>"
+
+
+def _kpi_card(title: str, value: str, subtitle: str = "") -> str:
+    subtitle_html = f"<div class='sg-kpi-sub'>{subtitle}</div>" if subtitle else ""
+    return (
+        "<div class='sg-card'>"
+        f"<div class='sg-kpi-title'>{title}</div>"
+        f"<div class='sg-kpi-value'>{value}</div>"
+        f"{subtitle_html}"
+        "</div>"
+    )
+
+
+def _resolve_selected_job(jobs_df: pd.DataFrame, selected_choice: str) -> str:
+    if selected_choice and selected_choice != "Auto":
+        st.session_state["ad_selected_job"] = selected_choice
+        return selected_choice
+    if st.session_state.get("ad_selected_job") in jobs_df["job_no"].values:
+        return st.session_state["ad_selected_job"]
+    return jobs_df.iloc[0]["job_no"]
+
 def _get_date_col(df: pd.DataFrame) -> str:
     return "work_date" if "work_date" in df.columns else "month_key"
 
@@ -311,7 +334,7 @@ def build_active_jobs_view(df: pd.DataFrame) -> pd.DataFrame:
     # Due date proximity
     if "job_due_date" in job_agg.columns:
         due_dates = pd.to_datetime(job_agg["job_due_date"], errors="coerce", utc=True)
-        now = pd.Timestamp.utcnow().tz_localize("UTC")
+        now = pd.Timestamp.now(tz="UTC")
         job_agg["days_to_due"] = (due_dates - now).dt.days
     else:
         job_agg["days_to_due"] = np.nan
@@ -396,35 +419,63 @@ def get_job_staff_breakdown(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
 
 
 def main():
-    st.title("Active Delivery Control Tower")
-    st.caption("Risk, forecast, and interventions for live jobs")
+    st.markdown(
+        """
+        <style>
+        .sg-band {background:#f7f7f2;border:1px solid #eceae3;border-radius:18px;padding:22px 24px;margin:10px 0 22px;}
+        .sg-band h3 {margin:0 0 6px 0;}
+        .sg-subtle {color:#6b6b6b;font-size:0.95rem;}
+        .sg-divider {height:1px;background:#eceae3;margin:16px 0;}
+        .sg-card {background:#ffffff;border:1px solid #eceae3;border-radius:14px;padding:14px 16px;margin:6px 0;}
+        .sg-kpi-title {font-size:0.82rem;color:#6b6b6b;text-transform:uppercase;letter-spacing:0.06em;}
+        .sg-kpi-value {font-size:1.6rem;font-weight:700;margin-top:4px;}
+        .sg-kpi-sub {font-size:0.85rem;color:#7a7a7a;margin-top:4px;}
+        .sg-pill {padding:4px 8px;border-radius:999px;color:#1f1f1f;font-size:0.78rem;font-weight:600;margin-right:6px;display:inline-block;}
+        .sg-callout {background:#fff7e6;border:1px solid #f6e0b3;border-radius:12px;padding:10px 12px;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("## Active Delivery Control Tower")
+    st.markdown(
+        '<div class="sg-subtle">Executive view of delivery risk, forecast trajectory, and operational interventions.</div>',
+        unsafe_allow_html=True,
+    )
 
     df = load_fact_timesheet()
 
-    st.sidebar.header("Filters")
+    # ======================================================================
+    # CHAIN CONTROLS
+    # ======================================================================
     departments = ["All"] + sorted(df["department_final"].dropna().unique().tolist())
-    selected_dept = st.sidebar.selectbox("Department", departments)
+    dept_col, cat_col, job_col, band_col = st.columns([0.22, 0.22, 0.36, 0.20])
+    with dept_col:
+        selected_dept = st.selectbox("Department", departments, key="ad_dept")
 
-    df_scope = df.copy()
-    if selected_dept != "All":
-        df_scope = df_scope[df_scope["department_final"] == selected_dept]
+    df_dept = df if selected_dept == "All" else df[df["department_final"] == selected_dept]
+    category_col = get_category_col(df_dept)
+    categories = ["All"] + sorted(df_dept[category_col].dropna().unique().tolist())
+    with cat_col:
+        selected_category = st.selectbox("Category", categories, key="ad_category")
 
-    category_col = get_category_col(df_scope)
-    categories = ["All"] + sorted(df_scope[category_col].dropna().unique().tolist())
-    selected_category = st.sidebar.selectbox("Category", categories)
-    if selected_category != "All":
-        df_scope = df_scope[df_scope[category_col] == selected_category]
-
-    band_filter = st.sidebar.multiselect(
-        "Risk Band",
-        options=["Red", "Amber", "Green"],
-        default=["Red", "Amber"],
-    )
-
+    df_scope = df_dept if selected_category == "All" else df_dept[df_dept[category_col] == selected_category]
     jobs_df = build_active_jobs_view(df_scope)
     if len(jobs_df) == 0:
         st.warning("No active jobs found for the selected filters.")
         return
+
+    job_options = ["Auto"] + sorted(jobs_df["job_no"].dropna().unique().tolist())
+    with job_col:
+        selected_job_choice = st.selectbox("Job", job_options, key="ad_job")
+
+    with band_col:
+        band_filter = st.multiselect(
+            "Risk Band",
+            options=["Red", "Amber", "Green"],
+            default=["Red", "Amber"],
+            key="ad_band",
+        )
 
     if band_filter:
         jobs_df = jobs_df[jobs_df["risk_band"].isin(band_filter)]
@@ -433,8 +484,20 @@ def main():
         st.info("No jobs match the selected risk bands.")
         return
 
+    breadcrumb = "Company"
+    if selected_dept != "All":
+        breadcrumb += f"  ›  {selected_dept}"
+    if selected_category != "All":
+        breadcrumb += f"  ›  {selected_category}"
+    if selected_job_choice != "Auto":
+        breadcrumb += f"  ›  {selected_job_choice}"
+    st.markdown(
+        f"{_pill('Chain', '#e6f0ff')}<span class='sg-subtle'>{breadcrumb}</span>",
+        unsafe_allow_html=True,
+    )
+
     # ======================================================================
-    # COMMAND HEADER
+    # EXEC SUMMARY BAND
     # ======================================================================
     jobs_at_risk = jobs_df[jobs_df["risk_score"] >= 70]
     eac_hours = jobs_df["actual_hours"] + jobs_df["remaining_hours"].fillna(0)
@@ -446,29 +509,31 @@ def main():
     margin_shortfall = margin_shortfall.clip(lower=0).fillna(0)
     margin_at_risk = margin_shortfall[jobs_df["risk_score"] >= 70].sum()
 
+    st.markdown('<div class="sg-band">', unsafe_allow_html=True)
+    st.markdown("### Executive Snapshot")
+    st.markdown('<div class="sg-subtle">Immediate health of active delivery and exposure.</div>', unsafe_allow_html=True)
     kpi_cols = st.columns(6)
-    with kpi_cols[0]:
-        st.metric("Active Jobs", len(jobs_df))
-    with kpi_cols[1]:
-        st.metric("Jobs at Risk", len(jobs_at_risk))
-    with kpi_cols[2]:
-        st.metric("Margin at Risk", fmt_currency(margin_at_risk))
-    with kpi_cols[3]:
-        st.metric("Forecast Overrun Hours", fmt_hours(overrun_hours[overrun_hours > 0].sum()))
-    with kpi_cols[4]:
-        st.metric("Avg Risk Score", f"{jobs_df['risk_score'].mean():.1f}")
-    with kpi_cols[5]:
-        st.metric("Scope Creep %", fmt_percent(jobs_df["scope_creep_pct"].mean()))
-
-    st.markdown("---")
+    kpi_cards = [
+        _kpi_card("Active Jobs", f"{len(jobs_df)}"),
+        _kpi_card("Jobs at Risk", f"{len(jobs_at_risk)}", "Risk score ≥ 70"),
+        _kpi_card("Margin at Risk", fmt_currency(margin_at_risk), "Shortfall vs benchmark"),
+        _kpi_card("Forecast Overrun Hrs", fmt_hours(overrun_hours[overrun_hours > 0].sum()), "EAC − Quoted"),
+        _kpi_card("Avg Risk Score", f"{jobs_df['risk_score'].mean():.1f}", "0–100 scale"),
+        _kpi_card("Scope Creep %", fmt_percent(jobs_df["scope_creep_pct"].mean()), "Unquoted share"),
+    ]
+    for col, card in zip(kpi_cols, kpi_cards):
+        with col:
+            st.markdown(card, unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # ======================================================================
-    # SECTION 1: RISK QUEUE
+    # SECTION 1 — RISK QUEUE
     # ======================================================================
-    section_header("Risk Queue", "Live jobs requiring action and why")
+    st.markdown('<div class="sg-band">', unsafe_allow_html=True)
+    st.markdown("### Section 1 — Risk Queue")
+    st.markdown('<div class="sg-subtle">Prioritised list of jobs with the highest intervention value.</div>', unsafe_allow_html=True)
 
-    left, right = st.columns([0.7, 0.3])
-
+    left, right = st.columns([0.72, 0.28])
     with left:
         display_cols = [
             "job_no", "client", "department_final", "job_category",
@@ -501,37 +566,48 @@ def main():
             },
             key="risk_queue",
         )
+        if job_selection and job_selection.selection and job_selection.selection.rows:
+            selected_idx = job_selection.selection.rows[0]
+            st.session_state["ad_selected_job"] = jobs_df.iloc[selected_idx]["job_no"]
 
     with right:
         scope_jobs = jobs_df[jobs_df["scope_creep_pct"] > 10]
         rate_jobs = jobs_df[jobs_df["rate_variance"] < 0]
         drift_jobs = jobs_df[jobs_df["runtime_delta_days"] > 0]
-        st.markdown("**Risk Drivers**")
-        st.metric("Scope Creep", f"{len(scope_jobs)} jobs · {fmt_percent(scope_jobs['scope_creep_pct'].mean())}")
-        st.metric("Rate Leakage", fmt_rate(rate_jobs["rate_variance"].mean()))
+        st.markdown("**Risk Driver Signals**")
+        st.markdown(_kpi_card("Scope Creep", f"{len(scope_jobs)} jobs", fmt_percent(scope_jobs["scope_creep_pct"].mean())), unsafe_allow_html=True)
+        st.markdown(_kpi_card("Rate Leakage", fmt_rate(rate_jobs["rate_variance"].mean()), "Avg variance"), unsafe_allow_html=True)
         drift_mean = drift_jobs["runtime_delta_days"].mean()
-        st.metric("Schedule Drift", f"{drift_mean:.1f} days" if pd.notna(drift_mean) else "—")
+        st.markdown(_kpi_card("Schedule Drift", f"{drift_mean:.1f} days" if pd.notna(drift_mean) else "—", "Avg vs benchmark"), unsafe_allow_html=True)
+        st.markdown('<div class="sg-callout">Drivers are computed from quote burn, scope creep, rate variance, and runtime drift.</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("---")
-
-    # ======================================================================
-    # SECTION 2: FORECAST & INTERVENTION
-    # ======================================================================
-    section_header("Forecast & Intervention", "What happens next and what to do")
-
-    selected_job = None
-    if job_selection and job_selection.selection and job_selection.selection.rows:
-        selected_idx = job_selection.selection.rows[0]
-        selected_job = jobs_df.iloc[selected_idx]["job_no"]
-    else:
-        selected_job = jobs_df.iloc[0]["job_no"]
-
+    # Resolve selected job for downstream sections
+    selected_job = _resolve_selected_job(jobs_df, selected_job_choice)
     job_row = jobs_df[jobs_df["job_no"] == selected_job].iloc[0]
     df_job = df_scope[df_scope["job_no"] == selected_job].copy()
+
+    # ======================================================================
+    # SECTION 2 — FORECAST & INTERVENTION
+    # ======================================================================
+    st.markdown('<div class="sg-band">', unsafe_allow_html=True)
+    st.markdown("### Section 2 — Forecast & Intervention")
+    st.markdown('<div class="sg-subtle">Mechanics are explicit. Outputs tie to intervention levers.</div>', unsafe_allow_html=True)
 
     forecast_col, action_col = st.columns(2)
     with forecast_col:
         st.markdown(f"**Forecast Dashboard — {selected_job}**")
+        st.markdown(
+            "<div class='sg-card'>"
+            "<div class='sg-kpi-title'>Forecast Mechanics (Step-by-step)</div>"
+            "<div class='sg-kpi-sub'>"
+            "1) Burn rate = last 28 days (fallback: full history). "
+            "2) Remaining Hours = max(Quoted − Actual, 0). "
+            "3) EAC Hours = Actual + Remaining. "
+            "4) EAC Margin % uses avg cost per hour and quoted revenue if available."
+            "</div></div>",
+            unsafe_allow_html=True,
+        )
         date_col = _get_date_col(df_job)
         df_job[date_col] = pd.to_datetime(df_job[date_col], errors="coerce")
         timeline = df_job.groupby(date_col)["hours_raw"].sum().sort_index()
@@ -551,20 +627,87 @@ def main():
             fig.add_hline(y=quoted_hours, line_dash="dash", annotation_text="Quoted")
         if pd.notna(eac):
             fig.add_hline(y=eac, line_dash="dot", annotation_text="Forecast EAC")
-        fig.update_layout(height=280, margin=dict(t=30, l=10, r=10, b=10))
-        st.plotly_chart(fig, use_container_width=True)
+        fig.update_layout(
+            height=280,
+            margin=dict(t=30, l=10, r=10, b=10),
+            xaxis_title="Date",
+            yaxis_title="Cumulative Hours",
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"forecast_burndown_{selected_job}")
 
         kpi_cols = st.columns(3)
         with kpi_cols[0]:
-            st.metric("EAC Hours", fmt_hours(eac))
+            st.markdown(_kpi_card("EAC Hours", fmt_hours(eac), "Forecast total"), unsafe_allow_html=True)
         with kpi_cols[1]:
-            st.metric("EAC Margin %", fmt_percent(job_row.get("forecast_margin_pct")))
+            st.markdown(_kpi_card("EAC Margin %", fmt_percent(job_row.get("forecast_margin_pct")), "Forecast margin"), unsafe_allow_html=True)
         eta_days = job_row.get("eta_days")
         with kpi_cols[2]:
-            st.metric("ETA Completion (days)", f"{eta_days:.0f}" if pd.notna(eta_days) else "—")
+            eta_label = f"{eta_days:.0f}" if pd.notna(eta_days) else "—"
+            st.markdown(_kpi_card("ETA Completion (days)", eta_label, "From burn rate"), unsafe_allow_html=True)
+
+        # Inputs panel for traceability
+        actual_hours = job_row.get("actual_hours", np.nan)
+        quoted_hours = job_row.get("quoted_hours", np.nan)
+        burn_rate = np.nan
+        if len(timeline) > 1:
+            days_span = max((timeline.index.max() - timeline.index.min()).days, 1)
+            burn_rate = timeline.sum() / days_span
+        remaining = job_row.get("remaining_hours", np.nan)
+        st.markdown(
+            "<div class='sg-card'>"
+            "<div class='sg-kpi-title'>Forecast Inputs</div>"
+            "<div class='sg-kpi-sub'>"
+            f"Actual Hours: {fmt_hours(actual_hours)} · "
+            f"Quoted Hours: {fmt_hours(quoted_hours)} · "
+            f"Burn Rate: {fmt_hours(burn_rate)}/day · "
+            f"Remaining: {fmt_hours(remaining)}"
+            "</div></div>",
+            unsafe_allow_html=True,
+        )
+
+        st.markdown("**Forecast Drivers (Task Level)**")
+        task_breakdown = get_job_task_breakdown(df_scope, selected_job)
+        if len(task_breakdown) > 0:
+            task_breakdown["overrun_hours"] = task_breakdown["variance"].fillna(0).clip(lower=0)
+            total_overrun = task_breakdown["overrun_hours"].sum()
+            driver_table = task_breakdown.sort_values("overrun_hours", ascending=False).head(5)
+            driver_table["overrun_share"] = np.where(
+                total_overrun > 0,
+                driver_table["overrun_hours"] / total_overrun * 100,
+                np.nan,
+            )
+            st.dataframe(
+                driver_table[["task_name", "actual_hours", "quoted_hours", "overrun_hours", "overrun_share"]].rename(
+                    columns={
+                        "task_name": "Task",
+                        "actual_hours": "Actual",
+                        "quoted_hours": "Quoted",
+                        "overrun_hours": "Overrun",
+                        "overrun_share": "Overrun Share",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Actual": st.column_config.NumberColumn(format="%.1f"),
+                    "Quoted": st.column_config.NumberColumn(format="%.1f"),
+                    "Overrun": st.column_config.NumberColumn(format="%.1f"),
+                    "Overrun Share": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+        else:
+            st.caption("No task-level quote data available for driver analysis.")
 
     with action_col:
         st.markdown("**Intervention Playbook**")
+        st.markdown(
+            "<div class='sg-card'>"
+            "<div class='sg-kpi-title'>Primary Driver</div>"
+            f"<div class='sg-kpi-value'>{job_row.get('primary_driver','—')}</div>"
+            "<div class='sg-kpi-sub'>Recommendation follows the dominant driver.</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
         st.write("Action summary")
         st.info(job_row.get("recommended_action", "Monitor"))
         st.markdown("**Priority interventions**")
@@ -575,19 +718,74 @@ def main():
         else:
             st.write("- Monitor")
 
-    st.markdown("---")
+        st.markdown("**Staff Mix Variance (Billable Share)**")
+        if "is_billable" in df_job.columns:
+            job_billable = df_job[df_job["is_billable"] == True]["hours_raw"].sum()
+            job_total = df_job["hours_raw"].sum()
+            job_billable_share = job_billable / job_total if job_total > 0 else np.nan
+            bench_share = job_row.get("median_billable_share")
+            variance = (job_billable_share - bench_share) * 100 if pd.notna(bench_share) else np.nan
+            st.markdown(
+                _kpi_card(
+                    "Job billable share",
+                    fmt_percent(job_billable_share * 100 if pd.notna(job_billable_share) else np.nan),
+                    f"Benchmark: {fmt_percent(bench_share * 100) if pd.notna(bench_share) else '—'} · Δ {variance:.1f} pp" if pd.notna(variance) else "Benchmark unavailable",
+                ),
+                unsafe_allow_html=True,
+            )
+            staff_mix = df_job.groupby("staff_name").agg(
+                hours=("hours_raw", "sum"),
+                billable_hours=("hours_raw", lambda x: x[df_job.loc[x.index, "is_billable"]].sum()),
+            ).reset_index()
+            staff_mix["billable_share"] = np.where(
+                staff_mix["hours"] > 0,
+                staff_mix["billable_hours"] / staff_mix["hours"] * 100,
+                np.nan,
+            )
+            top_staff = staff_mix.sort_values("hours", ascending=False).head(8)
+            st.dataframe(
+                top_staff[["staff_name", "hours", "billable_share"]].rename(
+                    columns={"staff_name": "Staff", "hours": "Hours", "billable_share": "Billable %"}
+                ),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Billable %": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+        else:
+            st.caption("Billable share not available in the dataset.")
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # ======================================================================
-    # SECTION 3: JOB DEEP-DIVE
+    # SECTION 3 — JOB DEEP-DIVE
     # ======================================================================
-    section_header("Job Deep-Dive", "Delivery health, profitability, and drivers")
+    st.markdown('<div class="sg-band">', unsafe_allow_html=True)
+    st.markdown("### Section 3 — Job Deep‑Dive")
+    st.markdown('<div class="sg-subtle">Traceability from job health → tasks → staff.</div>', unsafe_allow_html=True)
 
     tab_a, tab_b, tab_c = st.tabs(["Delivery Health", "Profitability", "Drivers"])
 
     with tab_a:
         st.markdown("**Quote vs Actual vs Forecast**")
-        st.plotly_chart(fig, use_container_width=True)
+        st.markdown(
+            "<div class='sg-card'>"
+            "<div class='sg-kpi-title'>Traceability</div>"
+            "<div class='sg-kpi-sub'>Cumulative hours vs quote and forecast EAC. "
+            "This is the single source of truth for delivery drift.</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"delivery_health_burndown_{selected_job}")
         st.markdown("**Runtime vs Benchmark**")
+        st.markdown(
+            "<div class='sg-card'>"
+            "<div class='sg-kpi-title'>Benchmark Logic</div>"
+            "<div class='sg-kpi-sub'>Median runtime for completed jobs within the same department and category.</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
         runtime_cols = st.columns(3)
         with runtime_cols[0]:
             st.metric("Runtime (days)", f"{job_row.get('runtime_days', np.nan):.0f}")
@@ -598,6 +796,13 @@ def main():
 
     with tab_b:
         st.markdown("**Margin Trend**")
+        st.markdown(
+            "<div class='sg-card'>"
+            "<div class='sg-kpi-title'>Margin Logic</div>"
+            "<div class='sg-kpi-sub'>(Revenue − Cost) ÷ Revenue over time.</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
         if "rev_alloc" in df_job.columns and "base_cost" in df_job.columns:
             margin_ts = df_job.groupby(date_col).agg(
                 revenue=("rev_alloc", "sum"),
@@ -609,9 +814,22 @@ def main():
                 np.nan,
             )
             fig_margin = px.line(margin_ts, x=date_col, y="margin_pct", markers=True)
-            fig_margin.update_layout(height=280, margin=dict(t=30, l=10, r=10, b=10))
-            st.plotly_chart(fig_margin, use_container_width=True)
+            fig_margin.update_layout(
+                height=280,
+                margin=dict(t=30, l=10, r=10, b=10),
+                xaxis_title="Date",
+                yaxis_title="Margin %",
+            )
+            st.plotly_chart(fig_margin, use_container_width=True, key=f"margin_trend_{selected_job}")
         st.markdown("**Rate Capture**")
+        st.markdown(
+            "<div class='sg-card'>"
+            "<div class='sg-kpi-title'>Rate Logic</div>"
+            "<div class='sg-kpi-sub'>Realised Rate = Actual Revenue ÷ Actual Hours. "
+            "Quote Rate = Quoted Amount ÷ Quoted Hours.</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
         rate_cols = st.columns(2)
         with rate_cols[0]:
             st.metric("Realised Rate", fmt_rate(job_row.get("realised_rate")))
@@ -623,6 +841,13 @@ def main():
         staff_df = get_job_staff_breakdown(df_scope, selected_job)
 
         st.markdown("**Task Cost Leaders**")
+        st.markdown(
+            "<div class='sg-card'>"
+            "<div class='sg-kpi-title'>Task Attribution</div>"
+            "<div class='sg-kpi-sub'>Top tasks by cost; variance flags overruns vs quote.</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
         if len(task_df) > 0:
             top_tasks = task_df.sort_values("actual_cost", ascending=False).head(10)
             st.dataframe(
@@ -634,6 +859,13 @@ def main():
             )
 
         st.markdown("**Staff Cost Leaders**")
+        st.markdown(
+            "<div class='sg-card'>"
+            "<div class='sg-kpi-title'>Staff Attribution</div>"
+            "<div class='sg-kpi-sub'>Top staff by cost; validates mix and resourcing.</div>"
+            "</div>",
+            unsafe_allow_html=True,
+        )
         if len(staff_df) > 0:
             top_staff = staff_df.sort_values("cost", ascending=False).head(10)
             st.dataframe(
@@ -644,9 +876,10 @@ def main():
                 hide_index=True,
                 column_config={"% of Job": st.column_config.NumberColumn(format="%.1f%%")},
             )
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # ======================================================================
-    # SECTION 4: BENCHMARK PANEL
+    # SECTION 4 — BENCHMARKS
     # ======================================================================
     with st.expander("Benchmark Panel (dept + category)"):
         st.markdown("**Benchmarks (completed jobs only)**")
@@ -656,7 +889,10 @@ def main():
         with bench_cols[1]:
             st.metric("Median margin %", fmt_percent(job_row.get("median_margin_pct")))
         with bench_cols[2]:
-            st.metric("Median billable share", fmt_percent(job_row.get("median_billable_share") * 100 if pd.notna(job_row.get('median_billable_share')) else np.nan))
+            st.metric(
+                "Median billable share",
+                fmt_percent(job_row.get("median_billable_share") * 100 if pd.notna(job_row.get("median_billable_share")) else np.nan),
+            )
 
         df_completed = df_scope.copy()
         if "job_completed_date" in df_completed.columns:
@@ -675,7 +911,11 @@ def main():
         if len(df_completed) > 0:
             task_mix = df_completed.groupby("task_name")["hours_raw"].sum().sort_values(ascending=False).head(5)
             st.markdown("**Median task mix (top 5)**")
-            st.dataframe(task_mix.reset_index().rename(columns={"task_name": "Task", "hours_raw": "Hours"}), use_container_width=True, hide_index=True)
+            st.dataframe(
+                task_mix.reset_index().rename(columns={"task_name": "Task", "hours_raw": "Hours"}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
             job_actual = df_completed.groupby("job_no")["hours_raw"].sum()
             job_task_quote = safe_quote_job_task(df_completed)
