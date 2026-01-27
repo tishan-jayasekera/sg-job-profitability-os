@@ -191,28 +191,7 @@ def main():
     
     st.markdown("---")
     
-    # =========================================================================
-    # TIME ALLOCATION
-    # =========================================================================
-    section_header("Time Allocation")
-    
-    st.markdown("""
-    **Descriptive, not prescriptive.** No targets.
-    
-    ### Metrics
-    - **Billable Ratio** = billable_hours / total_hours
-    - **HHI (concentration)** = Σ(task_share²)
-      - 1.0 = concentrated
-      - 0.0 = fragmented
-    
-    ### Crowd-Out Flags
-    Patterns that may indicate issues:
-    - Admin > 20% of non-billable
-    - Internal projects > 30%
-    - Very low billable without Ops-Heavy role
-    """)
-    
-    st.markdown("---")
+    # Time Allocation page removed
     
     # =========================================================================
     # REVENUE ALLOCATION

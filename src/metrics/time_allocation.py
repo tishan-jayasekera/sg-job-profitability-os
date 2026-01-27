@@ -50,12 +50,13 @@ def compute_allocation_breakdown(df: pd.DataFrame,
         nb = df_clean[~df_clean["is_billable"]].groupby([group_by, "breakdown"])["hours_raw"].sum().reset_index()
         nb = nb.dropna(subset=["breakdown"])
         
-        breakdown_map = (
-            nb.groupby(group_by)
-            .apply(lambda x: dict(zip(x["breakdown"], x["hours_raw"])))
-            .rename("nonbillable_by_breakdown")
-            .reset_index()
-        )
+        rows = []
+        for key, sub in nb.groupby(group_by):
+            rows.append({
+                group_by: key,
+                "nonbillable_by_breakdown": dict(zip(sub["breakdown"], sub["hours_raw"]))
+            })
+        breakdown_map = pd.DataFrame(rows)
         agg = agg.merge(breakdown_map, on=group_by, how="left")
     else:
         agg["nonbillable_by_breakdown"] = [{} for _ in range(len(agg))]

@@ -26,6 +26,17 @@ st.set_page_config(page_title="Job Mix & Demand", page_icon="📊", layout="wide
 
 init_state()
 
+def _section_intro(title: str, subtitle: str, why: str):
+    st.markdown(f"### {title}")
+    st.caption(subtitle)
+    st.markdown(f"**Why it matters:** {why}")
+
+def _section_start(variant: str):
+    st.markdown(f"<div class='section {variant}'>", unsafe_allow_html=True)
+
+def _section_end():
+    st.markdown("</div>", unsafe_allow_html=True)
+
 def _compute_staff_month_totals(df: pd.DataFrame) -> pd.DataFrame:
     """Compute staff-month totals with effective FTE scaling from timesheets."""
     if "staff_name" not in df.columns or "month_key" not in df.columns:
@@ -415,6 +426,42 @@ def compute_job_volume_deltas(
 def main():
     st.title("Job Mix & Implied FTE Demand")
     st.caption("Analyze job intake patterns and capacity implications")
+
+    st.markdown(
+        """
+        <style>
+        .page-hero {
+            background: linear-gradient(135deg, #f4efe4 0%, #fff7e8 100%);
+            border: 1px solid #eadfcb;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin: 6px 0 14px 0;
+        }
+        .guide-row { display: flex; gap: 12px; }
+        .guide-card {
+            flex: 1;
+            background: #ffffff;
+            border: 1px solid #e6e1d5;
+            border-radius: 10px;
+            padding: 12px 12px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        }
+        .guide-card h4 { margin: 0 0 6px 0; }
+        .section {
+            border-radius: 12px;
+            padding: 12px 14px;
+            margin: 14px 0;
+            border: 1px solid #e6e1d5;
+            background: #fcfbf8;
+        }
+        .band-portfolio { border-left: 6px solid #4c78a8; }
+        .band-value { border-left: 6px solid #f58518; }
+        .band-capacity { border-left: 6px solid #54a24b; }
+        .band-drill { border-left: 6px solid #e45756; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     
     # Load data
     df_all_raw = load_fact_timesheet()
@@ -441,14 +488,45 @@ def main():
         format_func=lambda x: f"Last {x}" if x != "all" else "All Time",
         index=1
     )
+
+    exclude_sg_alloc = st.sidebar.checkbox(
+        "Exclude: Social Garden Invoice Allocation",
+        value=True,
+        help="Removes the [Job Task] Name 'Social Garden Invoice Allocation' from all analyses."
+    )
     
     departments = ["All"] + sorted(df_all_raw["department_final"].dropna().unique().tolist())
     selected_dept = st.sidebar.selectbox("Department", departments)
     
+    if exclude_sg_alloc and "task_name" in df_all_raw.columns:
+        df_all_raw = df_all_raw[df_all_raw["task_name"] != "Social Garden Invoice Allocation"]
+
     if selected_dept != "All":
         df_all = df_all_raw[df_all_raw["department_final"] == selected_dept]
     else:
         df_all = df_all_raw
+
+    st.markdown(
+        """
+        <div class="page-hero">
+            <div class="guide-row">
+                <div class="guide-card">
+                    <h4>1) Portfolio Mix</h4>
+                    <div>What work is coming in, how big it is, and pricing signals.</div>
+                </div>
+                <div class="guide-card">
+                    <h4>2) Value vs Effort</h4>
+                    <div>Which jobs create value vs consume capacity, and why.</div>
+                </div>
+                <div class="guide-card">
+                    <h4>3) Capacity vs Delivery</h4>
+                    <div>Are we over- or under-loaded, and where?</div>
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     
     # Calculate cohorts
     cohort_df = calculate_job_cohorts(df_all, cohort_type)
@@ -507,7 +585,12 @@ def main():
     # =========================================================================
     # SECTION A: KPI STRIP
     # =========================================================================
-    section_header("Job Mix Summary")
+    _section_start("band-portfolio")
+    _section_intro(
+        "1) Portfolio Mix — Intake, Scale, and Pricing",
+        "How many jobs are coming in, how large they are, and what they imply for demand.",
+        "This sets the baseline for forecasting demand and pricing discipline."
+    )
     
     kpi_cols = st.columns(8)
     
@@ -567,13 +650,17 @@ Quotes repeat on each timesheet row. We dedupe at (job_no, task_name) before sum
 planned hours aren’t inflated.
             """
         )
-    
-    st.markdown("---")
+    _section_end()
     
     # =========================================================================
     # SECTION B: TREND CHARTS
     # =========================================================================
-    section_header("Monthly Trends")
+    _section_start("band-portfolio")
+    _section_intro(
+        "1.1) Monthly Trends — Volume vs Value",
+        "Track whether job volume and quote values are moving together or diverging.",
+        "Highlights pricing consistency and shifts in demand mix."
+    )
     
     col1, col2 = st.columns(2)
     
@@ -701,13 +788,17 @@ planned hours aren’t inflated.
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             )
             st.plotly_chart(fig, use_container_width=True)
-    
-    st.markdown("---")
+    _section_end()
     
     # =========================================================================
     # SECTION C: JOB QUADRANT
     # =========================================================================
-    section_header("Job Value vs Effort", "Identify 'high value / low hours' segment")
+    _section_start("band-value")
+    _section_intro(
+        "2) Value vs Effort — Portfolio Segmentation",
+        "Map jobs by quoted value and quoted hours, then drill into profitability and delivery risk.",
+        "Turns the portfolio into an action list: protect high‑value work and fix margin erosion."
+    )
     
     if len(job_level) > 0:
         job_quotes = job_level[(job_level["quoted_hours"] > 0) & (job_level["quoted_amount"] > 0)].copy()
@@ -733,14 +824,87 @@ planned hours aren’t inflated.
                 for col, value in chain_filters.items():
                     job_quotes = job_quotes[job_quotes[col] == value]
 
-            fig = quadrant_scatter(
-                job_quotes,
-                x="quoted_hours",
-                y="quoted_amount",
-                hover_name="job_no",
-                title="Job Portfolio: Value vs Effort",
-                x_title="Quoted Hours",
-                y_title="Quoted Amount ($)",
+            # Build margin to date for visual view (effort, value, margin)
+            job_financials_3d = df_window.groupby("job_no").agg(
+                revenue_to_date=("rev_alloc", "sum") if "rev_alloc" in df_window.columns else ("job_no", "count"),
+                cost_to_date=("base_cost", "sum") if "base_cost" in df_window.columns else ("job_no", "count"),
+            ).reset_index()
+            job_financials_3d["margin_to_date"] = job_financials_3d["revenue_to_date"] - job_financials_3d["cost_to_date"]
+            job_financials_3d["margin_pct_to_date"] = np.where(
+                job_financials_3d["revenue_to_date"] > 0,
+                job_financials_3d["margin_to_date"] / job_financials_3d["revenue_to_date"] * 100,
+                np.nan,
+            )
+
+            summary_candidates = [
+                "[Job] Job Summary",
+                "job_summary",
+                "job_summary_quote",
+                "job_summary_raw",
+                "job_name",
+                "job_name_raw",
+                "deliverable",
+                "task_label",
+            ]
+            summary_col = next((c for c in summary_candidates if c in df_all.columns), None)
+
+            job_meta_3d = df_all.groupby("job_no").agg(
+                client=("client", "first") if "client" in df_all.columns else ("job_no", "first"),
+                job_summary=(summary_col, "first") if summary_col else ("job_no", "first"),
+            ).reset_index()
+
+            job_3d = job_quotes.merge(job_financials_3d, on="job_no", how="left")
+            job_3d = job_3d.merge(job_meta_3d, on="job_no", how="left")
+            job_3d = job_3d.dropna(subset=["quoted_hours", "quoted_amount"])
+
+            x_med = job_3d["quoted_hours"].median()
+            y_med = job_3d["quoted_amount"].median()
+            margin_guard = 20.0
+
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=job_3d["quoted_hours"],
+                    y=job_3d["quoted_amount"],
+                    mode="markers",
+                    marker=dict(
+                        size=7,
+                        color=job_3d["margin_pct_to_date"],
+                        colorscale="RdYlGn",
+                        cmin=-20,
+                        cmax=50,
+                        colorbar=dict(title="Margin %"),
+                        line=dict(width=0.4, color="#444"),
+                        opacity=0.85,
+                    ),
+                    text=job_3d["job_no"],
+                    customdata=job_3d[["margin_pct_to_date", "client", "job_summary"]].values,
+                    hovertemplate=(
+                        "Job: %{text}<br>"
+                        "Client: %{customdata[1]}<br>"
+                        "Job Summary: %{customdata[2]}<br>"
+                        "Quoted Hours: %{x:.1f}<br>"
+                        "Quoted $: %{y:$,.0f}<br>"
+                        "Margin %: %{customdata[0]:.1f}%<extra></extra>"
+                    ),
+                )
+            )
+            fig.add_vline(x=x_med, line_dash="dash", line_color="#4c78a8")
+            fig.add_hline(y=y_med, line_dash="dash", line_color="#f58518")
+            fig.add_annotation(x=x_med, y=job_3d["quoted_amount"].max(), text="Median Effort", showarrow=False, yshift=10)
+            fig.add_annotation(x=job_3d["quoted_hours"].max(), y=y_med, text="Median Value", showarrow=False, xshift=10)
+            fig.add_annotation(
+                x=job_3d["quoted_hours"].min(),
+                y=job_3d["quoted_amount"].min(),
+                text=f"Green ≥ {margin_guard:.0f}% margin",
+                showarrow=False,
+                bgcolor="rgba(255,255,255,0.7)",
+            )
+            fig.update_layout(
+                title="Job Portfolio: Effort × Value (Color = Margin %)",
+                xaxis_title="Quoted Hours (Effort)",
+                yaxis_title="Quoted Amount ($) (Value)",
+                margin=dict(l=10, r=10, b=40, t=50),
             )
             st.plotly_chart(fig, use_container_width=True)
 
@@ -874,12 +1038,32 @@ planned hours aren’t inflated.
                         reasons.append("Realised rate below quote rate")
                 return "; ".join(reasons)
 
+            def _risk_action(row: pd.Series) -> str:
+                actions = []
+                if pd.notna(row.get("hours_overrun_pct")) and row["hours_overrun_pct"] > 10:
+                    actions.append("Scope reset + reforecast hours")
+                if pd.notna(row.get("quote_to_revenue")) and row["quote_to_revenue"] < 0.7:
+                    actions.append("Accelerate billing / milestone invoice")
+                if pd.notna(row.get("realised_rate")) and pd.notna(row.get("quote_rate")):
+                    if row["realised_rate"] < row["quote_rate"] * 0.85:
+                        actions.append("Staffing mix review (rate uplift)")
+                if pd.notna(row.get("margin_pct_to_date")) and row["margin_pct_to_date"] < 15:
+                    actions.append("Margin guardrails / pricing review")
+                if not actions:
+                    return "Monitor"
+                return " | ".join(dict.fromkeys(actions))
+
             active_risk = quadrant_detail[quadrant_detail["is_active"] == True].copy()
             active_risk["risk_reason"] = active_risk.apply(_risk_reasons, axis=1)
+            active_risk["recommended_action"] = active_risk.apply(_risk_action, axis=1)
             active_risk = active_risk[active_risk["risk_reason"] != ""]
             active_risk = active_risk.sort_values(["margin_pct_to_date", "quote_to_revenue"], ascending=[True, True])
 
             if len(active_risk) > 0:
+                st.caption(
+                    f"{len(active_risk)} active jobs flagged in this quadrant. "
+                    "Prioritize items with low margin %, weak revenue capture, or overruns."
+                )
                 st.dataframe(
                     active_risk.head(12)[
                         [
@@ -893,6 +1077,7 @@ planned hours aren’t inflated.
                             "realised_rate",
                             "quote_rate",
                             "risk_reason",
+                            "recommended_action",
                         ]
                     ].rename(columns={
                         "job_no": "Job",
@@ -905,6 +1090,7 @@ planned hours aren’t inflated.
                         "realised_rate": "Realised Rate",
                         "quote_rate": "Quote Rate",
                         "risk_reason": "Why At Risk",
+                        "recommended_action": "Recommended Action",
                     }),
                     use_container_width=True,
                     hide_index=True,
@@ -966,34 +1152,300 @@ planned hours aren’t inflated.
                 },
             )
 
-            st.subheader("Job Deep‑Dive: Margin Drivers and Overruns")
-            job_options = quadrant_detail["job_no"].dropna().unique().tolist()
-            if job_options:
-                selected_job = st.selectbox("Select a job to trace margin drivers", job_options, key="job_value_job_select")
-                df_job = df_window[df_window["job_no"] == selected_job].copy()
+            st.subheader("Job Deep‑Dive: Operational Health & Right‑Sizing")
+            st.caption("Start with a chain filter, shortlist jobs, then drill into one job with clear benchmarks.")
 
-                st.markdown("**1) Profitability to Date (Selected Window)**")
+            # Chain-first filters for deep-dive
+            chain_cols = st.columns(3)
+            with chain_cols[0]:
+                dept_options = ["All"] + sorted(df_window["department_final"].dropna().unique().tolist())
+                deep_dept = st.selectbox("Department (Deep‑Dive)", dept_options, key="deep_dept")
+            with chain_cols[1]:
+                df_cat = df_window if deep_dept == "All" else df_window[df_window["department_final"] == deep_dept]
+                cat_options = ["All"] + sorted(df_cat["job_category"].dropna().unique().tolist())
+                deep_cat = st.selectbox("Category (Deep‑Dive)", cat_options, key="deep_cat")
+            with chain_cols[2]:
+                status_choice = st.selectbox("Status", ["Active", "Completed", "All"], key="deep_status")
+
+            deep_df = df_window.copy()
+            if deep_dept != "All":
+                deep_df = deep_df[deep_df["department_final"] == deep_dept]
+            if deep_cat != "All":
+                deep_df = deep_df[deep_df["job_category"] == deep_cat]
+
+            # Job completion map
+            completion = deep_df.groupby("job_no").agg(
+                completed_date=("job_completed_date", "first") if "job_completed_date" in deep_df.columns else ("job_no", "first"),
+                job_status=("job_status", "first") if "job_status" in deep_df.columns else ("job_no", "first"),
+            ).reset_index()
+            if "job_completed_date" in completion.columns:
+                completion["is_completed"] = completion["completed_date"].notna()
+            elif "job_status" in completion.columns:
+                completion["is_completed"] = completion["job_status"].str.lower().str.contains("completed", na=False)
+            else:
+                completion["is_completed"] = False
+
+            if status_choice != "All":
+                want_completed = status_choice == "Completed"
+                completion = completion[completion["is_completed"] == want_completed]
+            deep_df = deep_df[deep_df["job_no"].isin(completion["job_no"].unique())]
+
+            # Quick scope summary
+            scope_cols = st.columns(4)
+            with scope_cols[0]:
+                st.metric("Jobs in Scope", f"{deep_df['job_no'].nunique():,}")
+            with scope_cols[1]:
+                st.metric("Active Jobs", f"{completion[completion['is_completed'] == False]['job_no'].nunique():,}")
+            with scope_cols[2]:
+                st.metric("Completed Jobs", f"{completion[completion['is_completed'] == True]['job_no'].nunique():,}")
+            with scope_cols[3]:
+                if "rev_alloc" in deep_df.columns and "base_cost" in deep_df.columns:
+                    prof = deep_df.groupby("job_no").agg(
+                        revenue=("rev_alloc", "sum"),
+                        cost=("base_cost", "sum"),
+                    ).reset_index()
+                    prof["margin_pct"] = np.where(
+                        prof["revenue"] > 0,
+                        (prof["revenue"] - prof["cost"]) / prof["revenue"] * 100,
+                        np.nan,
+                    )
+                    st.metric("Median Margin %", f"{prof['margin_pct'].median():.1f}%" if len(prof) > 0 else "—")
+                else:
+                    st.metric("Median Margin %", "—")
+
+            # Shortlist jobs
+            job_meta_deep = df_all.groupby("job_no").agg(
+                client=("client", "first") if "client" in df_all.columns else ("job_no", "first"),
+                job_summary=(summary_col, "first") if "summary_col" in locals() and summary_col else ("job_no", "first"),
+            ).reset_index()
+
+            job_metrics = deep_df.groupby("job_no").agg(
+                actual_hours=("hours_raw", "sum"),
+                revenue=("rev_alloc", "sum") if "rev_alloc" in deep_df.columns else ("job_no", "count"),
+                cost=("base_cost", "sum") if "base_cost" in deep_df.columns else ("job_no", "count"),
+            ).reset_index()
+            job_metrics["margin"] = job_metrics["revenue"] - job_metrics["cost"]
+            job_metrics["margin_pct"] = np.where(
+                job_metrics["revenue"] > 0,
+                job_metrics["margin"] / job_metrics["revenue"] * 100,
+                np.nan,
+            )
+            job_metrics = job_metrics.merge(completion[["job_no", "is_completed"]], on="job_no", how="left")
+            job_metrics = job_metrics.merge(job_meta_deep, on="job_no", how="left")
+
+            shortlist_n = st.slider("Shortlist size", 5, 30, 10, key="deep_shortlist")
+            sort_option = st.selectbox(
+                "Sort shortlist by",
+                ["Lowest Margin %", "Highest Cost", "Highest Hours"],
+                key="deep_sort",
+            )
+            if sort_option == "Highest Cost":
+                shortlist = job_metrics.sort_values("cost", ascending=False).head(shortlist_n)
+            elif sort_option == "Highest Hours":
+                shortlist = job_metrics.sort_values("actual_hours", ascending=False).head(shortlist_n)
+            else:
+                shortlist = job_metrics.sort_values("margin_pct", ascending=True).head(shortlist_n)
+
+            st.markdown("**Shortlist (Lowest Margin %)**")
+            st.dataframe(
+                shortlist.rename(columns={
+                    "job_no": "Job",
+                    "client": "Client",
+                    "job_summary": "Job Summary",
+                    "actual_hours": "Hours",
+                    "revenue": "Revenue",
+                    "cost": "Cost",
+                    "margin": "Margin",
+                    "margin_pct": "Margin %",
+                    "is_completed": "Completed",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Revenue": st.column_config.NumberColumn(format="$%.0f"),
+                    "Cost": st.column_config.NumberColumn(format="$%.0f"),
+                    "Margin": st.column_config.NumberColumn(format="$%.0f"),
+                    "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Completed": st.column_config.CheckboxColumn(),
+                },
+            )
+
+            selected_job = st.selectbox(
+                "Select job for deep‑dive",
+                shortlist["job_no"].tolist() if len(shortlist) > 0 else [],
+                key="deep_job_select",
+            )
+
+            if selected_job:
+                df_job = deep_df[deep_df["job_no"] == selected_job].copy()
+                job_row = quadrant_detail[quadrant_detail["job_no"] == selected_job].iloc[0]
+                job_dept = job_row.get("department_final")
+                job_cat = job_row.get("job_category")
+                job_active = bool(job_row.get("is_active"))
+
+                # Benchmark slice: completed jobs in same dept + category
+                df_bench = df_window.copy()
+                if job_dept in df_bench.columns:
+                    df_bench = df_bench[df_bench["department_final"] == job_dept]
+                if job_cat in df_bench.columns:
+                    df_bench = df_bench[df_bench["job_category"] == job_cat]
+
+                bench_completion = df_bench.groupby("job_no").agg(
+                    completed_date=("job_completed_date", "first") if "job_completed_date" in df_bench.columns else ("job_no", "first"),
+                    job_status=("job_status", "first") if "job_status" in df_bench.columns else ("job_no", "first"),
+                ).reset_index()
+                if "job_completed_date" in bench_completion.columns:
+                    bench_completion["is_completed"] = bench_completion["completed_date"].notna()
+                elif "job_status" in bench_completion.columns:
+                    bench_completion["is_completed"] = bench_completion["job_status"].str.lower().str.contains("completed", na=False)
+                else:
+                    bench_completion["is_completed"] = False
+
+                completed_jobs = set(bench_completion[bench_completion["is_completed"] == True]["job_no"].tolist())
+
+                # Runtime benchmarks (days and months)
+                date_col = "work_date" if "work_date" in df_bench.columns else "month_key"
+                df_bench_dates = df_bench.copy()
+                df_bench_dates[date_col] = pd.to_datetime(df_bench_dates[date_col], errors="coerce")
+                runtime = df_bench_dates.groupby("job_no").agg(
+                    start_date=(date_col, "min"),
+                    end_date=(date_col, "max"),
+                ).reset_index()
+                runtime = runtime[runtime["job_no"].isin(completed_jobs)]
+                runtime["runtime_days"] = (runtime["end_date"] - runtime["start_date"]).dt.days + 1
+                runtime["runtime_months"] = runtime["runtime_days"] / 30.44
+
+                job_runtime = df_job.copy()
+                job_runtime[date_col] = pd.to_datetime(job_runtime[date_col], errors="coerce")
+                if len(job_runtime) > 0:
+                    job_start = job_runtime[date_col].min()
+                    job_end = job_runtime[date_col].max()
+                    job_runtime_days = (job_end - job_start).days + 1
+                    job_runtime_months = job_runtime_days / 30.44
+                else:
+                    job_runtime_days = np.nan
+                    job_runtime_months = np.nan
+
+                runtime_med_days = runtime["runtime_days"].median() if len(runtime) > 0 else np.nan
+                runtime_med_months = runtime["runtime_months"].median() if len(runtime) > 0 else np.nan
+                delta_days = (job_runtime_days - runtime_med_days) if pd.notna(job_runtime_days) and pd.notna(runtime_med_days) else np.nan
+
+                # Billable mix benchmark
+                if "is_billable" in df_bench.columns:
+                    job_billable = df_job.copy()
+                    job_billable["billable_hours"] = np.where(job_billable["is_billable"], job_billable["hours_raw"], 0)
+                    job_billable_share = (
+                        job_billable["billable_hours"].sum() / job_billable["hours_raw"].sum()
+                        if job_billable["hours_raw"].sum() > 0 else np.nan
+                    )
+
+                    bench_billable = df_bench.copy()
+                    bench_billable["billable_hours"] = np.where(bench_billable["is_billable"], bench_billable["hours_raw"], 0)
+                    billable_by_job = bench_billable.groupby("job_no").agg(
+                        billable=("billable_hours", "sum"),
+                        total=("hours_raw", "sum"),
+                    ).reset_index()
+                    billable_by_job = billable_by_job[billable_by_job["job_no"].isin(completed_jobs)]
+                    billable_by_job["billable_share"] = np.where(
+                        billable_by_job["total"] > 0,
+                        billable_by_job["billable"] / billable_by_job["total"],
+                        np.nan,
+                    )
+                    bench_billable_share = billable_by_job["billable_share"].median() if len(billable_by_job) > 0 else np.nan
+                else:
+                    job_billable_share = np.nan
+                    bench_billable_share = np.nan
+
+                # Margin benchmark
+                bench_margin = np.nan
+                if len(df_bench) > 0 and "rev_alloc" in df_bench.columns and "base_cost" in df_bench.columns:
+                    bench_profit = df_bench[df_bench["job_no"].isin(completed_jobs)].groupby("job_no").agg(
+                        revenue=("rev_alloc", "sum"),
+                        cost=("base_cost", "sum"),
+                    ).reset_index()
+                    bench_profit["margin_pct"] = np.where(
+                        bench_profit["revenue"] > 0,
+                        (bench_profit["revenue"] - bench_profit["cost"]) / bench_profit["revenue"] * 100,
+                        np.nan,
+                    )
+                    bench_margin = bench_profit["margin_pct"].median() if len(bench_profit) > 0 else np.nan
+
                 job_fin = quadrant_detail[quadrant_detail["job_no"] == selected_job].iloc[0]
-                kpi_cols = st.columns(5)
-                with kpi_cols[0]:
-                    st.metric("Revenue to Date", fmt_currency(job_fin["revenue_to_date"]))
-                with kpi_cols[1]:
-                    st.metric("Cost to Date", fmt_currency(job_fin["cost_to_date"]))
-                with kpi_cols[2]:
-                    st.metric("Margin to Date", fmt_currency(job_fin["margin_to_date"]))
-                with kpi_cols[3]:
-                    st.metric("Margin %", fmt_percent(job_fin["margin_pct_to_date"]))
-                with kpi_cols[4]:
-                    st.metric("Revenue / Quote", f"{job_fin['quote_to_revenue']:.2f}x" if pd.notna(job_fin["quote_to_revenue"]) else "—")
+                margin_delta = (
+                    job_fin["margin_pct_to_date"] - bench_margin
+                    if pd.notna(job_fin["margin_pct_to_date"]) and pd.notna(bench_margin)
+                    else np.nan
+                )
+                billable_delta = (
+                    (job_billable_share - bench_billable_share) * 100
+                    if pd.notna(job_billable_share) and pd.notna(bench_billable_share)
+                    else np.nan
+                )
 
-                st.markdown("**2) Task Cost Leaders & Overruns**")
+                # Health score
+                health_points = 0
+                if pd.notna(delta_days):
+                    health_points += 2 if delta_days > 15 else (1 if delta_days > 7 else 0)
+                if pd.notna(margin_delta):
+                    health_points += 2 if margin_delta < -10 else (1 if margin_delta < -5 else 0)
+                if pd.notna(billable_delta):
+                    health_points += 2 if billable_delta < -10 else (1 if billable_delta < -5 else 0)
+                health_label = "Red" if health_points >= 4 else ("Amber" if health_points >= 2 else "Green")
+
+                actions = []
+                if pd.notna(delta_days) and delta_days > 7:
+                    actions.append("Reforecast timeline + reset scope")
+                if pd.notna(margin_delta) and margin_delta < -5:
+                    actions.append("Margin guardrails + pricing review")
+                if pd.notna(billable_delta) and billable_delta < -5:
+                    actions.append("Shift billable mix / reduce non‑billable")
+                if not actions:
+                    actions.append("Monitor and hold course")
+
+                st.markdown("**Executive Snapshot**")
+                snapshot_cols = st.columns(5)
+                with snapshot_cols[0]:
+                    st.metric("Status", "Active" if job_active else "Completed")
+                with snapshot_cols[1]:
+                    st.metric("Health", health_label)
+                with snapshot_cols[2]:
+                    st.metric("Margin Δ", f"{margin_delta:+.1f}%" if pd.notna(margin_delta) else "—")
+                with snapshot_cols[3]:
+                    st.metric("Billable Δ", f"{billable_delta:+.1f}pp" if pd.notna(billable_delta) else "—")
+                with snapshot_cols[4]:
+                    st.metric("Runtime Δ", f"{delta_days:+.0f}d" if pd.notna(delta_days) else "—")
+                st.info("Recommended action: " + " | ".join(dict.fromkeys(actions)))
+
+                st.markdown("**Benchmark vs Job (Medians)**")
+                compare_df = pd.DataFrame({
+                    "Metric": ["Runtime (Days)", "Runtime (Months)", "Margin %", "Billable Share %"],
+                    "Job": [
+                        job_runtime_days,
+                        job_runtime_months,
+                        job_fin["margin_pct_to_date"],
+                        job_billable_share * 100 if pd.notna(job_billable_share) else np.nan,
+                    ],
+                    "Benchmark": [
+                        runtime_med_days,
+                        runtime_med_months,
+                        bench_margin,
+                        bench_billable_share * 100 if pd.notna(bench_billable_share) else np.nan,
+                    ],
+                })
+                fig = go.Figure()
+                fig.add_trace(go.Bar(x=compare_df["Metric"], y=compare_df["Job"], name="Job"))
+                fig.add_trace(go.Bar(x=compare_df["Metric"], y=compare_df["Benchmark"], name="Benchmark"))
+                fig.update_layout(barmode="group", yaxis_title="Value")
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("**Task Cost Leaders & Overruns**")
                 if len(df_job) > 0:
                     task_cost = df_job.groupby("task_name").agg(
                         hours=("hours_raw", "sum"),
                         cost=("base_cost", "sum") if "base_cost" in df_job.columns else ("hours_raw", "sum"),
                         revenue=("rev_alloc", "sum") if "rev_alloc" in df_job.columns else ("hours_raw", "sum"),
                     ).reset_index()
-
                     jt = safe_quote_job_task(df_job)
                     if len(jt) > 0 and "quoted_time_total" in jt.columns:
                         task_cost = task_cost.merge(
@@ -1003,28 +1455,18 @@ planned hours aren’t inflated.
                         )
                     else:
                         task_cost["quoted_hours"] = np.nan
-
                     task_cost["hours_overrun"] = task_cost["hours"] - task_cost["quoted_hours"]
                     task_cost["hours_overrun_pct"] = np.where(
                         task_cost["quoted_hours"] > 0,
                         task_cost["hours_overrun"] / task_cost["quoted_hours"] * 100,
                         np.nan,
                     )
-                    task_cost["margin"] = task_cost["revenue"] - task_cost["cost"]
-                    task_cost["margin_pct"] = np.where(
-                        task_cost["revenue"] > 0,
-                        task_cost["margin"] / task_cost["revenue"] * 100,
-                        np.nan,
-                    )
-
                     st.dataframe(
                         task_cost.sort_values("cost", ascending=False).head(12).rename(columns={
                             "task_name": "Task",
                             "hours": "Hours",
                             "cost": "Cost",
                             "revenue": "Revenue",
-                            "margin": "Margin",
-                            "margin_pct": "Margin %",
                             "quoted_hours": "Quoted Hours",
                             "hours_overrun_pct": "Hours Overrun %",
                         }),
@@ -1034,14 +1476,49 @@ planned hours aren’t inflated.
                             "Hours": st.column_config.NumberColumn(format="%.1f"),
                             "Cost": st.column_config.NumberColumn(format="$%.0f"),
                             "Revenue": st.column_config.NumberColumn(format="$%.0f"),
-                            "Margin": st.column_config.NumberColumn(format="$%.0f"),
-                            "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
                             "Quoted Hours": st.column_config.NumberColumn(format="%.1f"),
                             "Hours Overrun %": st.column_config.NumberColumn(format="%.1f%%"),
                         },
                     )
 
-                st.markdown("**3) Staff Drivers (FTE‑aware)**")
+                st.markdown("**Task Distribution vs Benchmark (Median Share)**")
+                bench_tasks = df_bench[df_bench["job_no"].isin(completed_jobs)].copy()
+                if len(bench_tasks) > 0:
+                    bench_job_task = bench_tasks.groupby(["job_no", "task_name"])["hours_raw"].sum().reset_index()
+                    bench_job_totals = bench_tasks.groupby("job_no")["hours_raw"].sum().rename("job_hours").reset_index()
+                    bench_job_task = bench_job_task.merge(bench_job_totals, on="job_no", how="left")
+                    bench_job_task["task_share"] = np.where(
+                        bench_job_task["job_hours"] > 0,
+                        bench_job_task["hours_raw"] / bench_job_task["job_hours"],
+                        np.nan,
+                    )
+                    bench_task_median = bench_job_task.groupby("task_name")["task_share"].median().reset_index()
+                    job_task_share = df_job.groupby("task_name")["hours_raw"].sum().reset_index()
+                    job_task_share["job_hours"] = df_job["hours_raw"].sum()
+                    job_task_share["task_share"] = np.where(
+                        job_task_share["job_hours"] > 0,
+                        job_task_share["hours_raw"] / job_task_share["job_hours"],
+                        np.nan,
+                    )
+                    task_compare = job_task_share.merge(bench_task_median, on="task_name", how="left", suffixes=("", "_benchmark"))
+                    task_compare["share_delta"] = (task_compare["task_share"] - task_compare["task_share_benchmark"]) * 100
+                    st.dataframe(
+                        task_compare.sort_values("share_delta", ascending=False).head(12).rename(columns={
+                            "task_name": "Task",
+                            "task_share": "Job Share",
+                            "task_share_benchmark": "Benchmark Share",
+                            "share_delta": "Delta (pp)",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Job Share": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Benchmark Share": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Delta (pp)": st.column_config.NumberColumn(format="%.1f"),
+                        },
+                    )
+
+                st.markdown("**Staff Drivers (FTE‑aware)**")
                 if len(df_job) > 0 and "staff_name" in df_job.columns:
                     staff_cost = df_job.groupby("staff_name").agg(
                         hours=("hours_raw", "sum"),
@@ -1163,13 +1640,17 @@ Operational signals:
 - Low Value / High Effort: strong candidates for re-pricing or exit.
                 """
             )
-    
-    st.markdown("---")
+    _section_end()
     
     # =========================================================================
     # SECTION D: OPERATIONAL CAPACITY (DELIVERY VS SUPPLY)
     # =========================================================================
-    section_header("Operational Capacity", "Actual work delivered vs available capacity")
+    _section_start("band-capacity")
+    _section_intro(
+        "3) Capacity vs Delivery — Are We Over or Under‑Loaded?",
+        "Compare actual delivery to available capacity, and stress‑test growth scenarios.",
+        "This is the operational reality check before committing to new work."
+    )
 
     if len(capacity_delivery) > 0:
         growth_pct = st.slider("Sales growth scenario (demand increase)", 0, 50, 0, step=5)
@@ -1373,13 +1854,17 @@ This produces an apples‑to‑apples view of capacity vs delivery that reconcil
                     "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
                 },
             )
-
-    st.markdown("---")
+    _section_end()
 
     # =========================================================================
     # SECTION E: OPERATIONAL DRILLDOWN (DEPARTMENT → CATEGORY → STAFF → BREAKDOWN → TASK)
     # =========================================================================
-    section_header("Operational Drilldown", "Follow the delivery chain to locate slack or overload")
+    _section_start("band-drill")
+    _section_intro(
+        "3.1) Operational Drilldown — Where Capacity Lives",
+        "Walk the chain from department → category → staff → task to locate slack or overload.",
+        "Ensures decisions are tied to who can actually deliver the work."
+    )
     st.caption(
         "How to read this drilldown: capacity is allocated using real timesheet shares, so when you move "
         "from department → category → staff → task, the totals always reconcile. "
@@ -1740,6 +2225,7 @@ High slack means unutilised capacity; negative slack indicates overload.
             )
     else:
         st.caption("Need at least 6 months of data to compute the trend comparison.")
+    _section_end()
 
 
 if __name__ == "__main__":

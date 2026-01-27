@@ -107,7 +107,6 @@ def main():
         st.page_link("pages/2_Quote_Builder.py", label="Quote Builder", icon="📝")
         st.page_link("pages/3_Capacity_Profiles.py", label="Capacity & Profiles", icon="👥")
         st.page_link("pages/4_Active_Delivery.py", label="Active Delivery", icon="🎯")
-        st.page_link("pages/5_Time_Allocation.py", label="Time Allocation", icon="⏱️")
         st.page_link("pages/6_Job_Mix_and_Demand.py", label="Job Mix & Demand", icon="📊")
         st.page_link("pages/7_Data_Quality_QA.py", label="Data Quality & QA", icon="✅")
         st.page_link("pages/8_Glossary_Method.py", label="Glossary & Method", icon="📖")

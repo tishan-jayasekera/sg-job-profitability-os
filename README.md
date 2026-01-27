@@ -18,10 +18,9 @@ Everything else (client, state, role, etc.) is filter-only.
 2. **Quote Builder** - Historical benchmarks, task templates, economics preview
 3. **Capacity & Staffing** - Capacity overview, staffing recommendations, staff scatter
 4. **Active Delivery** - Risk monitoring, job breakdown, staff attribution
-5. **Utilisation & Time Use** - Utilisation analysis, time breakdown, leakage identification
-6. **Job Mix & Demand** - Intake trends, implied FTE demand, demand vs supply
-7. **Data Quality & QA** - Schema validation, reconciliation, anomaly detection
-8. **Glossary & Method** - Metric definitions, formulas, methodology
+5. **Job Mix & Demand** - Intake trends, implied FTE demand, demand vs supply
+6. **Data Quality & QA** - Schema validation, reconciliation, anomaly detection
+7. **Glossary & Method** - Metric definitions, formulas, methodology
 
 ## Quick Start
 
@@ -77,7 +76,6 @@ job-profitability-os/
 │   ├── 2_Quote_Builder.py
 │   ├── 3_Capacity_Profiles.py
 │   ├── 4_Active_Delivery.py
-│   ├── 5_Time_Allocation.py
 │   ├── 6_Job_Mix_and_Demand.py
 │   ├── 7_Data_Quality_QA.py
 │   └── 8_Glossary_Method.py

@@ -419,7 +419,7 @@ def render_action_shortlist(df: pd.DataFrame):
                     "type": "Low Billable Share",
                     "location": row["department_final"],
                     "detail": f"{row['utilisation']:.1f}% billable share of hours",
-                    "page": "Time Allocation"
+                    "page": "Job Mix & Demand"
                 })
     
     if not actions:
