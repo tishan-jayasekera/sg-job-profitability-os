@@ -9,12 +9,13 @@ import numpy as np
 from pathlib import Path
 import sys
 import plotly.express as px
+import plotly.graph_objects as go
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data.loader import load_fact_timesheet
 from src.data.cohorts import filter_by_time_window
-from src.data.semantic import profitability_rollup, get_category_col, safe_quote_rollup
+from src.data.semantic import profitability_rollup, get_category_col, safe_quote_rollup, filter_jobs_by_state
 from src.data.client_analytics import (
     compute_client_portfolio_summary,
     compute_client_quadrants,
@@ -85,14 +86,37 @@ def main():
         df_all["month_key"] = pd.to_datetime(df_all["month_key"])
 
     st.sidebar.header("Controls")
+
+    def _reset_client_selection():
+        if "selected_client_name" in st.session_state:
+            st.session_state["selected_client_name"] = []
+
     time_window = st.sidebar.selectbox(
         "Time Window",
         options=["6m", "12m", "24m", "all"],
-        index=1,
         format_func=lambda x: f"Last {x}" if x != "all" else "All Time",
+        key="filter_time_window",
+        on_change=_reset_client_selection,
     )
+    set_state("time_window", time_window)
+    job_state_options = ["All", "Active", "Completed"]
+    current_state = get_state("job_state_filter") if get_state("job_state_filter") in job_state_options else "All"
+    selected_state = st.sidebar.selectbox(
+        "Job State",
+        options=job_state_options,
+        index=job_state_options.index(current_state),
+        key="filter_job_state",
+        on_change=_reset_client_selection,
+    )
+    set_state("job_state_filter", selected_state)
 
     df_window = filter_by_time_window(df_all, time_window, date_col="month_key")
+    if selected_state in ["Active", "Completed"]:
+        state_jobs = filter_jobs_by_state(df_all, selected_state)
+        if "job_no" in state_jobs.columns:
+            df_window = df_window[df_window["job_no"].isin(state_jobs["job_no"].unique())]
+    else:
+        df_window = filter_jobs_by_state(df_window, selected_state)
     if "client" not in df_window.columns:
         st.warning("Client field missing from dataset.")
         return
@@ -261,6 +285,27 @@ def main():
     task_compare["delta_pp"] = task_compare["client_share_pct"] - task_compare["global_share_pct"]
     task_compare = task_compare[task_compare["delta_pp"] > 10].sort_values("delta_pp", ascending=False)
 
+    task_time_fig = None
+    staff_cost_time_fig = None
+    task_benchmark_fig = None
+    delivery_burn_fig = None
+    erosion_table = None
+    if "task_name" in df_client_window.columns and "staff_name" in df_client_window.columns:
+        task_hours = df_client_window.groupby("task_name")["hours_raw"].sum().reset_index()
+        top_tasks = task_hours.sort_values("hours_raw", ascending=False).head(8)["task_name"].tolist()
+        if "month_key" in df_client_window.columns:
+            task_time = df_client_window[df_client_window["task_name"].isin(top_tasks)].copy()
+            task_time = task_time.groupby(["month_key", "task_name"])["hours_raw"].sum().reset_index()
+            task_time_fig = px.bar(
+                task_time,
+                x="month_key",
+                y="hours_raw",
+                color="task_name",
+                title="Task Hours Over Time (Top Tasks)",
+            )
+            task_time_fig.update_layout(xaxis_title="Month", yaxis_title="Hours", legend_title="Task", barmode="stack")
+            task_time_fig.update_xaxes(tickformat="%b %Y")
+
     staffing = pd.DataFrame()
     senior_flag = False
     if "staff_name" in df_client_window.columns:
@@ -287,8 +332,150 @@ def main():
         )
         if pd.notna(company_rate) and pd.notna(client_rate):
             senior_flag = client_rate > company_rate * 1.2
+        if "month_key" in df_client_window.columns:
+            staff_time = df_client_window[df_client_window["staff_name"].isin(staffing["staff_name"].head(6))].copy()
+            staff_time = staff_time.groupby(["month_key", "staff_name"])["base_cost"].sum().reset_index()
+            staff_cost_time_fig = px.area(
+                staff_time,
+                x="month_key",
+                y="base_cost",
+                color="staff_name",
+                title="Staff Cost Over Time (Top Staff)",
+            )
+            staff_cost_time_fig.update_layout(xaxis_title="Month", yaxis_title="Cost", legend_title="Staff")
+            staff_cost_time_fig.update_xaxes(tickformat="%b %Y")
 
-    render_client_driver_forensics(task_compare, staffing, senior_flag)
+    # Benchmark comparison chart (task mix vs global median)
+    if len(client_task) > 0 and len(global_task) > 0:
+        task_compare_all = pd.merge(client_task, global_task, on="task_name", how="left")
+        task_compare_all["global_share_pct"] = task_compare_all["global_share_pct"].fillna(0)
+        task_compare_all = task_compare_all.sort_values("hours_raw", ascending=False).head(8)
+        task_compare_long = task_compare_all.melt(
+            id_vars=["task_name"],
+            value_vars=["share_pct", "global_share_pct"],
+            var_name="series",
+            value_name="share_pct_value",
+        )
+        task_compare_long["series"] = task_compare_long["series"].replace(
+            {"share_pct": "Client", "global_share_pct": "Benchmark"}
+        )
+        task_benchmark_fig = px.bar(
+            task_compare_long,
+            x="task_name",
+            y="share_pct_value",
+            color="series",
+            barmode="group",
+            title="Task Mix vs Global Median (Top Tasks)",
+        )
+        task_benchmark_fig.update_layout(xaxis_title="Task", yaxis_title="Share %", legend_title="")
+
+    # Delivery burn vs quote + expected end date
+    if "month_key" in df_client_window.columns:
+        monthly_hours = df_client_window.groupby("month_key")["hours_raw"].sum().reset_index()
+        monthly_hours = monthly_hours.sort_values("month_key")
+        monthly_hours["cumulative_hours"] = monthly_hours["hours_raw"].cumsum()
+        delivery_burn_fig = go.Figure()
+        delivery_burn_fig.add_trace(
+            go.Scatter(
+                x=monthly_hours["month_key"],
+                y=monthly_hours["cumulative_hours"],
+                mode="lines+markers",
+                name="Cumulative Hours",
+            )
+        )
+        quote_rollup_total = safe_quote_rollup(df_client_window, [])
+        if len(quote_rollup_total) > 0 and "quoted_hours" in quote_rollup_total.columns:
+            quoted_hours = quote_rollup_total["quoted_hours"].iloc[0]
+            if pd.notna(quoted_hours) and quoted_hours > 0:
+                delivery_burn_fig.add_hline(
+                    y=quoted_hours,
+                    line_dash="dash",
+                    line_color="#444",
+                    annotation_text="Quoted Hours",
+                    annotation_position="top left",
+                )
+        if "job_due_date" in df_client_window.columns:
+            job_due = df_client_window[["job_no", "job_due_date"]].drop_duplicates()
+            job_due["job_due_date"] = pd.to_datetime(job_due["job_due_date"], errors="coerce")
+            expected_end = job_due["job_due_date"].dropna().median()
+            if pd.notna(expected_end):
+                expected_end = pd.to_datetime(expected_end)
+                expected_end_dt = expected_end.to_pydatetime()
+                delivery_burn_fig.add_shape(
+                    type="line",
+                    x0=expected_end_dt,
+                    x1=expected_end_dt,
+                    y0=0,
+                    y1=1,
+                    xref="x",
+                    yref="paper",
+                    line=dict(dash="dot", color="#888"),
+                )
+                delivery_burn_fig.add_annotation(
+                    x=expected_end_dt,
+                    y=1.02,
+                    xref="x",
+                    yref="paper",
+                    text="Expected end",
+                    showarrow=False,
+                )
+        delivery_burn_fig.update_layout(
+            title="Delivery Burn vs Quote",
+            xaxis_title="Month",
+            yaxis_title="Cumulative Hours",
+        )
+        job_fin = df_client_window.groupby("job_no").agg(
+            revenue=("rev_alloc", "sum"),
+            cost=("base_cost", "sum"),
+            hours=("hours_raw", "sum"),
+        ).reset_index()
+        job_fin["margin"] = job_fin["revenue"] - job_fin["cost"]
+        job_fin["margin_pct"] = np.where(
+            job_fin["revenue"] > 0,
+            job_fin["margin"] / job_fin["revenue"] * 100,
+            np.nan,
+        )
+        quote_by_job = safe_quote_rollup(df_client_window, ["job_no"])
+        if len(quote_by_job) > 0:
+            job_fin = job_fin.merge(
+                quote_by_job[["job_no", "quoted_hours"]],
+                on="job_no",
+                how="left",
+            )
+        else:
+            job_fin["quoted_hours"] = np.nan
+        job_fin["hours_overrun_pct"] = np.where(
+            job_fin["quoted_hours"] > 0,
+            (job_fin["hours"] - job_fin["quoted_hours"]) / job_fin["quoted_hours"] * 100,
+            np.nan,
+        )
+        erosion = job_fin[
+            (job_fin["margin_pct"] < 10) | (job_fin["hours_overrun_pct"] > 10)
+        ].copy()
+        if len(erosion) > 0:
+            erosion = erosion.sort_values(
+                ["margin_pct", "hours_overrun_pct"],
+                ascending=[True, False],
+            ).head(12)
+            erosion_table = erosion.rename(columns={
+                "job_no": "Job",
+                "margin_pct": "Margin %",
+                "hours_overrun_pct": "Hours Overrun %",
+                "revenue": "Revenue",
+                "cost": "Cost",
+                "margin": "Margin",
+            })
+
+    render_client_driver_forensics(
+        task_compare,
+        staffing,
+        senior_flag,
+        task_time_fig=task_time_fig,
+        staff_cost_time_fig=staff_cost_time_fig,
+        task_benchmark_fig=task_benchmark_fig,
+        delivery_burn_fig=delivery_burn_fig,
+        erosion_table=erosion_table,
+    )
 
     # SECTION 6 — LTV & Trends (unfiltered data)
     ltv_client = selected_clients[0]

@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 from pathlib import Path
 import sys
 
@@ -32,7 +33,8 @@ from src.modeling.intervention import (
     get_peer_context,
 )
 from src.data.loader import load_fact_timesheet
-from src.data.semantic import safe_quote_job_task, get_category_col
+from src.data.semantic import safe_quote_job_task, get_category_col, safe_quote_rollup, filter_jobs_by_state
+from src.data.client_analytics import compute_global_task_median_mix, compute_company_cost_rate
 from src.data.cohorts import filter_by_time_window
 from src.config import config
 
@@ -533,6 +535,15 @@ def main():
         format_func=lambda x: f"Last {x}" if x != "all" else "All Time",
         index=1
     )
+    job_state_options = ["All", "Active", "Completed"]
+    current_state = get_state("job_state_filter") if get_state("job_state_filter") in job_state_options else "All"
+    selected_state = st.sidebar.selectbox(
+        "Job State",
+        options=job_state_options,
+        index=job_state_options.index(current_state),
+        key="filter_job_state",
+    )
+    set_state("job_state_filter", selected_state)
 
     exclude_sg_alloc = st.sidebar.checkbox(
         "Exclude: Social Garden Invoice Allocation",
@@ -550,6 +561,10 @@ def main():
         df_all = df_all_raw[df_all_raw["department_final"] == selected_dept]
     else:
         df_all = df_all_raw
+
+    if selected_state in ["Active", "Completed"]:
+        state_jobs = filter_jobs_by_state(df_all_raw, selected_state)
+        df_all = df_all[df_all["job_no"].isin(state_jobs["job_no"].unique())]
 
     st.markdown(
         """
@@ -572,8 +587,7 @@ def main():
         """,
         unsafe_allow_html=True,
     )
-    
-    # Calculate cohorts
+
     cohort_df = calculate_job_cohorts(df_all, cohort_type)
     
     if len(cohort_df) == 0:
@@ -591,9 +605,7 @@ def main():
     ).clip(lower=0)
     df_window = filter_by_time_window(df_all, time_window, date_col="month_key")
     capacity_delivery = calculate_capacity_vs_delivery(df_window, df_base=df_base_window)
-
-    # Job-level data for loss diagnosis and quadrant drill
-    category_col = get_category_col(df_all)
+    # Job-level summary for quoted vs actual (to-date)
     job_task = safe_quote_job_task(df_all)
     if len(job_task) > 0:
         job_quotes = job_task.groupby("job_no").agg(
@@ -607,6 +619,7 @@ def main():
         actual_hours=("hours_raw", "sum"),
     ).reset_index()
 
+    category_col = get_category_col(df_all)
     job_attrs = df_all.groupby("job_no").agg(
         department_final=("department_final", "first"),
         job_category=(category_col, "first"),
@@ -625,9 +638,16 @@ def main():
         np.nan,
     )
     job_level["cohort_month"] = pd.to_datetime(job_level["cohort_month"])
-    job_level = filter_by_time_window(job_level, time_window, date_col="cohort_month")
-    
-    # =========================================================================
+    job_level = job_level[job_level["cohort_month"].notna()]
+    job_level_window = filter_by_time_window(job_level, time_window, date_col="cohort_month")
+
+    monthly_actuals = job_level_window.groupby("cohort_month").agg(
+        total_actual_hours_to_date=("actual_hours", "sum"),
+        avg_actual_hours_to_date=("actual_hours", "mean"),
+        total_quoted_hours_to_date=("quoted_hours", "sum"),
+        underquoted_hours_to_date=("underquoted_hours", "sum"),
+    ).reset_index().sort_values("cohort_month")
+
     # SECTION A: KPI STRIP
     # =========================================================================
     _section_start("band-portfolio")
@@ -640,9 +660,9 @@ def main():
     kpi_cols = st.columns(8)
     
     total_jobs = monthly_metrics["job_count"].sum()
-    total_quoted_hours = monthly_metrics["total_quoted_hours"].sum()
-    total_quoted_amount = monthly_metrics["total_quoted_amount"].sum()
-    total_actual_hours = monthly_metrics["total_actual_hours"].sum()
+    total_quoted_hours = job_level_window["quoted_hours"].sum()
+    total_quoted_amount = job_level_window["quoted_amount"].sum()
+    total_actual_hours = job_level_window["actual_hours"].sum()
     avg_hours_per_job = total_quoted_hours / total_jobs if total_jobs > 0 else 0
     avg_amount_per_job = total_quoted_amount / total_jobs if total_jobs > 0 else 0
     value_per_quoted_hour = total_quoted_amount / total_quoted_hours if total_quoted_hours > 0 else 0
@@ -732,6 +752,7 @@ planned hours aren’t inflated.
             yaxis=dict(title="Jobs"),
             yaxis2=dict(title="Avg Quote Value ($)", overlaying="y", side="right"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="x unified",
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -748,7 +769,7 @@ planned hours aren’t inflated.
         fig.add_trace(
             go.Scatter(
                 x=monthly_metrics["cohort_month"],
-                y=monthly_metrics["avg_actual_hours"],
+                y=monthly_actuals["avg_actual_hours_to_date"],
                 name="Avg Actual Hours",
                 mode="lines+markers",
                 line=dict(color="#e45756", width=2),
@@ -758,6 +779,7 @@ planned hours aren’t inflated.
             title="Avg Hours per Job: Quoted vs Actual",
             yaxis=dict(title="Hours"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="x unified",
         )
         st.plotly_chart(fig, use_container_width=True)
     
@@ -775,7 +797,7 @@ planned hours aren’t inflated.
         fig.add_trace(
             go.Scatter(
                 x=monthly_metrics["cohort_month"],
-                y=monthly_metrics["total_actual_hours"],
+                y=monthly_actuals["total_actual_hours_to_date"],
                 name="Actual Hours",
                 mode="lines+markers",
                 line=dict(color="#b279a2", width=2),
@@ -784,7 +806,7 @@ planned hours aren’t inflated.
         fig.add_trace(
             go.Bar(
                 x=monthly_metrics["cohort_month"],
-                y=monthly_metrics["underquoted_hours"],
+                y=monthly_actuals["underquoted_hours_to_date"],
                 name="Under-Quoted Hours",
                 marker_color="rgba(228,87,86,0.35)",
             )
@@ -793,9 +815,169 @@ planned hours aren’t inflated.
             title="Total Hours: Quoted vs Actual",
             yaxis=dict(title="Hours"),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="x unified",
         )
         st.plotly_chart(fig, use_container_width=True)
 
+    # -----------------------------------------------------------------
+    # Job Mix & Scope Creep Diagnostics (Additive)
+    # -----------------------------------------------------------------
+    st.markdown("#### Job Mix & Scope Creep Diagnostics")
+    st.caption("Track category mix shifts, hours overrun, and margin erosion signals from department to company level.")
+
+    mix_cols = st.columns(2)
+    with mix_cols[0]:
+        if len(job_level_window) > 0 and "job_category" in job_level_window.columns:
+            top_cats = (
+                job_level_window.groupby("job_category")["job_no"]
+                .nunique()
+                .sort_values(ascending=False)
+                .head(6)
+                .index
+                .tolist()
+            )
+            cat_month = job_level_window[job_level_window["job_category"].isin(top_cats)].groupby(
+                ["cohort_month", "job_category"]
+            ).agg(
+                jobs=("job_no", "nunique"),
+                hours=("actual_hours", "sum"),
+            ).reset_index()
+            fig = go.Figure()
+            for cat in top_cats:
+                slice_df = cat_month[cat_month["job_category"] == cat]
+                fig.add_bar(
+                    x=slice_df["cohort_month"],
+                    y=slice_df["jobs"],
+                    name=cat,
+                )
+            fig.update_layout(
+                title="Job Mix by Category (Top 6)",
+                barmode="stack",
+                yaxis=dict(title="Jobs"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode="x unified",
+                template="plotly_white",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    with mix_cols[1]:
+        if len(job_level_window) > 0:
+            overrun_month = job_level_window.groupby("cohort_month").agg(
+                actual_hours=("actual_hours", "sum"),
+                quoted_hours=("quoted_hours", "sum"),
+                underquoted_hours=("underquoted_hours", "sum"),
+            ).reset_index()
+            overrun_month["underquoted_share"] = np.where(
+                overrun_month["actual_hours"] > 0,
+                overrun_month["underquoted_hours"] / overrun_month["actual_hours"] * 100,
+                np.nan,
+            )
+            fig = go.Figure()
+            fig.add_trace(
+                go.Bar(
+                    x=overrun_month["cohort_month"],
+                    y=overrun_month["underquoted_hours"],
+                    name="Under-Quoted Hours",
+                    marker_color="rgba(228,87,86,0.5)",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=overrun_month["cohort_month"],
+                    y=overrun_month["underquoted_share"],
+                    name="Under-Quoted Share %",
+                    yaxis="y2",
+                    mode="lines+markers",
+                    line=dict(color="#4c78a8", width=2),
+                )
+            )
+            fig.update_layout(
+                title="Hours Overrun / Scope Creep",
+                yaxis=dict(title="Under-Quoted Hours"),
+                yaxis2=dict(title="Under-Quoted Share %", overlaying="y", side="right"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode="x unified",
+                template="plotly_white",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    erosion_cols = st.columns(2)
+    with erosion_cols[0]:
+        if "department_final" in job_level_window.columns:
+            dept_margin = job_level_window.groupby(["cohort_month", "department_final"]).agg(
+                revenue=("quoted_amount", "sum"),
+                actual_hours=("actual_hours", "sum"),
+                cost=("actual_hours", "sum"),
+            ).reset_index()
+            if len(dept_margin) > 0 and "base_cost" in df_all.columns:
+                cost_map = df_all.groupby("job_no").agg(cost=("base_cost", "sum")).reset_index()
+                job_cost = job_level_window.merge(cost_map, on="job_no", how="left")
+                dept_margin = job_cost.groupby(["cohort_month", "department_final"]).agg(
+                    revenue=("quoted_amount", "sum"),
+                    cost=("cost", "sum"),
+                ).reset_index()
+                dept_margin["margin_pct"] = np.where(
+                    dept_margin["revenue"] > 0,
+                    (dept_margin["revenue"] - dept_margin["cost"]) / dept_margin["revenue"] * 100,
+                    np.nan,
+                )
+                top_depts = (
+                    dept_margin.groupby("department_final")["revenue"]
+                    .sum()
+                    .sort_values(ascending=False)
+                    .head(4)
+                    .index
+                    .tolist()
+                )
+                fig = go.Figure()
+                for dept in top_depts:
+                    slice_df = dept_margin[dept_margin["department_final"] == dept]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=slice_df["cohort_month"],
+                            y=slice_df["margin_pct"],
+                            name=dept,
+                            mode="lines+markers",
+                        )
+                    )
+                fig.update_layout(
+                    title="Margin % by Department (Top 4)",
+                    yaxis=dict(title="Margin %"),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                    hovermode="x unified",
+                    template="plotly_white",
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    with erosion_cols[1]:
+        if "rev_alloc" in df_all.columns and "base_cost" in df_all.columns:
+            company_month = df_all.groupby("month_key").agg(
+                revenue=("rev_alloc", "sum"),
+                cost=("base_cost", "sum"),
+            ).reset_index()
+            company_month["margin_pct"] = np.where(
+                company_month["revenue"] > 0,
+                (company_month["revenue"] - company_month["cost"]) / company_month["revenue"] * 100,
+                np.nan,
+            )
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=company_month["month_key"],
+                    y=company_month["margin_pct"],
+                    name="Company Margin %",
+                    mode="lines+markers",
+                    line=dict(color="#54a24b", width=2),
+                )
+            )
+            fig.update_layout(
+                title="Company Margin % Trend",
+                yaxis=dict(title="Margin %"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                hovermode="x unified",
+                template="plotly_white",
+            )
+            st.plotly_chart(fig, use_container_width=True)
         fig = time_series(
             monthly_metrics,
             x="cohort_month",
@@ -805,16 +987,16 @@ planned hours aren’t inflated.
         )
         st.plotly_chart(fig, use_container_width=True)
 
-    if len(job_level) > 0:
+    if len(job_level_window) > 0:
         top_depts = (
-            job_level.groupby("department_final")["underquoted_hours"]
+            job_level_window.groupby("department_final")["underquoted_hours"]
             .sum()
             .sort_values(ascending=False)
             .head(4)
             .index
             .tolist()
         )
-        dept_month = job_level[job_level["department_final"].isin(top_depts)].groupby(
+        dept_month = job_level_window[job_level_window["department_final"].isin(top_depts)].groupby(
             ["cohort_month", "department_final"]
         )["underquoted_hours"].sum().reset_index()
         if len(dept_month) > 0:
@@ -845,8 +1027,8 @@ planned hours aren’t inflated.
         "Turns the portfolio into an action list: protect high‑value work and fix margin erosion."
     )
     
-    if len(job_level) > 0:
-        job_quotes = job_level[(job_level["quoted_hours"] > 0) & (job_level["quoted_amount"] > 0)].copy()
+    if len(job_level_window) > 0:
+        job_quotes = job_level_window[(job_level_window["quoted_hours"] > 0) & (job_level_window["quoted_amount"] > 0)].copy()
 
         if len(job_quotes) > 5:
             # Chain filter for this section
@@ -1345,6 +1527,226 @@ planned hours aren’t inflated.
             )
 
             if selected_job:
+                df_job = deep_df[deep_df["job_no"] == selected_job].copy()
+                if selected_job in quadrant_detail["job_no"].values:
+                    job_row = quadrant_detail[quadrant_detail["job_no"] == selected_job].iloc[0]
+                else:
+                    job_row = deep_df[deep_df["job_no"] == selected_job].iloc[0]
+                job_dept = job_row.get("department_final")
+                job_cat = job_row.get("job_category")
+                job_active = bool(job_row.get("is_active")) if "is_active" in job_row else False
+
+                # -------------------------------------------------------------
+                # Driver Forensics (Selected Job)
+                # -------------------------------------------------------------
+                st.subheader("Driver Forensics — Selected Job")
+                st.caption("Root-cause margin erosion using task mix, staffing cost, and delivery burn.")
+
+                tabs = st.tabs(["Delivery Drivers", "Staffing Mix"])
+
+                with tabs[0]:
+                    task_time_fig = None
+                    task_benchmark_fig = None
+                    delivery_burn_fig = None
+
+                    if "task_name" in df_job.columns:
+                        task_hours = df_job.groupby("task_name")["hours_raw"].sum().reset_index()
+                        top_tasks = task_hours.sort_values("hours_raw", ascending=False).head(8)["task_name"].tolist()
+
+                        if "month_key" in df_job.columns:
+                            task_time = df_job[df_job["task_name"].isin(top_tasks)].copy()
+                            task_time = task_time.groupby(["month_key", "task_name"])["hours_raw"].sum().reset_index()
+                            task_time_fig = px.bar(
+                                task_time,
+                                x="month_key",
+                                y="hours_raw",
+                                color="task_name",
+                                title="Task Hours Over Time (Top Tasks)",
+                            )
+                            task_time_fig.update_layout(
+                                barmode="stack",
+                                xaxis_title="Month",
+                                yaxis_title="Hours",
+                                legend_title="Task",
+                            )
+                            task_time_fig.update_xaxes(tickformat="%b %Y")
+
+                        global_task = compute_global_task_median_mix(df_all)
+                        if len(global_task) > 0:
+                            client_task = df_job.groupby("task_name")["hours_raw"].sum().reset_index()
+                            total_hours = client_task["hours_raw"].sum()
+                            client_task["share_pct"] = np.where(
+                                total_hours > 0,
+                                client_task["hours_raw"] / total_hours * 100,
+                                0,
+                            )
+                            task_compare = pd.merge(client_task, global_task, on="task_name", how="left")
+                            task_compare["global_share_pct"] = task_compare["global_share_pct"].fillna(0)
+                            task_compare = task_compare.sort_values("hours_raw", ascending=False).head(8)
+                            task_compare_long = task_compare.melt(
+                                id_vars=["task_name"],
+                                value_vars=["share_pct", "global_share_pct"],
+                                var_name="series",
+                                value_name="share_pct_value",
+                            )
+                            task_compare_long["series"] = task_compare_long["series"].replace(
+                                {"share_pct": "Job", "global_share_pct": "Benchmark"}
+                            )
+                            task_benchmark_fig = px.bar(
+                                task_compare_long,
+                                x="task_name",
+                                y="share_pct_value",
+                                color="series",
+                                barmode="group",
+                                title="Task Mix vs Global Median (Top Tasks)",
+                            )
+                            task_benchmark_fig.update_layout(
+                                xaxis_title="Task",
+                                yaxis_title="Share %",
+                                legend_title="",
+                            )
+
+                    if "month_key" in df_job.columns:
+                        monthly_hours = df_job.groupby("month_key")["hours_raw"].sum().reset_index()
+                        monthly_hours = monthly_hours.sort_values("month_key")
+                        monthly_hours["cumulative_hours"] = monthly_hours["hours_raw"].cumsum()
+                        delivery_burn_fig = go.Figure()
+                        delivery_burn_fig.add_trace(
+                            go.Scatter(
+                                x=monthly_hours["month_key"],
+                                y=monthly_hours["cumulative_hours"],
+                                mode="lines+markers",
+                                name="Cumulative Hours",
+                            )
+                        )
+                        quote_rollup_total = safe_quote_rollup(df_job, [])
+                        if len(quote_rollup_total) > 0 and "quoted_hours" in quote_rollup_total.columns:
+                            quoted_hours = quote_rollup_total["quoted_hours"].iloc[0]
+                            if pd.notna(quoted_hours) and quoted_hours > 0:
+                                delivery_burn_fig.add_hline(
+                                    y=quoted_hours,
+                                    line_dash="dash",
+                                    line_color="#444",
+                                    annotation_text="Quoted Hours",
+                                    annotation_position="top left",
+                                )
+                        if "job_due_date" in df_job.columns:
+                            job_due = df_job[["job_no", "job_due_date"]].drop_duplicates()
+                            job_due["job_due_date"] = pd.to_datetime(job_due["job_due_date"], errors="coerce")
+                            expected_end = job_due["job_due_date"].dropna().median()
+                            if pd.notna(expected_end):
+                                expected_end_dt = pd.to_datetime(expected_end).to_pydatetime()
+                                delivery_burn_fig.add_shape(
+                                    type="line",
+                                    x0=expected_end_dt,
+                                    x1=expected_end_dt,
+                                    y0=0,
+                                    y1=1,
+                                    xref="x",
+                                    yref="paper",
+                                    line=dict(dash="dot", color="#888"),
+                                )
+                                delivery_burn_fig.add_annotation(
+                                    x=expected_end_dt,
+                                    y=1.02,
+                                    xref="x",
+                                    yref="paper",
+                                    text="Expected end",
+                                    showarrow=False,
+                                )
+                        delivery_burn_fig.update_layout(
+                            title="Delivery Burn vs Quote",
+                            xaxis_title="Month",
+                            yaxis_title="Cumulative Hours",
+                        )
+
+                    if task_benchmark_fig is not None:
+                        st.plotly_chart(task_benchmark_fig, use_container_width=True)
+                    if task_time_fig is not None:
+                        st.plotly_chart(task_time_fig, use_container_width=True)
+                    if delivery_burn_fig is not None:
+                        st.plotly_chart(delivery_burn_fig, use_container_width=True)
+
+                with tabs[1]:
+                    staff_cost_time_fig = None
+                    staffing = pd.DataFrame()
+                    senior_flag = False
+                    if "staff_name" in df_job.columns:
+                        if "role" not in df_job.columns:
+                            df_job["role"] = "—"
+                        else:
+                            df_job["role"] = df_job["role"].fillna("—")
+                        staffing = df_job.groupby(["staff_name", "role"]).agg(
+                            hours=("hours_raw", "sum"),
+                            cost=("base_cost", "sum"),
+                        ).reset_index()
+                        staffing["cost_rate"] = np.where(
+                            staffing["hours"] > 0,
+                            staffing["cost"] / staffing["hours"],
+                            np.nan,
+                        )
+                        staffing = staffing.sort_values("hours", ascending=False).head(20)
+
+                        company_rate = compute_company_cost_rate(df_all)
+                        job_rate = (
+                            df_job["base_cost"].sum() / df_job["hours_raw"].sum()
+                            if df_job["hours_raw"].sum() > 0
+                            else np.nan
+                        )
+                        if pd.notna(company_rate) and pd.notna(job_rate):
+                            senior_flag = job_rate > company_rate * 1.2
+                        if "month_key" in df_job.columns:
+                            staff_time = df_job[df_job["staff_name"].isin(staffing["staff_name"].head(6))].copy()
+                            staff_time = staff_time.groupby(["month_key", "staff_name"])["base_cost"].sum().reset_index()
+                            staff_cost_time_fig = px.area(
+                                staff_time,
+                                x="month_key",
+                                y="base_cost",
+                                color="staff_name",
+                                title="Staff Cost Over Time (Top Staff)",
+                            )
+                            staff_cost_time_fig.update_layout(
+                                xaxis_title="Month",
+                                yaxis_title="Cost",
+                                legend_title="Staff",
+                            )
+                            staff_cost_time_fig.update_xaxes(tickformat="%b %Y")
+                            if pd.notna(company_rate):
+                                month_hours = df_job.groupby("month_key")["hours_raw"].sum().reset_index()
+                                month_hours["benchmark_cost"] = month_hours["hours_raw"] * company_rate
+                                staff_cost_time_fig.add_trace(
+                                    go.Scatter(
+                                        x=month_hours["month_key"],
+                                        y=month_hours["benchmark_cost"],
+                                        mode="lines",
+                                        line=dict(dash="dash", color="#444"),
+                                        name="Benchmark cost (company avg rate)",
+                                    )
+                                )
+                    if senior_flag:
+                        st.warning("Senior-heavy delivery detected (blended cost rate >20% above company average).")
+                    if staff_cost_time_fig is not None:
+                        st.plotly_chart(staff_cost_time_fig, use_container_width=True)
+                    if len(staffing) == 0:
+                        st.info("No staffing mix data available.")
+                    else:
+                        st.dataframe(
+                            staffing.rename(columns={
+                                "staff_name": "Staff",
+                                "role": "Role",
+                                "hours": "Hours",
+                                "cost": "Cost",
+                                "cost_rate": "Cost Rate",
+                            }),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Hours": st.column_config.NumberColumn(format="%.1f"),
+                                "Cost": st.column_config.NumberColumn(format="$%.0f"),
+                                "Cost Rate": st.column_config.NumberColumn(format="$%.0f"),
+                            },
+                        )
+
                 df_job = deep_df[deep_df["job_no"] == selected_job].copy()
                 if selected_job in quadrant_detail["job_no"].values:
                     job_row = quadrant_detail[quadrant_detail["job_no"] == selected_job].iloc[0]
@@ -2400,7 +2802,7 @@ High slack means unutilised capacity; negative slack indicates overload.
             """
         )
 
-        loss_dept = job_level.groupby("department_final").agg(
+        loss_dept = job_level_window.groupby("department_final").agg(
             jobs=("job_no", "nunique"),
             actual_hours=("actual_hours", "sum"),
             underquoted_hours=("underquoted_hours", "sum"),
@@ -2412,7 +2814,7 @@ High slack means unutilised capacity; negative slack indicates overload.
         )
         loss_dept = loss_dept.sort_values("underquoted_hours", ascending=False).head(5)
 
-        loss_cat = job_level.groupby("job_category").agg(
+        loss_cat = job_level_window.groupby("job_category").agg(
             jobs=("job_no", "nunique"),
             actual_hours=("actual_hours", "sum"),
             underquoted_hours=("underquoted_hours", "sum"),

@@ -27,6 +27,7 @@ STATE_KEYS = {
     "include_nonbillable": "include_nonbillable",
     "selected_client": "selected_client",
     "selected_status": "selected_status",
+    "job_state_filter": "job_state_filter",
     
     # Quote Builder
     "quote_plan": "quote_plan",
@@ -68,6 +69,7 @@ DEFAULTS = {
     "include_nonbillable": True,
     "selected_client": None,
     "selected_status": None,
+    "job_state_filter": "All",
     "quote_plan": None,
     "recency_weighted": False,
     "active_staff_only": True,

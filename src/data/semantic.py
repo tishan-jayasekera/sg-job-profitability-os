@@ -364,6 +364,39 @@ def utilisation_metrics(df: pd.DataFrame, group_keys: Optional[List[str]] = None
 
 
 # =============================================================================
+# JOB STATE FILTERING
+# =============================================================================
+
+def filter_jobs_by_state(df: pd.DataFrame, state: str) -> pd.DataFrame:
+    """
+    Filter dataframe to Active / Completed / All jobs using job-level status.
+    """
+    if state not in ["Active", "Completed"] or "job_no" not in df.columns:
+        return df
+
+    job_cols = ["job_no"]
+    if "job_completed_date" in df.columns:
+        job_cols.append("job_completed_date")
+    if "job_status" in df.columns:
+        job_cols.append("job_status")
+
+    job_meta = df[job_cols].drop_duplicates(subset=["job_no"])
+    completed = pd.Series(False, index=job_meta.index)
+
+    if "job_completed_date" in job_meta.columns:
+        completed = completed | job_meta["job_completed_date"].notna()
+    if "job_status" in job_meta.columns:
+        completed = completed | job_meta["job_status"].str.contains("completed", case=False, na=False)
+
+    if state == "Active":
+        keep_jobs = job_meta.loc[~completed, "job_no"]
+    else:
+        keep_jobs = job_meta.loc[completed, "job_no"]
+
+    return df[df["job_no"].isin(keep_jobs)].copy()
+
+
+# =============================================================================
 # FULL METRIC PACK
 # =============================================================================
 

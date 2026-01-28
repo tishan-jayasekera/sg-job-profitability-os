@@ -127,12 +127,15 @@ def render_sidebar_filters(df: pd.DataFrame):
     )
     set_state("exclude_leave", exclude_leave)
     
-    active_jobs = st.sidebar.checkbox(
-        "Active Jobs Only",
-        value=get_state("active_jobs_only"),
-        key="filter_active_jobs"
+    job_state_options = ["All", "Active", "Completed"]
+    current_state = get_state("job_state_filter") if get_state("job_state_filter") in job_state_options else "All"
+    selected_state = st.sidebar.selectbox(
+        "Job State",
+        options=job_state_options,
+        index=job_state_options.index(current_state),
+        key="filter_job_state"
     )
-    set_state("active_jobs_only", active_jobs)
+    set_state("job_state_filter", selected_state)
     
     include_nonbillable = st.sidebar.checkbox(
         "Include Non-Billable",

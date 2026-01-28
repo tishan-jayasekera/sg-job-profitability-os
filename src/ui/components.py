@@ -323,11 +323,34 @@ def render_client_deep_dive(client_name: str, metrics: Dict[str, float], grade: 
 
 
 def render_client_driver_forensics(task_table: pd.DataFrame, staffing_table: pd.DataFrame,
-                                   senior_flag: bool):
+                                   senior_flag: bool, task_time_fig=None,
+                                   staff_cost_time_fig=None,
+                                   task_benchmark_fig=None, delivery_burn_fig=None,
+                                   erosion_table: Optional[pd.DataFrame] = None):
     st.subheader("Section 5 — Driver Forensics")
     tabs = st.tabs(["Delivery Drivers", "Staffing Mix"])
     with tabs[0]:
         st.markdown("Tasks where this client spends disproportionately more time than the global median.")
+        if task_benchmark_fig is not None:
+            st.plotly_chart(task_benchmark_fig, use_container_width=True)
+        if task_time_fig is not None:
+            st.plotly_chart(task_time_fig, use_container_width=True)
+        if delivery_burn_fig is not None:
+            st.plotly_chart(delivery_burn_fig, use_container_width=True)
+        if erosion_table is not None and len(erosion_table) > 0:
+            st.markdown("**Constituent Jobs Driving Erosion**")
+            st.dataframe(
+                erosion_table,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Hours Overrun %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Revenue": st.column_config.NumberColumn(format="$%.0f"),
+                    "Cost": st.column_config.NumberColumn(format="$%.0f"),
+                    "Margin": st.column_config.NumberColumn(format="$%.0f"),
+                },
+            )
         if len(task_table) == 0:
             st.info("No task mix variance detected.")
         else:
@@ -349,6 +372,8 @@ def render_client_driver_forensics(task_table: pd.DataFrame, staffing_table: pd.
     with tabs[1]:
         if senior_flag:
             st.warning("Senior-heavy delivery detected (blended cost rate >20% above company average).")
+        if staff_cost_time_fig is not None:
+            st.plotly_chart(staff_cost_time_fig, use_container_width=True)
         if len(staffing_table) == 0:
             st.info("No staffing mix data available.")
         else:

@@ -34,7 +34,8 @@ from src.ui.charts import (
 from src.data.loader import load_fact_timesheet
 from src.data.semantic import (
     full_metric_pack, profitability_rollup, quote_delivery_metrics,
-    rate_rollups, utilisation_metrics, exclude_leave, get_category_col, safe_quote_job_task
+    rate_rollups, utilisation_metrics, exclude_leave, get_category_col, safe_quote_job_task,
+    filter_jobs_by_state
 )
 from src.data.cohorts import filter_by_time_window, filter_active_jobs
 
@@ -50,9 +51,9 @@ def apply_global_filters(df: pd.DataFrame) -> pd.DataFrame:
     time_window = get_state("time_window")
     df = filter_by_time_window(df, time_window)
     
-    # Active jobs only
-    if get_state("active_jobs_only"):
-        df = filter_active_jobs(df)
+    # Job state filter (Active / Completed / All)
+    job_state = get_state("job_state_filter")
+    df = filter_jobs_by_state(df, job_state)
     
     # Exclude leave (for utilisation calculations - optional here)
     # Note: We don't exclude leave from revenue/cost calculations
