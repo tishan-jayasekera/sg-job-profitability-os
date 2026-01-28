@@ -35,6 +35,12 @@ STATE_KEYS = {
     
     # Job Mix
     "cohort_definition": "cohort_definition",
+    
+    # Operational Intervention Engine
+    "intervention_quadrant": "intervention_quadrant",
+    "intervention_selected_job": "intervention_selected_job",
+    "intervention_shortlist_size": "intervention_shortlist_size",
+    "intervention_issue_filter": "intervention_issue_filter",
 }
 
 
@@ -60,6 +66,12 @@ DEFAULTS = {
     "recency_weighted": False,
     "active_staff_only": True,
     "cohort_definition": "first_activity",
+    
+    # Operational Intervention Engine
+    "intervention_quadrant": None,
+    "intervention_selected_job": None,
+    "intervention_shortlist_size": 10,
+    "intervention_issue_filter": "All Issues",
 }
 
 

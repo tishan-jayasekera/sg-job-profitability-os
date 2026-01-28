@@ -16,6 +16,21 @@ from src.ui.state import init_state, get_state, set_state
 from src.ui.layout import section_header
 from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent, fmt_count
 from src.ui.charts import time_series, quadrant_scatter, horizontal_bar
+from src.ui.intervention_components import (
+    render_quadrant_health_summary,
+    render_intervention_queue,
+    render_selected_job_brief,
+    render_driver_analysis,
+    render_peer_context,
+    render_quadrant_trend,
+    render_methodology_expander,
+)
+from src.modeling.intervention import (
+    compute_intervention_risk_score,
+    build_intervention_queue,
+    compute_quadrant_health_summary,
+    get_peer_context,
+)
 from src.data.loader import load_fact_timesheet
 from src.data.semantic import safe_quote_job_task, get_category_col
 from src.data.cohorts import filter_by_time_window
