@@ -218,6 +218,177 @@ def filter_chips(filters: Dict[str, Any]):
         st.caption(f"Active filters: {chips}")
 
 
+# =============================================================================
+# CLIENT PROFITABILITY COMPONENTS
+# =============================================================================
+
+def render_client_portfolio_health(summary: Dict[str, float]):
+    st.subheader("Section 1 — Executive Portfolio Health")
+    metrics = {
+        "Total Clients": summary.get("total_clients"),
+        "Portfolio Revenue": summary.get("portfolio_revenue"),
+        "Portfolio Profit": summary.get("portfolio_profit"),
+        "Median Margin %": summary.get("median_margin_pct"),
+        "% Unprofitable Clients": summary.get("unprofitable_share"),
+    }
+    format_map = {
+        "Total Clients": "count",
+        "Portfolio Revenue": "currency",
+        "Portfolio Profit": "currency",
+        "Median Margin %": "percent",
+        "% Unprofitable Clients": "percent",
+    }
+    kpi_strip(metrics, format_map=format_map)
+    if summary.get("top5_profit_share") is not None:
+        st.caption(
+            f"Concentration risk: Top 5 clients contribute {fmt_percent(summary.get('top5_profit_share'))} of total profit."
+        )
+
+
+def render_client_quadrant_scatter(fig):
+    st.subheader("Section 2 — Portfolio Quadrant Scatter")
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+
+
+def render_client_intervention_queue(df: pd.DataFrame, shortlist_size: int):
+    st.subheader("Section 3 — The Intervention Queue")
+    if len(df) == 0:
+        st.info("No clients found for the selected quadrant.")
+        return
+    queue = df.head(shortlist_size).rename(columns={
+        "client": "Client",
+        "margin": "Profit",
+        "margin_pct": "Margin %",
+        "revenue": "Revenue",
+        "realised_rate": "Avg Realised Rate",
+        "primary_driver": "Primary Driver",
+    })
+    st.dataframe(
+        queue[["Client", "Profit", "Margin %", "Revenue", "Avg Realised Rate", "Primary Driver"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Profit": st.column_config.NumberColumn(format="$%.0f"),
+            "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+            "Revenue": st.column_config.NumberColumn(format="$%.0f"),
+            "Avg Realised Rate": st.column_config.NumberColumn(format="$%.0f"),
+        },
+    )
+
+
+def render_client_deep_dive(client_name: str, metrics: Dict[str, float], grade: str,
+                            ledger: pd.DataFrame, dept_fig):
+    st.subheader("Section 4 — Selected Client Deep‑Dive")
+    st.markdown(f"**Client:** {client_name}")
+    metrics = metrics.copy()
+    metrics["Health Grade"] = grade
+    format_map = {
+        "Revenue": "currency",
+        "Profit": "currency",
+        "Margin %": "percent",
+        "Realised Rate": "rate",
+        "Jobs": "count",
+        "Health Grade": "text",
+    }
+    kpi_strip(metrics, format_map=format_map)
+    st.markdown("**Job Ledger**")
+    if len(ledger) == 0:
+        st.info("No jobs found for this client in the selected window.")
+    else:
+        st.dataframe(
+            ledger.rename(columns={
+                "job_no": "Job",
+                "department_final": "Department",
+                "job_category": "Category",
+                "hours": "Hours",
+                "revenue": "Revenue",
+                "cost": "Cost",
+                "margin": "Margin",
+                "margin_pct": "Margin %",
+                "realised_rate": "Realised Rate",
+            }),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Hours": st.column_config.NumberColumn(format="%.1f"),
+                "Revenue": st.column_config.NumberColumn(format="$%.0f"),
+                "Cost": st.column_config.NumberColumn(format="$%.0f"),
+                "Margin": st.column_config.NumberColumn(format="$%.0f"),
+                "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Realised Rate": st.column_config.NumberColumn(format="$%.0f"),
+            },
+        )
+    st.markdown("**Department Contribution (Profit)**")
+    st.plotly_chart(dept_fig, use_container_width=True)
+
+
+def render_client_driver_forensics(task_table: pd.DataFrame, staffing_table: pd.DataFrame,
+                                   senior_flag: bool):
+    st.subheader("Section 5 — Driver Forensics")
+    tabs = st.tabs(["Delivery Drivers", "Staffing Mix"])
+    with tabs[0]:
+        st.markdown("Tasks where this client spends disproportionately more time than the global median.")
+        if len(task_table) == 0:
+            st.info("No task mix variance detected.")
+        else:
+            st.dataframe(
+                task_table.rename(columns={
+                    "task_name": "Task",
+                    "client_share_pct": "Client Share %",
+                    "global_share_pct": "Global Median %",
+                    "delta_pp": "Delta (pp)",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Client Share %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Global Median %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Delta (pp)": st.column_config.NumberColumn(format="%.1f"),
+                },
+            )
+    with tabs[1]:
+        if senior_flag:
+            st.warning("Senior-heavy delivery detected (blended cost rate >20% above company average).")
+        if len(staffing_table) == 0:
+            st.info("No staffing mix data available.")
+        else:
+            st.dataframe(
+                staffing_table.rename(columns={
+                    "staff_name": "Staff",
+                    "role": "Role",
+                    "hours": "Hours",
+                    "cost": "Cost",
+                    "cost_rate": "Cost Rate",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Cost": st.column_config.NumberColumn(format="$%.0f"),
+                    "Cost Rate": st.column_config.NumberColumn(format="$%.0f"),
+                },
+            )
+
+
+def render_client_ltv_section(cumulative_fig, margin_fig, tenure_months: int):
+    st.subheader("Section 6 — Empirical LTV & Trends")
+    st.metric("Client Lifetime (months)", tenure_months)
+    st.plotly_chart(cumulative_fig, use_container_width=True)
+    st.plotly_chart(margin_fig, use_container_width=True)
+
+
+def render_client_ltv_methodology_expander():
+    with st.expander("LTV Methodology", expanded=False):
+        st.markdown(
+            """
+**LTV is empirical and historical.** It represents cumulative profit captured to date,
+not a forward-looking or projected lifetime value. The trend view uses the full, unfiltered
+history to preserve tenure and cumulative economics.
+            """
+        )
+
+
+
 def download_button(df: pd.DataFrame,
                     filename: str,
                     label: str = "Download CSV",

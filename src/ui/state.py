@@ -41,6 +41,12 @@ STATE_KEYS = {
     "intervention_selected_job": "intervention_selected_job",
     "intervention_shortlist_size": "intervention_shortlist_size",
     "intervention_issue_filter": "intervention_issue_filter",
+
+    # Client Profitability & LTV
+    "selected_client_quadrant": "selected_client_quadrant",
+    "selected_client_name": "selected_client_name",
+    "client_queue_mode": "client_queue_mode",
+    "client_shortlist_size": "client_shortlist_size",
 }
 
 
@@ -72,6 +78,12 @@ DEFAULTS = {
     "intervention_selected_job": None,
     "intervention_shortlist_size": 10,
     "intervention_issue_filter": "All Issues",
+
+    # Client Profitability & LTV
+    "selected_client_quadrant": "Partners",
+    "selected_client_name": None,
+    "client_queue_mode": "Intervention",
+    "client_shortlist_size": 10,
 }
 
 

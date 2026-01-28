@@ -187,6 +187,42 @@ def scatter_plot(df: pd.DataFrame, x: str, y: str,
     return apply_layout(fig)
 
 
+def client_quadrant_scatter(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    size_col: str,
+    quadrant_col: str,
+    median_x: float,
+    median_y: float,
+    title: str = "Client Portfolio Quadrants",
+    x_title: str = "Revenue",
+    y_title: str = "Profit",
+) -> go.Figure:
+    """
+    Scatter with quadrant lines and labels.
+    """
+    if len(df) == 0:
+        return apply_layout(go.Figure(), title=title)
+
+    fig = px.scatter(
+        df,
+        x=x_col,
+        y=y_col,
+        size=size_col,
+        color=quadrant_col,
+        hover_name="client",
+        hover_data=["revenue", "margin", "margin_pct", "hours", "realised_rate"],
+        title=title,
+    )
+
+    fig.add_vline(x=median_x, line_dash="dash", line_color=CHART_COLORS["neutral"])
+    fig.add_hline(y=median_y, line_dash="dash", line_color=CHART_COLORS["neutral"])
+    fig.update_layout(xaxis_title=x_title, yaxis_title=y_title, dragmode="select")
+
+    return apply_layout(fig)
+
+
 def render_risk_matrix(df: pd.DataFrame,
                        x: str,
                        y: str,
@@ -355,6 +391,16 @@ def time_series(df: pd.DataFrame, x: str, y: str,
         yaxis_title=y_title or y,
     )
     
+    return apply_layout(fig)
+
+
+def cumulative_profit_line(df: pd.DataFrame, x: str, y: str,
+                           title: str = "Cumulative Profit") -> go.Figure:
+    """
+    Cumulative profit line chart.
+    """
+    fig = px.line(df, x=x, y=y, title=title, markers=True)
+    fig.update_layout(xaxis_title="", yaxis_title="Cumulative Profit")
     return apply_layout(fig)
 
 

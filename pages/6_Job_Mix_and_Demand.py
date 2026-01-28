@@ -474,6 +474,31 @@ def main():
             border: 1px solid #e6e1d5;
             background: #fcfbf8;
         }
+        .profit-frame {
+            background: linear-gradient(135deg, #f7f2e7 0%, #fff9ee 100%);
+            border: 1px solid #eadfcb;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin: 8px 0 10px 0;
+        }
+        .profit-frame h4 { margin: 0 0 4px 0; }
+        .profit-frame p { margin: 0; color: #5a5346; }
+        .signal-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+        .signal-card {
+            background: #ffffff;
+            border: 1px solid #e6e1d5;
+            border-radius: 10px;
+            padding: 10px 12px;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.05);
+        }
+        .signal-card small { color: #6c6455; }
+        .signal-card strong { display: block; font-size: 18px; margin-top: 2px; }
+        @media (max-width: 900px) {
+            .signal-row { grid-template-columns: repeat(2, 1fr); }
+        }
+        @media (max-width: 600px) {
+            .signal-row { grid-template-columns: 1fr; }
+        }
         .band-portfolio { border-left: 6px solid #4c78a8; }
         .band-value { border-left: 6px solid #f58518; }
         .band-capacity { border-left: 6px solid #54a24b; }
@@ -986,12 +1011,6 @@ planned hours aren’t inflated.
                 np.nan,
             )
 
-            st.subheader("Quadrant Portfolio: Jobs + Profitability Context")
-            st.caption(
-                "This table converts the quadrant into a decision list: who the client is, how much was quoted, "
-                "what has been earned so far, and whether margin is holding up."
-            )
-
             job_financials = df_window.groupby("job_no").agg(
                 revenue_to_date=("rev_alloc", "sum") if "rev_alloc" in df_window.columns else ("job_no", "count"),
                 cost_to_date=("base_cost", "sum") if "base_cost" in df_window.columns else ("job_no", "count"),
@@ -1039,12 +1058,6 @@ planned hours aren’t inflated.
                 np.nan,
             )
 
-            st.subheader("Active Jobs at Risk (Margin Erosion)")
-            st.caption(
-                "Focus list for delivery leaders. These are active jobs where margins are under pressure "
-                "or trending below quote economics."
-            )
-
             def _risk_reasons(row: pd.Series) -> str:
                 reasons = []
                 if pd.notna(row.get("margin_pct_to_date")) and row["margin_pct_to_date"] < 15:
@@ -1078,6 +1091,34 @@ planned hours aren’t inflated.
             active_risk["recommended_action"] = active_risk.apply(_risk_action, axis=1)
             active_risk = active_risk[active_risk["risk_reason"] != ""]
             active_risk = active_risk.sort_values(["margin_pct_to_date", "quote_to_revenue"], ascending=[True, True])
+
+            st.subheader("Quadrant Portfolio: Jobs + Profitability Context")
+            st.caption(
+                "A decision-focused view of who is in the quadrant, how value is being captured, and where margins are leaking."
+            )
+
+            def _fmt_pct(value: float, decimals: int = 1) -> str:
+                return f"{value:.{decimals}f}%" if pd.notna(value) else "—"
+
+            total_jobs_q = quadrant_detail["job_no"].nunique()
+            active_jobs_q = int(quadrant_detail["is_active"].sum()) if "is_active" in quadrant_detail.columns else 0
+            risk_share = (len(active_risk) / active_jobs_q * 100) if active_jobs_q > 0 else np.nan
+
+            story_cols = st.columns(4)
+            story_cols[0].metric("Jobs in Quadrant", f"{total_jobs_q:,}")
+            story_cols[1].metric("Active Jobs", f"{active_jobs_q:,}")
+            story_cols[2].metric("Median Margin %", _fmt_pct(quadrant_detail["margin_pct_to_date"].median()))
+            story_cols[3].metric("Active Jobs at Risk", _fmt_pct(risk_share))
+
+            st.markdown(
+                "**How to use this view:** start with the risk watchlist, then scan the full ledger to spot"
+                " systemic patterns (pricing, scope control, staffing mix)."
+            )
+
+            st.markdown("#### 1) Risk Watchlist (Active Jobs)")
+            st.caption(
+                "Jobs where delivery economics are breaking: low margins, weak revenue capture, or hours overruns."
+            )
 
             if len(active_risk) > 0:
                 st.caption(
@@ -1125,52 +1166,54 @@ planned hours aren’t inflated.
             else:
                 st.success("No active jobs flagged for margin erosion in this quadrant.")
 
-            st.dataframe(
-                quadrant_detail.sort_values("quoted_amount", ascending=False)[
-                    [
-                        "job_no",
-                        "client",
-                        "department_final",
-                        "job_category",
-                        "quoted_amount",
-                        "revenue_to_date",
-                        "margin_to_date",
-                        "margin_pct_to_date",
-                        "quoted_hours",
-                        "actual_hours",
-                        "hours_overrun_pct",
-                        "quote_to_revenue",
-                        "is_active",
-                    ]
-                ].rename(columns={
-                    "job_no": "Job",
-                    "client": "Client",
-                    "department_final": "Department",
-                    "job_category": "Category",
-                    "quoted_amount": "Quoted $",
-                    "revenue_to_date": "Revenue to Date",
-                    "margin_to_date": "Margin to Date",
-                    "margin_pct_to_date": "Margin %",
-                    "quoted_hours": "Quoted Hours",
-                    "actual_hours": "Actual Hours",
-                    "hours_overrun_pct": "Hours Overrun %",
-                    "quote_to_revenue": "Revenue / Quote",
-                    "is_active": "Active",
-                }),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Quoted $": st.column_config.NumberColumn(format="$%.0f"),
-                    "Revenue to Date": st.column_config.NumberColumn(format="$%.0f"),
-                    "Margin to Date": st.column_config.NumberColumn(format="$%.0f"),
-                    "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Quoted Hours": st.column_config.NumberColumn(format="%.1f"),
-                    "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
-                    "Hours Overrun %": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Revenue / Quote": st.column_config.NumberColumn(format="%.2fx"),
-                    "Active": st.column_config.CheckboxColumn(),
-                },
-            )
+            st.markdown("#### 2) Full Portfolio Ledger (All Jobs)")
+            with st.expander("Show full job list", expanded=False):
+                st.dataframe(
+                    quadrant_detail.sort_values("quoted_amount", ascending=False)[
+                        [
+                            "job_no",
+                            "client",
+                            "department_final",
+                            "job_category",
+                            "quoted_amount",
+                            "revenue_to_date",
+                            "margin_to_date",
+                            "margin_pct_to_date",
+                            "quoted_hours",
+                            "actual_hours",
+                            "hours_overrun_pct",
+                            "quote_to_revenue",
+                            "is_active",
+                        ]
+                    ].rename(columns={
+                        "job_no": "Job",
+                        "client": "Client",
+                        "department_final": "Department",
+                        "job_category": "Category",
+                        "quoted_amount": "Quoted $",
+                        "revenue_to_date": "Revenue to Date",
+                        "margin_to_date": "Margin to Date",
+                        "margin_pct_to_date": "Margin %",
+                        "quoted_hours": "Quoted Hours",
+                        "actual_hours": "Actual Hours",
+                        "hours_overrun_pct": "Hours Overrun %",
+                        "quote_to_revenue": "Revenue / Quote",
+                        "is_active": "Active",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Quoted $": st.column_config.NumberColumn(format="$%.0f"),
+                        "Revenue to Date": st.column_config.NumberColumn(format="$%.0f"),
+                        "Margin to Date": st.column_config.NumberColumn(format="$%.0f"),
+                        "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Quoted Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Actual Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Hours Overrun %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Revenue / Quote": st.column_config.NumberColumn(format="%.2fx"),
+                        "Active": st.column_config.CheckboxColumn(),
+                    },
+                )
 
             st.subheader("Job Deep‑Dive: Operational Health & Right‑Sizing")
             st.caption("Start with a chain filter, shortlist jobs, then drill into one job with clear benchmarks.")
@@ -1632,27 +1675,133 @@ planned hours aren’t inflated.
                         np.nan,
                     )
 
-                    st.subheader("Profitability Evolution (Selected Quadrant)")
+                    trend = trend.sort_values("month_key")
+                    st.markdown(
+                        """
+                        <div class="profit-frame">
+                            <h4>Profitability Storyboard — Selected Quadrant</h4>
+                            <p>Track value capture over time, isolate margin drift, and identify where delivery economics are breaking.</p>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    control_cols = st.columns([1.2, 1.1, 1.1, 1.4])
+                    with control_cols[0]:
+                        focus_metric = st.selectbox(
+                            "Focus metric",
+                            ["Margin %", "Realised Rate", "Revenue", "Cost", "Margin $"],
+                        )
+                    with control_cols[1]:
+                        smoothing = st.selectbox("Smoothing", ["None", "3-month MA"])
+                    with control_cols[2]:
+                        view_mode = st.selectbox("View mode", ["Executive", "Diagnostic"])
+                    with control_cols[3]:
+                        risk_floor = st.slider("Margin risk floor (%)", -20, 40, 15, step=5)
+
+                    trend_plot = trend.copy()
+                    if smoothing == "3-month MA":
+                        trend_plot["margin_pct"] = trend_plot["margin_pct"].rolling(3, min_periods=1).mean()
+                        trend_plot["realised_rate"] = trend_plot["realised_rate"].rolling(3, min_periods=1).mean()
+                        trend_plot["revenue"] = trend_plot["revenue"].rolling(3, min_periods=1).mean()
+                        trend_plot["cost"] = trend_plot["cost"].rolling(3, min_periods=1).mean()
+                        trend_plot["margin"] = trend_plot["margin"].rolling(3, min_periods=1).mean()
+
+                    latest = trend_plot.tail(1).iloc[0]
+                    prev = trend_plot.tail(2).head(1).iloc[0] if len(trend_plot) > 1 else latest
+
+                    metric_cols = st.columns(4)
+                    metric_cols[0].metric(
+                        "Latest Margin %",
+                        fmt_percent(latest["margin_pct"]) if pd.notna(latest["margin_pct"]) else "—",
+                        delta=fmt_percent(latest["margin_pct"] - prev["margin_pct"]) if pd.notna(prev["margin_pct"]) else None,
+                    )
+                    metric_cols[1].metric(
+                        "Latest Realised Rate",
+                        fmt_currency(latest["realised_rate"]) if pd.notna(latest["realised_rate"]) else "—",
+                        delta=fmt_currency(latest["realised_rate"] - prev["realised_rate"]) if pd.notna(prev["realised_rate"]) else None,
+                    )
+                    metric_cols[2].metric(
+                        "Revenue (Latest)",
+                        fmt_currency(latest["revenue"]) if pd.notna(latest["revenue"]) else "—",
+                        delta=fmt_currency(latest["revenue"] - prev["revenue"]) if pd.notna(prev["revenue"]) else None,
+                    )
+                    metric_cols[3].metric(
+                        "Margin $ (Latest)",
+                        fmt_currency(latest["margin"]) if pd.notna(latest["margin"]) else "—",
+                        delta=fmt_currency(latest["margin"] - prev["margin"]) if pd.notna(prev["margin"]) else None,
+                    )
+
+                    risk_share = None
+                    risk_jobs = None
+                    band_mix = None
+                    job_margin = None
+
+                    latest_month = trend_plot["month_key"].max()
+                    latest_jobs = prof_slice[prof_slice["month_key"] == latest_month].copy()
+                    if len(latest_jobs) > 0:
+                        job_margin = latest_jobs.groupby("job_no").agg(
+                            revenue=("revenue", "sum"),
+                            cost=("cost", "sum"),
+                        ).reset_index()
+                        job_margin["margin_pct"] = np.where(
+                            job_margin["revenue"] > 0,
+                            (job_margin["revenue"] - job_margin["cost"]) / job_margin["revenue"] * 100,
+                            np.nan,
+                        )
+                        bands = [-np.inf, 0, 10, 20, 35, np.inf]
+                        labels = ["<0%", "0-10%", "10-20%", "20-35%", ">35%"]
+                        job_margin["band"] = pd.cut(job_margin["margin_pct"], bins=bands, labels=labels)
+                        band_mix = job_margin["band"].value_counts().reindex(labels, fill_value=0).reset_index()
+                        band_mix.columns = ["band", "jobs"]
+                        band_mix["share"] = np.where(
+                            band_mix["jobs"].sum() > 0,
+                            band_mix["jobs"] / band_mix["jobs"].sum() * 100,
+                            0,
+                        )
+                        risk_jobs = int((job_margin["margin_pct"] < risk_floor).sum())
+                        risk_share = (
+                            risk_jobs / len(job_margin) * 100
+                            if len(job_margin) > 0
+                            else None
+                        )
+
+                    risk_share_label = f"{risk_share:.1f}% of jobs" if risk_share is not None else "n/a"
+                    risk_jobs_label = f"{risk_jobs} jobs" if risk_jobs is not None else "n/a"
+
+                    st.markdown(
+                        "<div class='signal-row'>"
+                        f"<div class='signal-card'><small>Focus</small><strong>{focus_metric}</strong></div>"
+                        f"<div class='signal-card'><small>Trend window</small><strong>{len(trend_plot)} months</strong></div>"
+                        f"<div class='signal-card'><small>Below risk floor</small><strong>{risk_share_label}</strong></div>"
+                        f"<div class='signal-card'><small>At-risk count</small><strong>{risk_jobs_label}</strong></div>"
+                        "</div>",
+                        unsafe_allow_html=True,
+                    )
+
+                    st.markdown("#### 1) Profitability Trend")
                     fig = go.Figure()
-                    fig.add_trace(
-                        go.Scatter(
-                            x=trend["month_key"],
-                            y=trend["margin_pct"],
-                            name="Margin %",
-                            mode="lines+markers",
-                            line=dict(color="#54a24b", width=2),
+                    if focus_metric in ["Margin %", "Realised Rate", "Revenue", "Cost", "Margin $"]:
+                        fig.add_trace(
+                            go.Scatter(
+                                x=trend_plot["month_key"],
+                                y=trend_plot["margin_pct"],
+                                name="Margin %",
+                                mode="lines+markers",
+                                line=dict(color="#54a24b", width=3 if focus_metric == "Margin %" else 1.5),
+                            )
                         )
-                    )
-                    fig.add_trace(
-                        go.Scatter(
-                            x=trend["month_key"],
-                            y=trend["realised_rate"],
-                            name="Realised Rate",
-                            mode="lines+markers",
-                            yaxis="y2",
-                            line=dict(color="#4c78a8", width=2),
+                        fig.add_trace(
+                            go.Scatter(
+                                x=trend_plot["month_key"],
+                                y=trend_plot["realised_rate"],
+                                name="Realised Rate",
+                                mode="lines+markers",
+                                yaxis="y2",
+                                line=dict(color="#4c78a8", width=3 if focus_metric == "Realised Rate" else 1.5),
+                            )
                         )
-                    )
+
                     fig.update_layout(
                         yaxis=dict(title="Margin %"),
                         yaxis2=dict(title="Realised Rate", overlaying="y", side="right"),
@@ -1661,26 +1810,65 @@ planned hours aren’t inflated.
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
-                    st.dataframe(
-                        trend.rename(columns={
-                            "month_key": "Month",
-                            "revenue": "Revenue",
-                            "cost": "Cost",
-                            "margin": "Margin",
-                            "margin_pct": "Margin %",
-                            "realised_rate": "Realised Rate",
-                        }),
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Month": st.column_config.DateColumn(format="YYYY-MM"),
-                            "Revenue": st.column_config.NumberColumn(format="$%.0f"),
-                            "Cost": st.column_config.NumberColumn(format="$%.0f"),
-                            "Margin": st.column_config.NumberColumn(format="$%.0f"),
-                            "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
-                            "Realised Rate": st.column_config.NumberColumn(format="$%.0f"),
-                        },
-                    )
+                    if band_mix is not None:
+                        st.markdown("#### 2) Margin Band Mix (Latest Month)")
+                        band_fig = go.Figure()
+                        band_fig.add_trace(
+                            go.Bar(
+                                x=band_mix["band"],
+                                y=band_mix["share"],
+                                marker_color="#f58518",
+                            )
+                        )
+                        band_fig.update_layout(
+                            yaxis=dict(title="% of Jobs"),
+                            xaxis=dict(title="Margin Band"),
+                            title="Job Mix by Margin Band",
+                        )
+                        st.plotly_chart(band_fig, use_container_width=True)
+
+                    st.markdown("#### 3) Detail Table")
+                    with st.expander("Show profitability ledger", expanded=view_mode == "Diagnostic"):
+                        st.dataframe(
+                            trend.rename(columns={
+                                "month_key": "Month",
+                                "revenue": "Revenue",
+                                "cost": "Cost",
+                                "margin": "Margin",
+                                "margin_pct": "Margin %",
+                                "realised_rate": "Realised Rate",
+                            }),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Month": st.column_config.DateColumn(format="YYYY-MM"),
+                                "Revenue": st.column_config.NumberColumn(format="$%.0f"),
+                                "Cost": st.column_config.NumberColumn(format="$%.0f"),
+                                "Margin": st.column_config.NumberColumn(format="$%.0f"),
+                                "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+                                "Realised Rate": st.column_config.NumberColumn(format="$%.0f"),
+                            },
+                        )
+                        if job_margin is not None:
+                            st.markdown("**At-risk jobs (latest month)**")
+                            st.dataframe(
+                                job_margin[job_margin["margin_pct"] < risk_floor]
+                                .sort_values("margin_pct", ascending=True)
+                                .head(10)
+                                .rename(columns={
+                                    "job_no": "Job",
+                                    "revenue": "Revenue",
+                                    "cost": "Cost",
+                                    "margin_pct": "Margin %",
+                                }),
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Revenue": st.column_config.NumberColumn(format="$%.0f"),
+                                    "Cost": st.column_config.NumberColumn(format="$%.0f"),
+                                    "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+                                },
+                            )
 
             st.info(
                 """
