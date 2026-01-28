@@ -857,6 +857,8 @@ planned hours aren’t inflated.
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 hovermode="x unified",
                 template="plotly_white",
+                height=360,
+                margin=dict(l=50, r=30, t=60, b=40),
             )
             st.plotly_chart(fig, use_container_width=True)
 
@@ -898,8 +900,71 @@ planned hours aren’t inflated.
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                 hovermode="x unified",
                 template="plotly_white",
+                height=360,
+                margin=dict(l=50, r=40, t=60, b=40),
             )
             st.plotly_chart(fig, use_container_width=True)
+
+            # Overrun drivers: job categories + tasks
+            st.markdown("**Overrun Drivers**")
+            driver_cols = st.columns([1, 0.04, 1])
+            with driver_cols[0]:
+                if "job_category" in job_level_window.columns:
+                    cat_overrun = job_level_window.groupby("job_category").agg(
+                        jobs=("job_no", "nunique"),
+                        underquoted_hours=("underquoted_hours", "sum"),
+                        actual_hours=("actual_hours", "sum"),
+                    ).reset_index()
+                    cat_overrun["underquoted_share"] = np.where(
+                        cat_overrun["actual_hours"] > 0,
+                        cat_overrun["underquoted_hours"] / cat_overrun["actual_hours"] * 100,
+                        np.nan,
+                    )
+                    cat_overrun = cat_overrun.sort_values("underquoted_hours", ascending=False).head(6)
+                    fig = go.Figure()
+                    fig.add_bar(
+                        x=cat_overrun["underquoted_hours"],
+                        y=cat_overrun["job_category"],
+                        orientation="h",
+                        marker_color="#e45756",
+                        name="Under-Quoted Hours",
+                    )
+                    fig.update_layout(
+                        title="Top Job Categories Driving Overruns",
+                        xaxis=dict(title="Under-Quoted Hours"),
+                        yaxis=dict(title="Category", categoryorder="total ascending"),
+                        template="plotly_white",
+                        height=320,
+                        margin=dict(l=80, r=20, t=50, b=40),
+                        legend=dict(orientation="h"),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
+            with driver_cols[2]:
+                if "task_name" in df_window.columns and "job_no" in job_level_window.columns:
+                    overrun_jobs = job_level_window[job_level_window["underquoted_hours"] > 0]["job_no"].unique()
+                    task_overrun = df_window[df_window["job_no"].isin(overrun_jobs)].groupby("task_name").agg(
+                        hours=("hours_raw", "sum"),
+                    ).reset_index()
+                    task_overrun = task_overrun.sort_values("hours", ascending=False).head(8)
+                    fig = go.Figure()
+                    fig.add_bar(
+                        x=task_overrun["hours"],
+                        y=task_overrun["task_name"],
+                        orientation="h",
+                        marker_color="#f58518",
+                        name="Hours (Overrun Jobs)",
+                    )
+                    fig.update_layout(
+                        title="Top Tasks Inside Overrun Jobs",
+                        xaxis=dict(title="Hours"),
+                        yaxis=dict(title="Task", categoryorder="total ascending"),
+                        template="plotly_white",
+                        height=320,
+                        margin=dict(l=120, r=20, t=50, b=40),
+                        legend=dict(orientation="h"),
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
 
     erosion_cols = st.columns(2)
     with erosion_cols[0]:
