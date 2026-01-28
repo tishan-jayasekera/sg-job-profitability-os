@@ -118,7 +118,12 @@ def calculate_job_mix_metrics(df: pd.DataFrame, cohort_df: pd.DataFrame) -> pd.D
     else:
         job_quotes = pd.DataFrame({"job_no": [], "quoted_hours": [], "quoted_amount": []})
 
-    job_actuals = df.groupby("job_no", dropna=False).agg(
+    # Actual hours in cohort month (align demand to intake month)
+    df_with_cohort = df.merge(cohort_df, on="job_no", how="inner")
+    df_with_cohort["month_key"] = pd.to_datetime(df_with_cohort["month_key"])
+    df_with_cohort["cohort_month"] = pd.to_datetime(df_with_cohort["cohort_month"])
+    df_cohort_month = df_with_cohort[df_with_cohort["month_key"] == df_with_cohort["cohort_month"]]
+    job_actuals = df_cohort_month.groupby("job_no", dropna=False).agg(
         actual_hours=("hours_raw", "sum"),
     ).reset_index()
     

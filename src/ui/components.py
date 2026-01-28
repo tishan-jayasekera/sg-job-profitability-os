@@ -3,6 +3,7 @@ Reusable UI components and blocks.
 """
 import streamlit as st
 import pandas as pd
+import numpy as np
 from typing import Optional, List, Dict, Any
 
 from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent, fmt_rate
@@ -28,7 +29,8 @@ def kpi_strip(metrics: Dict[str, Any],
         "hours": fmt_hours,
         "percent": fmt_percent,
         "rate": fmt_rate,
-        "count": lambda x: f"{int(x):,}" if pd.notna(x) else "—",
+        "count": lambda x: "—" if (pd.isna(x) or np.isinf(x)) else f"{int(x):,}",
+        "text": lambda x: str(x) if pd.notna(x) else "—",
     }
     
     for i, (label, value) in enumerate(metrics.items()):
@@ -231,3 +233,421 @@ def download_button(df: pd.DataFrame,
         mime="text/csv",
         key=key
     )
+
+
+def render_data_quality_panel(panel: Dict[str, Any], warnings: Optional[List[str]] = None):
+    """
+    Render data quality transparency panel.
+
+    Args:
+        panel: Dict of key->value strings to display.
+        warnings: List of warning strings to show.
+    """
+    with st.expander("Data Quality & Transparency"):
+        for key, value in panel.items():
+            st.markdown(f"- **{key}**: {value}")
+        if warnings:
+            st.markdown("---")
+            st.markdown("**Warnings**")
+            for w in warnings:
+                st.warning(w)
+        st.page_link("pages/8_Glossary_Method.py", label="Glossary & Method", icon="📖")
+
+
+# =============================================================================
+# ENHANCED KPI STRIP WITH SPARKLINES (NEW FOR PHASE 1)
+# =============================================================================
+
+def render_kpi_strip_with_sparklines(
+    metrics: Dict[str, Any],
+    sparklines: Optional[Dict[str, List[float]]] = None,
+    format_map: Optional[Dict[str, str]] = None,
+    status_indicators: Optional[Dict[str, str]] = None,  # Dict of label -> "green"/"yellow"/"red"
+):
+    """
+    Render enhanced KPI strip with status indicators and optional trend sparklines.
+    
+    Args:
+        metrics: Dict of {label: value}
+        sparklines: Dict of {label: [trend_values]} for mini-charts
+        format_map: Dict of {label: format_type}
+        status_indicators: Dict of {label: status_color}
+    """
+    if format_map is None:
+        format_map = {}
+    if status_indicators is None:
+        status_indicators = {}
+    
+    cols = st.columns(len(metrics))
+    
+    formatters = {
+        "currency": fmt_currency,
+        "hours": fmt_hours,
+        "percent": fmt_percent,
+        "rate": fmt_rate,
+        "count": lambda x: "—" if (pd.isna(x) or np.isinf(x)) else f"{int(x):,}",
+        "weeks": lambda x: "—" if (pd.isna(x) or np.isinf(x)) else f"{x:.1f}w",
+        "text": lambda x: str(x) if pd.notna(x) else "—",
+    }
+    
+    status_emoji = {
+        "green": "🟢",
+        "yellow": "🟡",
+        "red": "🔴",
+    }
+    
+    for i, (label, value) in enumerate(metrics.items()):
+        with cols[i]:
+            fmt_type = format_map.get(label, "currency")
+            formatter = formatters.get(fmt_type, str)
+            formatted = formatter(value) if pd.notna(value) else "—"
+            
+            # Add status emoji
+            status = status_indicators.get(label, "")
+            emoji = f" {status_emoji.get(status, '')}" if status in status_emoji else ""
+            
+            st.metric(label=label, value=f"{formatted}{emoji}")
+            
+            # Add sparkline if provided
+            if sparklines and label in sparklines and len(sparklines[label]) > 0:
+                try:
+                    import plotly.graph_objects as go
+                    sparkline_data = [v for v in sparklines[label] if pd.notna(v)]
+                    if len(sparkline_data) > 0:
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            y=sparkline_data,
+                            mode="lines",
+                            fill="tozeroy",
+                            line=dict(color="#1f77b4", width=1),
+                            hovertemplate="%{y:.1f}<extra></extra>",
+                        ))
+                        fig.update_layout(
+                            showlegend=False,
+                            hovermode="x unified",
+                            margin=dict(l=0, r=0, t=0, b=0),
+                            height=60,
+                            xaxis=dict(showticklabels=False),
+                            yaxis=dict(showticklabels=False),
+                        )
+                        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+                except Exception:
+                    pass  # Fail silently if sparkline rendering fails
+
+
+# =============================================================================
+# SMART TABLE RENDERING WITH SORTING/FILTERING
+# =============================================================================
+
+def render_sortable_table(
+    df: pd.DataFrame,
+    sort_column: Optional[str] = None,
+    sort_ascending: bool = False,
+    filter_columns: Optional[Dict[str, List[str]]] = None,
+    color_map: Optional[Dict[str, Dict[str, str]]] = None,
+    export_label: str = "Export CSV",
+):
+    """
+    Render a sortable, filterable table with optional row color-coding.
+    
+    Args:
+        df: DataFrame to display
+        sort_column: Column to sort by (default None = use input order)
+        sort_ascending: Sort ascending if True, descending if False
+        filter_columns: Dict of {column_name: [allowed_values]} for filtering
+        color_map: Dict of {column_name: {value: color_hex}}
+        export_label: Label for CSV export button
+    """
+    df = df.copy()
+    
+    # Apply filters
+    if filter_columns:
+        for col, allowed_values in filter_columns.items():
+            if col in df.columns and allowed_values:
+                df = df[df[col].isin(allowed_values)]
+    
+    # Apply sorting
+    if sort_column and sort_column in df.columns:
+        df = df.sort_values(sort_column, ascending=sort_ascending)
+    
+    # Display table
+    st.dataframe(
+        df,
+        use_container_width=True,
+        hide_index=True,
+    )
+    
+    # Export button
+    csv_data = df.to_csv(index=False)
+    st.download_button(
+        label=export_label,
+        data=csv_data,
+        file_name="export.csv",
+        mime="text/csv",
+    )
+
+
+# =============================================================================
+# DATA QUALITY WARNINGS & TRANSPARENCY
+# =============================================================================
+
+def render_data_quality_panel_extended(
+    benchmark_info: Optional[Dict[str, Any]] = None,
+    data_freshness: Optional[Dict[str, str]] = None,
+    warnings: Optional[List[str]] = None,
+    completeness: Optional[Dict[str, float]] = None,
+):
+    """
+    Render comprehensive data quality panel.
+    
+    Args:
+        benchmark_info: Dict with benchmark reliability info
+        data_freshness: Dict with last_refresh, next_refresh times
+        warnings: List of warning messages
+        completeness: Dict of data completeness percentages
+    """
+    with st.expander("📊 Data Quality & Transparency", expanded=False):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if benchmark_info:
+                st.markdown("**Benchmark Reliability**")
+                for key, value in benchmark_info.items():
+                    st.markdown(f"- {key}: {value}")
+            
+            if data_freshness:
+                st.markdown("**Data Freshness**")
+                for key, value in data_freshness.items():
+                    st.markdown(f"- {key}: {value}")
+        
+        with col2:
+            if completeness:
+                st.markdown("**Data Completeness**")
+                for metric, pct in completeness.items():
+                    col_a, col_b = st.columns([3, 1])
+                    with col_a:
+                        st.progress(pct / 100.0, text=f"{metric}: {pct:.0f}%")
+                    with col_b:
+                        st.markdown(f"*{pct:.0f}%*")
+        
+        if warnings:
+            st.markdown("---")
+            st.markdown("**Data Quality Warnings**")
+            for warning in warnings:
+                st.warning(warning, icon="⚠️")
+        
+        st.markdown("---")
+        st.caption("[📖 View Glossary & Methods](pages/8_Glossary_Method.py)")
+
+
+def render_status_badge_row(
+    df: pd.DataFrame,
+    status_column: str,
+    status_colors: Optional[Dict[str, str]] = None,
+) -> pd.DataFrame:
+    """
+    Add status badges to DataFrame for display (using st.write with HTML).
+    
+    Note: Returns HTML-enhanced column for better visualization.
+    
+    Args:
+        df: DataFrame
+        status_column: Column containing status values
+        status_colors: Dict of {status: hex_color}
+        
+    Returns:
+        Modified DataFrame with status badges
+    """
+    if status_colors is None:
+        status_colors = {
+            "On-Track": "#28a745",
+            "At-Risk": "#ffc107",
+            "Blocked": "#dc3545",
+            "Critical": "#d32f2f",
+            "Unknown": "#6c757d",
+        }
+    
+    df = df.copy()
+    
+    def badge_html(status):
+        color = status_colors.get(status, "#6c757d")
+        return f'<span style="background-color: {color}; color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px;">{status}</span>'
+    
+    df[status_column] = df[status_column].apply(badge_html)
+    return df
+
+# ============================================================================
+# PHASE 1B: DRILL-CHAIN UI COMPONENTS
+# ============================================================================
+
+def render_breadcrumb_header(
+    horizon_weeks: int,
+    scope_levels: List[str],
+) -> None:
+    """
+    Render top navigation breadcrumb + horizon selector.
+    
+    Args:
+        horizon_weeks: Current forecast horizon (4, 8, 12, 16)
+        scope_levels: List of active scope levels, e.g. ["Company", "Sales", "Fixed Price"]
+    """
+    col_horizon, col_scope = st.columns([2, 4])
+    
+    with col_horizon:
+        new_horizon = st.radio(
+            label="Forecast Horizon",
+            options=[4, 8, 12, 16],
+            index=[4, 8, 12, 16].index(horizon_weeks),
+            horizontal=True,
+            key="horizon_selector",
+        )
+        if new_horizon != horizon_weeks:
+            st.session_state['forecast_horizon_weeks'] = new_horizon
+            st.rerun()
+    
+    with col_scope:
+        breadcrumb_text = " ▸ ".join(["Company"] + scope_levels)
+        st.markdown(f"**Scope:** {breadcrumb_text}")
+
+
+def render_job_health_card(
+    job_row: pd.Series,
+) -> None:
+    """
+    Render job health summary card with human-readable states (no math artifacts).
+    
+    Args:
+        job_row: Single row from job_level dataframe with columns:
+                 job_no, status, due_weeks, job_eta_weeks, risk_score, 
+                 remaining_hours, expected_hours, actual_hours, job_velocity_hrs_week
+    """
+    from src.modeling.forecast import translate_job_state
+    
+    job_id = job_row.get('job_no', 'N/A')
+    risk_score = job_row.get('risk_score', np.nan)
+    due_weeks = job_row.get('due_weeks', np.nan)
+    eta_weeks = job_row.get('job_eta_weeks', np.nan)
+    velocity = job_row.get('job_velocity_hrs_week', 0)
+    
+    status, status_label = translate_job_state(risk_score, due_weeks, eta_weeks, velocity)
+    
+    remaining = job_row.get('remaining_hours', 0)
+    expected = job_row.get('expected_hours', 0)
+    actual = job_row.get('actual_hours', 0)
+    
+    st.subheader(f"Job #{job_id} - {status_label}")
+    
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        if pd.isna(eta_weeks) or np.isinf(eta_weeks):
+            eta_display = "No run-rate"
+        else:
+            eta_display = f"{eta_weeks:.1f}w"
+        st.metric("ETA", eta_display)
+    
+    with col2:
+        if pd.isna(due_weeks):
+            due_display = "—"
+        elif due_weeks < 0:
+            due_display = f"🔴 {-due_weeks:.1f}w ago"
+        else:
+            due_display = f"{due_weeks:.1f}w"
+        st.metric("Due", due_display)
+    
+    with col3:
+        if pd.isna(due_weeks) or pd.isna(eta_weeks):
+            buffer_display = "—"
+        elif np.isinf(eta_weeks):
+            buffer_display = "Blocked"
+        else:
+            buffer = due_weeks - eta_weeks
+            buffer_display = f"{buffer:.1f}w"
+        st.metric("Buffer", buffer_display)
+    
+    with col4:
+        st.metric("Risk", f"{risk_score:.2f}" if pd.notna(risk_score) else "—")
+    
+    with col5:
+        pct_complete = (actual / expected * 100) if expected > 0 else 0
+        st.metric("% Complete", f"{pct_complete:.0f}%")
+    
+    # Scope breakdown
+    st.markdown("---")
+    scope_cols = st.columns(3)
+    with scope_cols[0]:
+        st.write(f"**Benchmark:** {fmt_hours(expected)}")
+    with scope_cols[1]:
+        st.write(f"**Spent:** {fmt_hours(actual)}")
+    with scope_cols[2]:
+        st.write(f"**Remaining:** {fmt_hours(remaining)}")
+
+
+def render_task_status_badge(
+    velocity: float,
+    remaining_hours: float,
+    expected_hours: float,
+) -> str:
+    """
+    Translate task metrics into readable status badge.
+    
+    Args:
+        velocity: Hours per week
+        remaining_hours: Hours left to complete
+        expected_hours: Benchmark hours for this task
+        
+    Returns:
+        Status string: "Blocked" | "At-Risk" | "On-Track" | "Negligible"
+    """
+    if remaining_hours < 5:
+        return "Negligible"
+    
+    if velocity == 0:
+        return "Blocked"
+    
+    if remaining_hours > expected_hours:
+        return "At-Risk"
+    
+    return "On-Track"
+
+
+def render_scope_filtered_table(
+    df: pd.DataFrame,
+    title: str,
+    sortable_columns: Optional[List[str]] = None,
+    status_column: Optional[str] = None,
+    clickable_row_index: Optional[int] = None,
+) -> Optional[int]:
+    """
+    Render interactive table with sort, filter, and selection.
+    
+    Args:
+        df: DataFrame to display
+        title: Table title
+        sortable_columns: Column names that should be clickable for sorting
+        status_column: Column to apply status-based coloring
+        clickable_row_index: If provided, return index of clicked row
+        
+    Returns:
+        Clicked row index (or None if no click)
+    """
+    st.subheader(title)
+    
+    if len(df) == 0:
+        st.info("No data available for this scope.")
+        return None
+    
+    # Simple display with status coloring
+    display_df = df.copy()
+    
+    if status_column and status_column in display_df.columns:
+        display_df = display_df.style.applymap(
+            lambda x: 'background-color: #90EE90' if x == 'On-Track' else
+                      'background-color: #FFD700' if x == 'At-Risk' else
+                      'background-color: #FF6B6B' if x == 'Blocked' else '',
+            subset=[status_column]
+        )
+    
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    return None

@@ -187,6 +187,77 @@ def scatter_plot(df: pd.DataFrame, x: str, y: str,
     return apply_layout(fig)
 
 
+def render_risk_matrix(df: pd.DataFrame,
+                       x: str,
+                       y: str,
+                       size: str,
+                       color: str,
+                       hover_name: str,
+                       hover_data: List[str],
+                       title: str = "Risk Matrix",
+                       custom_data: Optional[List[str]] = None) -> go.Figure:
+    """
+    Render risk matrix scatter with shaded risk zones.
+    """
+    fig = px.scatter(
+        df,
+        x=x,
+        y=y,
+        size=size,
+        color=color,
+        hover_name=hover_name,
+        hover_data=hover_data,
+        custom_data=custom_data,
+        color_continuous_scale=["#2ca02c", "#ffbf00", "#d62728"],
+        range_color=(0, 1),
+        title=title,
+    )
+    fig.add_vline(x=0, line_dash="dash", line_color=CHART_COLORS["danger"])
+    fig.add_vline(x=2, line_dash="dot", line_color=CHART_COLORS["warning"])
+    fig.update_layout(xaxis_title="Time Buffer (weeks)", yaxis_title="Remaining Hours")
+    return apply_layout(fig)
+
+
+def render_task_stacked_bar(df: pd.DataFrame,
+                            task_col: str,
+                            expected_col: str,
+                            actual_col: str,
+                            remaining_col: str,
+                            title: str = "Task Shape vs Reality") -> go.Figure:
+    """
+    Stacked bar chart for task benchmark vs actual vs remaining.
+    """
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=df[task_col], y=df[expected_col], name="Benchmark (Expected)", marker_color="#9ecae1"))
+    fig.add_trace(go.Bar(x=df[task_col], y=df[actual_col], name="Actual", marker_color="#3182bd"))
+    fig.add_trace(go.Bar(x=df[task_col], y=df[remaining_col], name="Remaining", marker_color="#ff7f0e"))
+    fig.update_layout(barmode="stack", title=title, xaxis_title="Task", yaxis_title="Hours")
+    return apply_layout(fig)
+
+
+def render_bottleneck_heatmap(df: pd.DataFrame,
+                              job_col: str,
+                              task_col: str,
+                              value_col: str,
+                              status_col: str,
+                              title: str = "Bottleneck Heatmap") -> go.Figure:
+    """
+    Heatmap of job-task bottleneck status with remaining hours annotations.
+    """
+    pivot = df.pivot_table(index=job_col, columns=task_col, values=value_col, aggfunc="sum").fillna(0)
+    status = df.pivot_table(index=job_col, columns=task_col, values=status_col, aggfunc="first")
+    z = pivot.values
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=pivot.columns,
+        y=pivot.index,
+        colorscale="YlOrRd",
+        colorbar_title="Remaining Hrs",
+    ))
+    fig.update_layout(title=title, xaxis_title="Task", yaxis_title="Job")
+    return apply_layout(fig)
+
+
 def rate_scatter(df: pd.DataFrame, 
                  group_col: str,
                  revenue_col: str = "revenue",
@@ -400,6 +471,194 @@ def quadrant_scatter(df: pd.DataFrame, x: str, y: str,
     fig.update_layout(
         xaxis_title=x_title or x,
         yaxis_title=y_title or y,
+    )
+    
+    return apply_layout(fig)
+
+
+# =============================================================================
+# RISK MATRIX & BOTTLENECK CHARTS (NEW FOR FORECAST PAGE)
+# =============================================================================
+
+def risk_matrix(job_level: pd.DataFrame, on_click_job_callback=None) -> go.Figure:
+    """
+    Create risk heat-map scatter plot.
+    
+    X-axis: Time buffer (weeks until due - weeks to complete)
+    Y-axis: Remaining work (hours)
+    Bubble size: Team velocity (hours/week)
+    Color: Risk score (0=green, 1=red)
+    
+    Args:
+        job_level: DataFrame with columns: job_no, due_weeks, job_eta_weeks, 
+                   remaining_task_hours (or similar), team_velocity (optional), risk_score
+        on_click_job_callback: Optional callback function(job_no) on bubble click
+        
+    Returns:
+        Plotly Figure
+    """
+    df = job_level.copy()
+    df = df.dropna(subset=["due_weeks", "job_eta_weeks"])
+    
+    # Compute time buffer
+    df["time_buffer"] = df["due_weeks"] - df["job_eta_weeks"]
+    
+    # Estimate remaining hours if not present
+    if "remaining_task_hours" not in df.columns:
+        df["remaining_task_hours"] = 100  # Fallback
+    
+    # Estimate velocity if not present
+    if "team_velocity" not in df.columns:
+        df["team_velocity"] = 38  # Default FTE 38 hrs/week
+    
+    # Ensure risk_score exists
+    if "risk_score" not in df.columns:
+        from ..modeling.forecast import compute_risk_score
+        df["risk_score"] = df.apply(
+            lambda row: compute_risk_score(row["due_weeks"], row["job_eta_weeks"]),
+            axis=1
+        )
+    
+    # Color mapping: 0=green, 1=red
+    colors = df["risk_score"].fillna(0.5)
+    
+    # Status labels
+    df["status_label"] = df.apply(
+        lambda row: "On-Track" if row["risk_score"] < 0.2 else (
+            "Caution" if row["risk_score"] < 0.5 else (
+                "At-Risk" if row["risk_score"] < 0.8 else "Critical"
+            )
+        ) if pd.notna(row["risk_score"]) else "Unknown",
+        axis=1
+    )
+    
+    fig = go.Figure()
+    
+    # Add scatter trace
+    fig.add_trace(go.Scatter(
+        x=df["time_buffer"],
+        y=df["remaining_task_hours"],
+        mode="markers",
+        marker=dict(
+            size=df["team_velocity"].fillna(38) / 2,
+            color=colors,
+            colorscale="RdYlGn_r",
+            cmin=0,
+            cmax=1,
+            showscale=True,
+            colorbar=dict(
+                title="Risk Score",
+                tickvals=[0, 0.25, 0.5, 0.75, 1.0],
+                ticktext=["On-Track", "Caution", "Yellow", "At-Risk", "Critical"],
+            ),
+            line=dict(width=1, color="white"),
+        ),
+        text=[f"Job: {j}<br>Status: {s}<br>Buffer: {b:.1f}w<br>Remaining: {r:.0f}h<br>Risk: {rs:.2f}" 
+              for j, s, b, r, rs in zip(df["job_no"], df["status_label"], 
+                                        df["time_buffer"], df["remaining_task_hours"], 
+                                        df["risk_score"])],
+        hovertemplate="%{text}<extra></extra>",
+        customdata=df["job_no"],
+        name="Jobs",
+    ))
+    
+    # Add reference lines
+    fig.add_vline(x=0, line_dash="dash", line_color="red", annotation_text="Due Now", annotation_position="top right")
+    fig.add_vline(x=2, line_dash="dot", line_color="orange", annotation_text="2-Week Warning", annotation_position="top right")
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", line_width=1)
+    
+    # Add shaded risk zones
+    fig.add_shape(type="rect", x0=-100, x1=0, y0=0, y1=df["remaining_task_hours"].max() * 1.1,
+                  fillcolor="red", opacity=0.05, line_width=0, layer="below")
+    fig.add_shape(type="rect", x0=0, x1=2, y0=0, y1=df["remaining_task_hours"].max() * 1.1,
+                  fillcolor="orange", opacity=0.05, line_width=0, layer="below")
+    fig.add_shape(type="rect", x0=2, x1=100, y0=0, y1=df["remaining_task_hours"].max() * 1.1,
+                  fillcolor="green", opacity=0.05, line_width=0, layer="below")
+    
+    fig.update_layout(
+        title="Job Risk Matrix (Time Buffer vs. Remaining Work)",
+        xaxis_title="Time Buffer (weeks)",
+        yaxis_title="Remaining Work (hours)",
+        height=500,
+        hovermode="closest",
+    )
+    
+    return apply_layout(fig)
+
+
+def task_stacked_bar(task_data: pd.DataFrame) -> go.Figure:
+    """
+    Create stacked bar chart showing task decomposition (expected, actual, remaining).
+    
+    Args:
+        task_data: DataFrame with columns: task_name, expected_task_hours, 
+                   actual_task_hours, remaining_task_hours
+                   
+    Returns:
+        Plotly Figure
+    """
+    df = task_data.copy()
+    df = df.fillna(0)
+    
+    fig = go.Figure()
+    
+    fig.add_trace(go.Bar(
+        x=df["task_name"],
+        y=df["expected_task_hours"],
+        name="Benchmark (Expected)",
+        marker_color="#b3d9ff",
+    ))
+    
+    fig.add_trace(go.Bar(
+        x=df["task_name"],
+        y=df["actual_task_hours"],
+        name="Actual",
+        marker_color="#1f77b4",
+    ))
+    
+    fig.add_trace(go.Bar(
+        x=df["task_name"],
+        y=df["remaining_task_hours"],
+        name="Forecast Remaining",
+        marker_color="#ff7f0e",
+    ))
+    
+    fig.update_layout(
+        barmode="stack",
+        title="Task Shape vs. Reality (Benchmark → Actual → Remaining)",
+        xaxis_title="Task",
+        yaxis_title="Hours",
+        height=320,
+        hovermode="x unified",
+    )
+    
+    return apply_layout(fig)
+
+
+def bottleneck_heatmap(job_task_matrix: pd.DataFrame) -> go.Figure:
+    """
+    Create heatmap showing bottleneck status by job and task.
+    
+    Args:
+        job_task_matrix: Pivoted DataFrame with jobs as rows, tasks as columns,
+                        values = status (0=green, 1=yellow, 2=red) or remaining hours
+                        
+    Returns:
+        Plotly Figure
+    """
+    fig = go.Figure(data=go.Heatmap(
+        z=job_task_matrix.values,
+        x=job_task_matrix.columns,
+        y=job_task_matrix.index,
+        colorscale="RdYlGn_r",
+        hovertemplate="Job: %{y}<br>Task: %{x}<br>Value: %{z:.0f}<extra></extra>",
+    ))
+    
+    fig.update_layout(
+        title="Bottleneck Heatmap (Job × Task)",
+        xaxis_title="Task",
+        yaxis_title="Job",
+        height=400,
     )
     
     return apply_layout(fig)

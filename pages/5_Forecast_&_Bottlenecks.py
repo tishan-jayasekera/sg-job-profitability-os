@@ -1,561 +1,690 @@
 """
-Forecast & Bottlenecks Page
+5-Level Drill-Chain Forecast & Bottlenecks Dashboard
 
-Predict remaining work vs empirical capacity using benchmarks + team velocity.
+Level 0: Company Forecast (landing page)
+    → click department → Level 1
+Level 1: Department Forecast
+    → click category → Level 2
+Level 2: Category Distribution
+    → click job → Level 3
+Level 3: Individual Job Detail
+    → click task → Level 4
+Level 4: Task → FTE Responsibility
+
+Key principle: One drill path, one set of definitions (horizon, velocity window, benchmark basis).
+No math artifacts (no inf, no NaN, no divide-by-zero exposed).
 """
-from __future__ import annotations
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from pathlib import Path
-import sys
+from datetime import datetime, timedelta
+from typing import Optional, Tuple
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from src.data.loader import load_fact_timesheet
-from src.data.semantic import get_category_col
-from src.data.cohorts import get_active_jobs
-from src.data.profiles import (
-    compute_task_expertise,
-    compute_category_expertise,
-    compute_staff_capacity,
-    compute_expected_load,
-    compute_headroom,
-)
-from src.staffing.engine import recommend_staff_for_plan
-from src.modeling.benchmarks import build_category_benchmarks
-from src.modeling.forecast import forecast_remaining_work, solve_bottlenecks
-from src.modeling.supply import build_velocity_for_active_jobs
-from src.ui.formatting import fmt_hours, fmt_percent
 from src.config import config
+from src.data.loader import load_fact_timesheet
+from src.data.cohorts import get_active_jobs
+from src.modeling.benchmarks import build_category_benchmarks
+from src.modeling.supply import build_velocity_for_active_jobs
+from src.modeling.forecast import (
+    forecast_remaining_work,
+    solve_bottlenecks,
+    compute_risk_scores_for_jobs,
+    translate_job_state,
+    get_company_forecast,
+    get_dept_forecast,
+    get_category_jobs,
+    get_job_tasks,
+)
+from src.ui.components import (
+    render_breadcrumb_header,
+    render_job_health_card,
+    render_task_status_badge,
+    render_scope_filtered_table,
+)
+from src.ui.charts import (
+    apply_layout,
+    risk_matrix,
+    task_stacked_bar,
+    bottleneck_heatmap,
+)
 
 
-st.set_page_config(page_title="Forecast & Bottlenecks", page_icon="🧭", layout="wide")
+# ============================================================================
+# SESSION STATE INITIALIZATION
+# ============================================================================
+
+def init_session_state():
+    """Initialize drill-chain navigation state."""
+    if 'drill_state' not in st.session_state:
+        st.session_state['drill_state'] = {
+            'level': 0,  # 0-4
+            'selected_dept': None,
+            'selected_category': None,
+            'selected_job_id': None,
+            'selected_task_id': None,
+            'forecast_horizon_weeks': 12,
+            'velocity_lookback_days': 21,
+        }
 
 
-def _get_job_meta(df: pd.DataFrame) -> pd.DataFrame:
-    category_col = get_category_col(df)
-    cols = ["job_no", "department_final", category_col]
-    meta = df[cols].drop_duplicates()
-    meta = meta.rename(columns={category_col: "category_rev_job"})
-    if "job_due_date" in df.columns:
-        due = df.groupby("job_no")["job_due_date"].first().reset_index()
-        meta = meta.merge(due, on="job_no", how="left")
-    return meta
+# ============================================================================
+# LEVEL 0: COMPANY FORECAST
+# ============================================================================
+
+def render_level_0(
+    job_level: pd.DataFrame,
+    task_level: pd.DataFrame,
+) -> None:
+    """
+    Level 0: Company-level forecast.
+    
+    Shows: Total demand vs capacity, gap by department, at-risk overview.
+    Interaction: Click a department row → navigate to Level 1.
+    """
+    st.markdown("## Company Forecast")
+    
+    horizon = st.session_state['drill_state']['forecast_horizon_weeks']
+    
+    # Company KPI strip
+    company_forecast = get_company_forecast(job_level, horizon_weeks=horizon)
+    
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(
+            "Total Demand",
+            f"{company_forecast['total_demand_hours']:,.0f}h",
+            delta=f"{company_forecast['gap_hours']:,.0f}h buffer"
+        )
+    with col2:
+        st.metric(
+            "Team Capacity",
+            f"{company_forecast['total_capacity_hours']:,.0f}h",
+            delta=f"Horizon: {horizon}w"
+        )
+    with col3:
+        gap_status = "🟢 Surplus" if company_forecast['gap_hours'] > 0 else "🔴 Oversubscribed"
+        st.metric(
+            "Gap",
+            f"{company_forecast['gap_hours']:,.0f}h",
+            delta=gap_status
+        )
+    with col4:
+        st.metric(
+            "Gap (FTE)",
+            f"{company_forecast['gap_fte']:.1f}",
+            delta=f"@ 38h/week"
+        )
+    
+    st.markdown("---")
+    
+    # Department breakdown
+    st.markdown("### Department Breakdown (click to drill)")
+    
+    dept_df = company_forecast['dept_breakdown'].copy()
+    dept_df = dept_df[[
+        'department_final',
+        'demand_hours',
+        'capacity_hours',
+        'gap_hours',
+        'gap_pct',
+        'at_risk_count',
+        'avg_risk_score',
+    ]].round(2)
+    
+    # Display with instructions
+    st.info("Click on a department name below to drill into that department's forecast.")
+    
+    for idx, row in dept_df.iterrows():
+        dept_name = row['department_final']
+        cols = st.columns([2, 1, 1, 1, 1, 1])
+        
+        with cols[0]:
+            if st.button(
+                f"🔷 {dept_name}",
+                key=f"dept_btn_{dept_name}",
+                use_container_width=True,
+            ):
+                st.session_state['drill_state']['level'] = 1
+                st.session_state['drill_state']['selected_dept'] = dept_name
+                st.rerun()
+        
+        with cols[1]:
+            st.write(f"{row['demand_hours']:,.0f}h")
+        with cols[2]:
+            st.write(f"{row['capacity_hours']:,.0f}h")
+        with cols[3]:
+            st.write(f"{row['gap_hours']:,.0f}h")
+        with cols[4]:
+            st.write(f"{row['at_risk_count']:.0f}")
+        with cols[5]:
+            st.write(f"{row['avg_risk_score']:.2f}")
+    
+    st.markdown("---")
+    
+    # Risk overview
+    st.markdown("### Portfolio Risk Overview")
+    
+    risk_counts = {
+        '🟢 On-Track': (job_level['risk_score'] < 0.2).sum(),
+        '🟡 At-Risk': ((job_level['risk_score'] >= 0.2) & (job_level['risk_score'] < 0.7)).sum(),
+        '🔴 Critical': (job_level['risk_score'] >= 0.7).sum(),
+    }
+    
+    status_cols = st.columns(3)
+    for col, (status, count) in zip(status_cols, risk_counts.items()):
+        with col:
+            st.info(f"{status}: **{count}** jobs")
 
 
-def _completed_jobs(df: pd.DataFrame) -> pd.DataFrame:
-    if "job_completed_date" in df.columns:
-        return df[df["job_completed_date"].notna()].copy()
-    if "job_status" in df.columns:
-        return df[df["job_status"].str.lower().str.contains("completed", na=False)].copy()
-    return df.iloc[0:0].copy()
+# ============================================================================
+# LEVEL 1: DEPARTMENT FORECAST
+# ============================================================================
 
-
-def _capacity_weekly(df: pd.DataFrame, weeks: int) -> float:
-    if len(df) == 0:
-        return np.nan
-    date_col = "work_date" if "work_date" in df.columns else "month_key"
-    df = df.copy()
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    latest = df[date_col].max()
-    cutoff = latest - pd.Timedelta(weeks=weeks)
-    recent = df[df[date_col] >= cutoff]
-    if len(recent) == 0:
-        recent = df
-    if "fte_hours_scaling" not in recent.columns:
-        recent["fte_hours_scaling"] = 1.0
-    staff_fte = recent.groupby("staff_name")["fte_hours_scaling"].median().sum()
-    return staff_fte * config.CAPACITY_HOURS_PER_WEEK
-
-
-def _weekly_trend(df_active: pd.DataFrame, df_completed: pd.DataFrame, dept: str | None, cat: str | None) -> tuple[pd.Series, pd.Series, float]:
-    date_col = "work_date" if "work_date" in df_active.columns else "month_key"
-    active = df_active.copy()
-    active[date_col] = pd.to_datetime(active[date_col], errors="coerce")
-    if dept:
-        active = active[active["department_final"] == dept]
-    if cat:
-        active = active[active["category_rev_job"] == cat]
-    weekly_active = active.set_index(date_col)["hours_raw"].resample("W").sum()
-
-    completed = df_completed.copy()
-    if len(completed) > 0:
-        completed[date_col] = pd.to_datetime(completed[date_col], errors="coerce")
-        if dept:
-            completed = completed[completed["department_final"] == dept]
-        if cat:
-            completed = completed[completed["category_rev_job"] == cat]
-        weekly_completed = completed.set_index(date_col)["hours_raw"].resample("W").sum()
+def render_level_1(
+    job_level: pd.DataFrame,
+    task_level: pd.DataFrame,
+    dept: str,
+) -> None:
+    """
+    Level 1: Department-level forecast.
+    
+    Shows: Dept demand vs capacity, breakdown by category, top bottleneck tasks.
+    Interaction: Click a category → Level 2; click breadcrumb → Level 0.
+    """
+    st.markdown(f"## {dept} Forecast")
+    
+    # Breadcrumb
+    col_breadcrumb, col_back = st.columns([4, 1])
+    with col_breadcrumb:
+        st.markdown(f"**Scope:** Company ▸ {dept}")
+    with col_back:
+        if st.button("← Back to Company", key="back_to_level0"):
+            st.session_state['drill_state']['level'] = 0
+            st.session_state['drill_state']['selected_dept'] = None
+            st.rerun()
+    
+    st.markdown("---")
+    
+    horizon = st.session_state['drill_state']['forecast_horizon_weeks']
+    dept_forecast = get_dept_forecast(job_level, dept=dept, horizon_weeks=horizon)
+    
+    # Department KPI strip
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Dept Demand", f"{dept_forecast['dept_demand_hours']:,.0f}h")
+    with col2:
+        st.metric("Dept Capacity", f"{dept_forecast['dept_capacity_hours']:,.0f}h")
+    with col3:
+        gap_status = "🟢 Surplus" if dept_forecast['dept_gap_hours'] > 0 else "🔴 Oversubscribed"
+        st.metric("Dept Gap", f"{dept_forecast['dept_gap_hours']:,.0f}h", delta=gap_status)
+    with col4:
+        st.metric("At-Risk Jobs", dept_forecast['at_risk_count'])
+    
+    st.markdown("---")
+    
+    # Category breakdown
+    st.markdown("### Categories (click to drill)")
+    
+    cat_df = dept_forecast['category_breakdown'].copy()
+    cat_df = cat_df[[
+        'category_rev_job',
+        'job_count',
+        'demand_hours',
+        'capacity_hours',
+        'gap_hours',
+        'at_risk_count',
+        'avg_risk_score',
+    ]].round(2)
+    
+    for idx, row in cat_df.iterrows():
+        cat_name = row['category_rev_job']
+        cols = st.columns([2, 1, 1, 1, 1, 1, 1])
+        
+        with cols[0]:
+            if st.button(
+                f"📂 {cat_name}",
+                key=f"cat_btn_{cat_name}",
+                use_container_width=True,
+            ):
+                st.session_state['drill_state']['level'] = 2
+                st.session_state['drill_state']['selected_category'] = cat_name
+                st.rerun()
+        
+        with cols[1]:
+            st.write(f"{row['job_count']:.0f}")
+        with cols[2]:
+            st.write(f"{row['demand_hours']:,.0f}h")
+        with cols[3]:
+            st.write(f"{row['capacity_hours']:,.0f}h")
+        with cols[4]:
+            st.write(f"{row['gap_hours']:,.0f}h")
+        with cols[5]:
+            st.write(f"{row['at_risk_count']:.0f}")
+        with cols[6]:
+            st.write(f"{row['avg_risk_score']:.2f}")
+    
+    st.markdown("---")
+    
+    # Top bottleneck tasks (dept-scoped)
+    st.markdown("### Top Bottleneck Tasks")
+    
+    dept_tasks = task_level[
+        task_level['job_no'].isin(
+            job_level[job_level['department_final'] == dept]['job_no'].unique()
+        )
+    ].copy()
+    
+    dept_tasks = dept_tasks.sort_values('remaining_task_hours', ascending=False).head(10)
+    
+    if len(dept_tasks) > 0:
+        dept_tasks = dept_tasks.rename(columns={
+            "team_velocity_hours_week": "task_velocity_hrs_week",
+            "expected_task_hours": "task_hours_p50",
+        })
+        display_cols = [
+            "task_name", "job_no", "remaining_task_hours",
+            "task_velocity_hrs_week", "task_hours_p50",
+        ]
+        display_cols = [c for c in display_cols if c in dept_tasks.columns]
+        st.dataframe(dept_tasks[display_cols], use_container_width=True, hide_index=True)
     else:
-        weekly_completed = pd.Series(dtype=float)
-
-    cap_week = _capacity_weekly(active, config.LOAD_TRAILING_WEEKS)
-    return weekly_active, weekly_completed, cap_week
+        st.info("No bottleneck tasks in this department.")
 
 
-def _recommend_staff_for_gaps(task_gaps: pd.DataFrame, task_expertise: pd.DataFrame, category_expertise: pd.DataFrame, headroom_df: pd.DataFrame, dept: str, cat: str) -> dict:
-    if len(task_gaps) == 0:
-        return {}
-    plan = {
-        "department": dept,
-        "category": cat,
-        "tasks": [
-            {"task_name": row["task_name"], "hours": row["remaining_task_hours"]}
-            for _, row in task_gaps.iterrows()
-        ],
-    }
-    eligibility_config = {
-        "recency_months": config.ELIGIBILITY_RECENCY_MONTHS,
-        "min_hours": config.ELIGIBILITY_MIN_HOURS,
-        "min_jobs": config.ELIGIBILITY_MIN_JOBS,
-    }
-    recs, _ = recommend_staff_for_plan(
-        plan,
-        task_expertise,
-        category_expertise,
-        headroom_df,
-        eligibility_config,
-        top_n=1,
-    )
-    if len(recs) == 0:
-        return {}
-    return recs.groupby("task_name")["staff_name"].first().to_dict()
+# ============================================================================
+# LEVEL 2: CATEGORY DISTRIBUTION
+# ============================================================================
 
+def render_level_2(
+    job_level: pd.DataFrame,
+    task_level: pd.DataFrame,
+    dept: str,
+    category: str,
+) -> None:
+    """
+    Level 2: Category-level distribution view.
+    
+    Shows: Benchmark vs actual, job distribution, worst jobs ranked.
+    Interaction: Click a job → Level 3; click breadcrumb → Level 1 or 0.
+    """
+    st.markdown(f"## {category} (in {dept})")
+    
+    # Breadcrumb
+    col_breadcrumb, col_back = st.columns([4, 1])
+    with col_breadcrumb:
+        st.markdown(f"**Scope:** Company ▸ {dept} ▸ {category}")
+    with col_back:
+        if st.button("← Back to Department", key="back_to_level1"):
+            st.session_state['drill_state']['level'] = 1
+            st.session_state['drill_state']['selected_category'] = None
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Get category jobs
+    cat_jobs = get_category_jobs(job_level, dept=dept, category=category)
+    
+    if len(cat_jobs) == 0:
+        st.warning(f"No active jobs found in {category}.")
+        return
+    
+    # Category KPI strip
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("# Active Jobs", len(cat_jobs))
+    with col2:
+        st.metric("Total Remaining", f"{cat_jobs['remaining_hours'].sum():,.0f}h")
+    with col3:
+        st.metric("Avg Risk Score", f"{cat_jobs['risk_score'].mean():.2f}")
+    
+    st.markdown("---")
+    
+    # Worst jobs (ranked by urgency)
+    st.markdown("### Jobs (Ranked by Urgency - Click to Detail)")
+    
+    for idx, job_row in cat_jobs.iterrows():
+        job_id = job_row['job_no']
+        cols = st.columns([2, 1, 1, 1, 1, 1, 1])
+        
+        with cols[0]:
+            if st.button(
+                f"🎯 Job #{job_id}",
+                key=f"job_btn_{job_id}",
+                use_container_width=True,
+            ):
+                st.session_state['drill_state']['level'] = 3
+                st.session_state['drill_state']['selected_job_id'] = job_id
+                st.rerun()
+        
+        with cols[1]:
+            st.write(f"{job_row['remaining_hours']:,.0f}h")
+        with cols[2]:
+            st.write(f"{job_row['job_velocity_hrs_week']:.1f}h/w")
+        with cols[3]:
+            if np.isinf(job_row.get('job_eta_weeks', np.inf)):
+                st.write("∞")
+            else:
+                st.write(f"{job_row.get('job_eta_weeks', 0):.1f}w")
+        with cols[4]:
+            st.write(f"{job_row['due_weeks']:.1f}w")
+        with cols[5]:
+            status, _ = translate_job_state(
+                job_row['risk_score'],
+                job_row['due_weeks'],
+                job_row.get('job_eta_weeks', np.inf),
+                job_row['job_velocity_hrs_week']
+            )
+            st.write(status)
+        with cols[6]:
+            st.write(f"{job_row['risk_score']:.2f}")
+
+
+# ============================================================================
+# LEVEL 3: INDIVIDUAL JOB DETAIL
+# ============================================================================
+
+def render_level_3(
+    job_level: pd.DataFrame,
+    task_level: pd.DataFrame,
+    job_id: int,
+    dept: str,
+    category: str,
+) -> None:
+    """
+    Level 3: Individual job deep-dive.
+    
+    Shows: Job health card, active contributors, task bottleneck matrix.
+    Interaction: Click a task → Level 4; click breadcrumb → Level 2, 1, or 0.
+    """
+    st.markdown(f"## Job #{job_id}")
+    
+    # Breadcrumb
+    col_breadcrumb, col_back = st.columns([4, 1])
+    with col_breadcrumb:
+        st.markdown(f"**Scope:** Company ▸ {dept} ▸ {category} ▸ #{job_id}")
+    with col_back:
+        if st.button("← Back to Category", key="back_to_level2"):
+            st.session_state['drill_state']['level'] = 2
+            st.session_state['drill_state']['selected_job_id'] = None
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Get job row
+    job_row = job_level[job_level['job_no'] == job_id].iloc[0]
+    
+    # Health card
+    render_job_health_card(job_row)
+    
+    st.markdown("---")
+    
+    # Job tasks
+    st.markdown("### Bottleneck Tasks (Click to Detail)")
+    
+    job_tasks = get_job_tasks(task_level, job_id=job_id, min_hours=0)
+    job_tasks['show_negligible'] = False  # Toggle later if needed
+    
+    if len(job_tasks) > 0:
+        for idx, task_row in job_tasks.iterrows():
+            task_id = task_row.get('task_id', idx)
+            task_name = task_row['task_name']
+            remaining = task_row['remaining_task_hours']
+            velocity = task_row.get('team_velocity_hours_week', task_row.get('task_velocity_hrs_week'))
+            expected = task_row.get('expected_task_hours', task_row.get('task_hours_p50'))
+            
+            status = render_task_status_badge(velocity, remaining, expected)
+            
+            cols = st.columns([2, 1, 1, 1, 1])
+            
+            with cols[0]:
+                if st.button(
+                    f"📋 {task_name}",
+                    key=f"task_btn_{task_id}",
+                    use_container_width=True,
+                ):
+                    st.session_state['drill_state']['level'] = 4
+                    st.session_state['drill_state']['selected_task_id'] = task_id
+                    st.rerun()
+            
+            with cols[1]:
+                st.write(f"{remaining:.0f}h")
+            with cols[2]:
+                st.write(f"{velocity:.1f}h/w")
+            with cols[3]:
+                if velocity > 0:
+                    st.write(f"{remaining / velocity:.1f}w")
+                else:
+                    st.write("∞")
+            with cols[4]:
+                st.write(status)
+    else:
+        st.info("No tasks tracked for this job yet.")
+
+
+# ============================================================================
+# LEVEL 4: TASK → FTE RESPONSIBILITY
+# ============================================================================
+
+def render_level_4(
+    job_level: pd.DataFrame,
+    task_level: pd.DataFrame,
+    job_id: int,
+    task_id: int,
+    dept: str,
+    category: str,
+) -> None:
+    """
+    Level 4: Task-level FTE responsibility and feasibility.
+    
+    Shows: Task health, active contributors, eligible staff, capacity feasibility, what-if.
+    Interaction: Click breadcrumb → Level 3, 2, 1, or 0.
+    """
+    st.markdown(f"## Task Details (Job #{job_id})")
+    
+    # Breadcrumb
+    col_breadcrumb, col_back = st.columns([4, 1])
+    with col_breadcrumb:
+        st.markdown(f"**Scope:** Company ▸ {dept} ▸ {category} ▸ #{job_id} ▸ Task")
+    with col_back:
+        if st.button("← Back to Job", key="back_to_level3"):
+            st.session_state['drill_state']['level'] = 3
+            st.session_state['drill_state']['selected_task_id'] = None
+            st.rerun()
+    
+    st.markdown("---")
+    
+    # Get task row
+    task_row = task_level[task_level.index == task_id].iloc[0] if task_id in task_level.index else None
+    
+    if task_row is None:
+        st.error(f"Task {task_id} not found.")
+        return
+    
+    task_name = task_row.get('task_name', 'Unknown')
+    remaining = task_row['remaining_task_hours']
+    velocity = task_row.get('team_velocity_hours_week', task_row.get('task_velocity_hrs_week'))
+    expected = task_row.get('expected_task_hours', task_row.get('task_hours_p50'))
+    
+    # Task summary
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Task", task_name)
+    with col2:
+        st.metric("Remaining", f"{remaining:.0f}h")
+    with col3:
+        st.metric("Velocity", f"{velocity:.1f}h/w")
+    with col4:
+        if velocity > 0:
+            st.metric("Est Complete", f"{remaining / velocity:.1f}w")
+        else:
+            st.metric("Est Complete", "Blocked")
+    
+    st.markdown("---")
+    
+    # What-if scenario
+    st.markdown("### What-If Scenario Planning")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        added_velocity = st.slider(
+            "Add velocity (hrs/week)",
+            min_value=0.0,
+            max_value=20.0,
+            value=0.0,
+            step=1.0,
+            key="added_velocity"
+        )
+    
+    with col2:
+        deadline_shift = st.slider(
+            "Shift deadline (weeks)",
+            min_value=-2,
+            max_value=4,
+            value=0,
+            step=1,
+            key="deadline_shift"
+        )
+    
+    # Scenario impact
+    new_velocity = velocity + added_velocity
+    new_remaining_weeks = remaining / new_velocity if new_velocity > 0 else np.inf
+    original_weeks = remaining / velocity if velocity > 0 else np.inf
+    
+    impact_cols = st.columns(3)
+    with impact_cols[0]:
+        if np.isinf(original_weeks):
+            st.metric("Current", "Blocked")
+        else:
+            st.metric("Current", f"{original_weeks:.1f}w")
+    
+    with impact_cols[1]:
+        if np.isinf(new_remaining_weeks):
+            st.metric("With Changes", "Blocked")
+        else:
+            st.metric("With Changes", f"{new_remaining_weeks:.1f}w")
+    
+    with impact_cols[2]:
+        if np.isinf(original_weeks) or np.isinf(new_remaining_weeks):
+            savings = "Unblocked!"
+        else:
+            savings = f"{original_weeks - new_remaining_weeks:.1f}w saved"
+        st.metric("Improvement", savings)
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
 
 def main():
-    st.title("Forecast & Bottlenecks")
-    st.caption("Remaining work vs empirical capacity using completed-job benchmarks + team velocity.")
-
-    df = load_fact_timesheet()
-    category_col = get_category_col(df)
-    df = df.rename(columns={category_col: "category_rev_job"})
-
-    active_jobs = get_active_jobs(df)
-    df_active = df[df["job_no"].isin(active_jobs)].copy()
-    if len(df_active) == 0:
-        st.warning("No active jobs found.")
+    """Main entry point: render appropriate level based on session state."""
+    st.set_page_config(page_title="Forecast & Bottlenecks", layout="wide")
+    st.title("📊 Forecast & Bottlenecks - 5-Level Drill-Chain")
+    
+    init_session_state()
+    
+    # Load data
+    try:
+        df_active = load_fact_timesheet()
+        if len(df_active) == 0:
+            st.error("No active timesheet data found.")
+            return
+    except Exception as e:
+        st.error(f"Error loading data: {e}")
         return
-
-    bench_summary, task_mix = build_category_benchmarks(df)
-    remaining = forecast_remaining_work(df_active, bench_summary, task_mix)
-    velocity = build_velocity_for_active_jobs(df, active_jobs, weeks=config.LOAD_TRAILING_WEEKS)
-    task_level, job_level = solve_bottlenecks(remaining, velocity, df_active)
-
-    job_meta = _get_job_meta(df_active)
-    job_level = job_level.merge(job_meta, on="job_no", how="left")
-
-    # =========================
-    # CHAIN CONTROLS (TOP-DOWN)
-    # =========================
-    st.subheader("Chain Controls")
-    dept_options = ["All"] + sorted(job_level["department_final"].dropna().unique().tolist())
-    dept = st.selectbox("Department", dept_options)
-    scope = job_level.copy()
-    if dept != "All":
-        scope = scope[scope["department_final"] == dept]
-
-    cat_options = ["All"] + sorted(scope["category_rev_job"].dropna().unique().tolist())
-    category = st.selectbox("Job Category", cat_options)
-    if category != "All":
-        scope = scope[scope["category_rev_job"] == category]
-
-    job_options = sorted(scope["job_no"].dropna().unique().tolist())
-    selected_job = st.selectbox("Job", job_options)
-
-    selected_meta = job_level[job_level["job_no"] == selected_job].iloc[0]
-    selected_task = task_level[task_level["job_no"] == selected_job].copy()
-    selected_bench = bench_summary[
-        (bench_summary["department_final"] == selected_meta["department_final"]) &
-        (bench_summary["category_rev_job"] == selected_meta["category_rev_job"])
-    ]
-
-    # =========================
-    # SECTION 1 — COMPANY FORECAST
-    # =========================
-    st.subheader("Section 1 — Company Forecast (Top‑Down)")
-    company_eta = job_level["job_eta_weeks"].replace([np.inf, -np.inf], np.nan).max()
-    company_risk = (job_level["status"] == "At Risk").sum()
-    company_blocked = (job_level["status"] == "Blocked").sum()
-    company_total_remaining = task_level["remaining_task_hours"].sum()
-    zero_velocity_tasks = task_level[
-        (task_level["remaining_task_hours"] > 0) & (task_level["team_velocity_hours_week"] == 0)
-    ]
-    # Company Demand Trend
-    st.markdown("**Company Demand Trend**")
-    date_col = "work_date" if "work_date" in df_active.columns else "month_key"
-    df_active[date_col] = pd.to_datetime(df_active[date_col], errors="coerce")
-    df_completed = _completed_jobs(df)
-    if len(df_completed) > 0:
-        df_completed[date_col] = pd.to_datetime(df_completed[date_col], errors="coerce")
-    weekly_hours = df_active.set_index(date_col)["hours_raw"].resample("W").sum()
-    weekly_jobs = df_active.groupby(pd.Grouper(key=date_col, freq="W"))["job_no"].nunique()
-    weekly_completed = (
-        df_completed.set_index(date_col)["hours_raw"].resample("W").sum()
-        if len(df_completed) > 0 else pd.Series(dtype=float)
-    )
-    capacity_week = _capacity_weekly(df_active, config.LOAD_TRAILING_WEEKS)
-
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=weekly_hours.index,
-        y=weekly_hours.values,
-        mode="lines+markers",
-        name="Active Job Hours (weekly)",
-    ))
-    if len(weekly_completed) > 0:
-        fig.add_trace(go.Scatter(
-            x=weekly_completed.index,
-            y=weekly_completed.values,
-            mode="lines+markers",
-            name="Completed Work (weekly)",
-        ))
-    fig.add_trace(go.Scatter(
-        x=weekly_jobs.index,
-        y=weekly_jobs.values,
-        mode="lines+markers",
-        name="Active Jobs (count)",
-        yaxis="y2",
-    ))
-    if pd.notna(capacity_week) and capacity_week > 0:
-        fig.add_hline(y=capacity_week, line_dash="dash", annotation_text="Imputed Capacity / week")
-    fig.update_layout(
-        height=320,
-        xaxis_title="Week",
-        yaxis=dict(title="Hours"),
-        yaxis2=dict(title="Active Jobs", overlaying="y", side="right"),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(t=40, l=10, r=10, b=10),
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("**Forecast Period (Next N Weeks)**")
-    n_weeks = st.slider("Forecast weeks", 4, 16, 8)
-    projected_weekly_demand = weekly_hours.mean() if len(weekly_hours) > 0 else 0
-    forecast_total_demand = projected_weekly_demand * n_weeks
-    forecast_total_capacity = capacity_week * n_weeks if pd.notna(capacity_week) else np.nan
-    forecast_gap = forecast_total_capacity - forecast_total_demand if pd.notna(forecast_total_capacity) else np.nan
-    forecast_cols = st.columns(4)
-    with forecast_cols[0]:
-        st.metric("Projected Demand (hrs)", fmt_hours(forecast_total_demand))
-    with forecast_cols[1]:
-        st.metric("Projected Capacity (hrs)", fmt_hours(forecast_total_capacity))
-    with forecast_cols[2]:
-        st.metric("Forecast Gap", fmt_hours(forecast_gap))
-    with forecast_cols[3]:
-        st.metric("Avg Weekly Demand", fmt_hours(projected_weekly_demand))
-
-    if len(weekly_hours) > 0:
-        last_actual = weekly_hours.index.max()
-        forecast_end = last_actual + pd.Timedelta(weeks=n_weeks)
-        fig_forecast = go.Figure()
-        fig_forecast.add_trace(go.Scatter(
-            x=weekly_hours.index,
-            y=weekly_hours.values,
-            mode="lines+markers",
-            name="Actual (weekly)",
-        ))
-        if pd.notna(capacity_week) and capacity_week > 0:
-            fig_forecast.add_hline(y=capacity_week, line_dash="dash", annotation_text="Capacity / week")
-        fig_forecast.add_shape(
-            type="rect",
-            x0=last_actual,
-            x1=forecast_end,
-            y0=0,
-            y1=max(weekly_hours.max(), capacity_week if pd.notna(capacity_week) else 0),
-            fillcolor="rgba(200,200,200,0.25)",
-            line_width=0,
-            layer="below",
-        )
-        fig_forecast.update_layout(
-            height=260,
-            xaxis_title="Week",
-            yaxis_title="Hours",
-            margin=dict(t=30, l=10, r=10, b=10),
-        )
-        st.plotly_chart(fig_forecast, use_container_width=True)
-
-    surplus_week = capacity_week - projected_weekly_demand if pd.notna(capacity_week) else np.nan
-    surplus_fte = surplus_week / config.CAPACITY_HOURS_PER_WEEK if pd.notna(surplus_week) else np.nan
-    st.caption(
-        f"Insight: Forecast period assumes steady demand at {fmt_hours(projected_weekly_demand)} hrs/wk. "
-        f"Projected capacity surplus = {fmt_hours(surplus_week)} hrs/wk "
-        f"({surplus_fte:.2f} FTE/wk) if positive."
-    )
-
-    if len(weekly_hours) > 0 and pd.notna(capacity_week):
-        forecast_index = pd.date_range(start=last_actual + pd.Timedelta(weeks=1), periods=n_weeks, freq="W")
-        gap_series = pd.Series([capacity_week - projected_weekly_demand] * n_weeks, index=forecast_index)
-        gap_fig = go.Figure()
-        gap_fig.add_trace(go.Bar(
-            x=gap_series.index,
-            y=gap_series.values,
-            name="Capacity − Demand (hrs)",
-            marker_color=["#d95f02" if v < 0 else "#1b9e77" for v in gap_series.values],
-        ))
-        gap_fig.update_layout(
-            height=240,
-            xaxis_title="Forecast Week",
-            yaxis_title="Capacity Gap (hrs)",
-            margin=dict(t=30, l=10, r=10, b=10),
-        )
-        st.plotly_chart(gap_fig, use_container_width=True)
-
-        deficit_weeks = (gap_series < 0).sum()
-        if deficit_weeks > 0:
-            st.warning(
-                f"Key insight: {deficit_weeks} of the next {n_weeks} weeks show a capacity deficit. "
-                "Consider rebalancing workload or adding capacity."
-            )
+    
+    # Build forecasts
+    try:
+        benchmarks, task_mix = build_category_benchmarks(df_active)
+        
+        remaining_by_task = forecast_remaining_work(df_active, benchmarks, task_mix)
+        active_jobs = df_active['job_no'].unique().tolist()
+        velocity_df = build_velocity_for_active_jobs(df_active, active_jobs, weeks=4)
+        job_level = df_active[['job_no', 'department_final', 'category_rev_job']].drop_duplicates()
+        task_level, job_level = solve_bottlenecks(remaining_by_task, velocity_df, job_level)
+        job_level = compute_risk_scores_for_jobs(job_level)
+        
+        # Aggregate remaining hours from task_level to job_level for forecasting
+        remaining_hours_by_job = task_level.groupby('job_no')['remaining_task_hours'].sum().reset_index()
+        remaining_hours_by_job.columns = ['job_no', 'remaining_hours']
+        job_level = job_level.merge(remaining_hours_by_job, on='job_no', how='left')
+        job_level['remaining_hours'] = job_level['remaining_hours'].fillna(0)
+        
+    except Exception as e:
+        import traceback
+        st.error(f"Error computing forecasts: {e}")
+        st.error(traceback.format_exc())
+        return
+    
+    # Route to appropriate level
+    drill_state = st.session_state['drill_state']
+    level = drill_state['level']
+    
+    try:
+        if level == 0:
+            render_level_0(job_level, remaining_by_task)
+        
+        elif level == 1:
+            if drill_state['selected_dept']:
+                render_level_1(job_level, remaining_by_task, drill_state['selected_dept'])
+            else:
+                st.warning("No department selected. Returning to company view.")
+                st.session_state['drill_state']['level'] = 0
+                st.rerun()
+        
+        elif level == 2:
+            if drill_state['selected_dept'] and drill_state['selected_category']:
+                render_level_2(
+                    job_level,
+                    remaining_by_task,
+                    drill_state['selected_dept'],
+                    drill_state['selected_category'],
+                )
+            else:
+                st.warning("Invalid category selection. Returning.")
+                st.session_state['drill_state']['level'] = 1
+                st.rerun()
+        
+        elif level == 3:
+            if drill_state['selected_job_id']:
+                dept = drill_state.get('selected_dept', 'Unknown')
+                cat = drill_state.get('selected_category', 'Unknown')
+                render_level_3(
+                    job_level,
+                    remaining_by_task,
+                    drill_state['selected_job_id'],
+                    dept,
+                    cat,
+                )
+            else:
+                st.warning("Invalid job selection. Returning.")
+                st.session_state['drill_state']['level'] = 2
+                st.rerun()
+        
+        elif level == 4:
+            if drill_state['selected_job_id'] and drill_state['selected_task_id']:
+                dept = drill_state.get('selected_dept', 'Unknown')
+                cat = drill_state.get('selected_category', 'Unknown')
+                render_level_4(
+                    job_level,
+                    remaining_by_task,
+                    drill_state['selected_job_id'],
+                    drill_state['selected_task_id'],
+                    dept,
+                    cat,
+                )
+            else:
+                st.warning("Invalid task selection. Returning.")
+                st.session_state['drill_state']['level'] = 3
+                st.rerun()
+        
         else:
-            st.success("Key insight: No forecasted capacity deficit in the selected period.")
-
-    # Company Remaining Work
-    st.markdown("**Company Remaining Work**")
-    rem_cols = st.columns(4)
-    with rem_cols[0]:
-        st.metric("Active Jobs", f"{job_level['job_no'].nunique():,}")
-    with rem_cols[1]:
-        st.metric("Remaining Hours", fmt_hours(company_total_remaining))
-    with rem_cols[2]:
-        st.metric("ETA (max)", f"{company_eta:.1f} wks" if pd.notna(company_eta) else "—")
-    with rem_cols[3]:
-        st.metric("At Risk / Blocked", f"{company_risk} / {company_blocked}")
-
-    # Company Bottleneck Risk
-    st.markdown("**Company Bottleneck Risk**")
-    risk_cols = st.columns(3)
-    with risk_cols[0]:
-        st.metric("Zero‑Velocity Tasks", f"{len(zero_velocity_tasks):,}")
-    with risk_cols[1]:
-        st.metric("Jobs w/ Bottlenecks", f"{zero_velocity_tasks['job_no'].nunique():,}")
-    with risk_cols[2]:
-        st.metric("Blocked Jobs", f"{company_blocked:,}")
-
-    st.divider()
-
-    # =========================
-    # SECTION 2 — DEPARTMENT VIEW
-    # =========================
-    st.subheader("Section 2 — Department Forecast")
-    st.markdown("**Department Demand Trend**")
-    dept_list = sorted(job_level["department_final"].dropna().unique().tolist())
-    if dept == "All":
-        selected_depts = st.multiselect("Departments to compare", dept_list, default=dept_list[:2])
-    else:
-        selected_depts = [dept]
-    dept_trend_cols = st.columns(2)
-    for idx, d in enumerate(selected_depts):
-        with dept_trend_cols[idx % 2]:
-            weekly_active, weekly_completed, cap_week = _weekly_trend(df_active, df_completed, d, None)
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=weekly_active.index, y=weekly_active.values, mode="lines+markers", name="Active"))
-            if len(weekly_completed) > 0:
-                fig.add_trace(go.Scatter(x=weekly_completed.index, y=weekly_completed.values, mode="lines+markers", name="Completed"))
-            if pd.notna(cap_week) and cap_week > 0:
-                fig.add_hline(y=cap_week, line_dash="dash", annotation_text="Capacity / week")
-            fig.update_layout(height=220, title=d, xaxis_title="Week", yaxis_title="Hours", margin=dict(t=30, l=10, r=10, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("**Department Remaining Work**")
-    dept_summary = job_level.groupby("department_final").agg(
-        jobs=("job_no", "nunique"),
-        at_risk=("status", lambda x: (x == "At Risk").sum()),
-        blocked=("status", lambda x: (x == "Blocked").sum()),
-    ).reset_index()
-    dept_remaining = task_level.groupby("department_final")["remaining_task_hours"].sum().reset_index()
-    dept_summary = dept_summary.merge(dept_remaining, on="department_final", how="left")
-    st.dataframe(
-        dept_summary.rename(columns={
-            "department_final": "Department",
-            "remaining_task_hours": "Remaining Hours",
-        }),
-        use_container_width=True,
-        hide_index=True,
-        column_config={"Remaining Hours": st.column_config.NumberColumn(format="%.1f")},
-    )
-    st.markdown("**Department Bottleneck Risk**")
-    dept_bottlenecks = task_level[
-        (task_level["remaining_task_hours"] > 0) & (task_level["team_velocity_hours_week"] == 0)
-    ].groupby("department_final")["task_name"].count().rename("zero_velocity_tasks").reset_index()
-    st.dataframe(
-        dept_bottlenecks.rename(columns={"department_final": "Department", "zero_velocity_tasks": "Zero‑Velocity Tasks"}),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.divider()
-
-    # =========================
-    # SECTION 3 — CATEGORY VIEW
-    # =========================
-    st.subheader("Section 3 — Category Forecast")
-    st.markdown("**Category Demand Trend**")
-    cat_list = sorted(scope["category_rev_job"].dropna().unique().tolist())
-    if category == "All":
-        selected_cats = st.multiselect("Categories to compare", cat_list, default=cat_list[:2])
-    else:
-        selected_cats = [category]
-    cat_trend_cols = st.columns(2)
-    for idx, c in enumerate(selected_cats):
-        with cat_trend_cols[idx % 2]:
-            weekly_active, weekly_completed, cap_week = _weekly_trend(df_active, df_completed, dept if dept != "All" else None, c)
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=weekly_active.index, y=weekly_active.values, mode="lines+markers", name="Active"))
-            if len(weekly_completed) > 0:
-                fig.add_trace(go.Scatter(x=weekly_completed.index, y=weekly_completed.values, mode="lines+markers", name="Completed"))
-            if pd.notna(cap_week) and cap_week > 0:
-                fig.add_hline(y=cap_week, line_dash="dash", annotation_text="Capacity / week")
-            fig.update_layout(height=220, title=c, xaxis_title="Week", yaxis_title="Hours", margin=dict(t=30, l=10, r=10, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown("**Category Remaining Work**")
-    cat_summary = scope.groupby("category_rev_job").agg(
-        jobs=("job_no", "nunique"),
-        at_risk=("status", lambda x: (x == "At Risk").sum()),
-        blocked=("status", lambda x: (x == "Blocked").sum()),
-    ).reset_index()
-    cat_remaining = task_level.groupby("category_rev_job")["remaining_task_hours"].sum().reset_index()
-    cat_summary = cat_summary.merge(cat_remaining, on="category_rev_job", how="left")
-    st.dataframe(
-        cat_summary.rename(columns={
-            "category_rev_job": "Category",
-            "remaining_task_hours": "Remaining Hours",
-        }),
-        use_container_width=True,
-        hide_index=True,
-        column_config={"Remaining Hours": st.column_config.NumberColumn(format="%.1f")},
-    )
-    st.markdown("**Category Bottleneck Risk**")
-    cat_bottlenecks = task_level[
-        (task_level["remaining_task_hours"] > 0) & (task_level["team_velocity_hours_week"] == 0)
-    ].groupby("category_rev_job")["task_name"].count().rename("zero_velocity_tasks").reset_index()
-    st.dataframe(
-        cat_bottlenecks.rename(columns={"category_rev_job": "Category", "zero_velocity_tasks": "Zero‑Velocity Tasks"}),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.divider()
-
-    # KPI strip
-    st.subheader("Section 4 — Job Forecast Summary")
-    actual_hours = df_active[df_active["job_no"] == selected_job]["hours_raw"].sum()
-    projected = selected_task["projected_eac_hours"].max() if len(selected_task) > 0 else np.nan
-    eta = selected_meta["job_eta_weeks"]
-    due_weeks = selected_meta.get("due_weeks", np.nan)
-    status = selected_meta.get("status", "Unknown")
-
-    kpi_cols = st.columns(5)
-    with kpi_cols[0]:
-        st.metric("Projected EAC (p50)", fmt_hours(projected))
-    with kpi_cols[1]:
-        st.metric("Actual to Date", fmt_hours(actual_hours))
-    with kpi_cols[2]:
-        st.metric("ETA (weeks)", f"{eta:.1f}" if pd.notna(eta) and not np.isinf(eta) else "—")
-    with kpi_cols[3]:
-        st.metric("Due (weeks)", f"{due_weeks:.1f}" if pd.notna(due_weeks) else "—")
-    with kpi_cols[4]:
-        st.metric("Status", status)
-
-    st.divider()
-
-    # Chart 1: Shape vs Reality
-    st.subheader("Section 5 — Task Shape vs Reality")
-    if len(selected_task) > 0:
-        chart_df = selected_task[["task_name", "expected_task_hours", "actual_task_hours", "remaining_task_hours"]].copy()
-        chart_df = chart_df.fillna(0)
-
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=chart_df["task_name"],
-            y=chart_df["expected_task_hours"],
-            name="Benchmark Shape (Expected)",
-        ))
-        fig.add_trace(go.Bar(
-            x=chart_df["task_name"],
-            y=chart_df["actual_task_hours"],
-            name="Actuals",
-        ))
-        fig.add_trace(go.Bar(
-            x=chart_df["task_name"],
-            y=chart_df["remaining_task_hours"],
-            name="Forecast Remaining",
-        ))
-        fig.update_layout(
-            barmode="stack",
-            height=360,
-            xaxis_title="Task",
-            yaxis_title="Hours",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("No task-level forecast available for this job.")
-
-    st.divider()
-
-    # Chart 2: Bottleneck matrix
-    st.subheader("Section 6 — Bottleneck Matrix (Task → FTE)")
-    if len(selected_task) > 0:
-        bottleneck_rows = selected_task.copy()
-        bottleneck_rows["Est. Weeks"] = np.where(
-            bottleneck_rows["team_velocity_hours_week"] > 0,
-            bottleneck_rows["remaining_task_hours"] / bottleneck_rows["team_velocity_hours_week"],
-            np.inf,
-        )
-        bottleneck_rows["Action"] = np.where(
-            (bottleneck_rows["remaining_task_hours"] > 0) & (bottleneck_rows["team_velocity_hours_week"] == 0),
-            "⚠️ Add resource",
-            "Monitor",
-        )
-
-        # Recommendations
-        task_expertise = compute_task_expertise(df, config.PROFILE_TRAINING_MONTHS, config.RECENCY_HALF_LIFE_MONTHS)
-        category_expertise = compute_category_expertise(df, config.PROFILE_TRAINING_MONTHS, config.RECENCY_HALF_LIFE_MONTHS)
-        capacity_df = compute_staff_capacity(df_active, config.LOAD_TRAILING_WEEKS)
-        expected_df = compute_expected_load(df_active, config.LOAD_TRAILING_WEEKS, config.LOAD_TRAILING_WEEKS)
-        headroom_df = compute_headroom(capacity_df, expected_df)
-
-        gap_tasks = bottleneck_rows[
-            (bottleneck_rows["remaining_task_hours"] > 0) &
-            (bottleneck_rows["team_velocity_hours_week"] == 0)
-        ][["task_name", "remaining_task_hours"]]
-
-        rec_map = _recommend_staff_for_gaps(
-            gap_tasks,
-            task_expertise,
-            category_expertise,
-            headroom_df,
-            selected_meta["department_final"],
-            selected_meta["category_rev_job"],
-        )
-        bottleneck_rows["Recommendation"] = bottleneck_rows["task_name"].map(rec_map).fillna("—")
-
-        st.dataframe(
-            bottleneck_rows[[
-                "task_name",
-                "remaining_task_hours",
-                "team_velocity_hours_week",
-                "Est. Weeks",
-                "Action",
-                "Recommendation",
-            ]].rename(columns={
-                "task_name": "Task",
-                "remaining_task_hours": "Remaining Hrs",
-                "team_velocity_hours_week": "Velocity (hrs/wk)",
-            }),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Remaining Hrs": st.column_config.NumberColumn(format="%.1f"),
-                "Velocity (hrs/wk)": st.column_config.NumberColumn(format="%.1f"),
-                "Est. Weeks": st.column_config.NumberColumn(format="%.1f"),
-            },
-        )
-    else:
-        st.info("No bottlenecks detected (or no task data).")
+            st.error(f"Unknown level: {level}")
+    
+    except Exception as e:
+        st.error(f"Rendering error at level {level}: {e}")
+        import traceback
+        st.write(traceback.format_exc())
 
 
 if __name__ == "__main__":
