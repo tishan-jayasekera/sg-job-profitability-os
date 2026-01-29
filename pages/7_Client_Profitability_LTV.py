@@ -95,20 +95,16 @@ def main():
         "Time Window",
         options=["6m", "12m", "24m", "all"],
         format_func=lambda x: f"Last {x}" if x != "all" else "All Time",
-        key="filter_time_window",
+        key="time_window",
         on_change=_reset_client_selection,
     )
-    set_state("time_window", time_window)
     job_state_options = ["All", "Active", "Completed"]
-    current_state = get_state("job_state_filter") if get_state("job_state_filter") in job_state_options else "All"
     selected_state = st.sidebar.selectbox(
         "Job State",
         options=job_state_options,
-        index=job_state_options.index(current_state),
-        key="filter_job_state",
+        key="job_state_filter",
         on_change=_reset_client_selection,
     )
-    set_state("job_state_filter", selected_state)
 
     df_window = filter_by_time_window(df_all, time_window, date_col="month_key")
     if selected_state in ["Active", "Completed"]:
@@ -126,7 +122,12 @@ def main():
     render_client_portfolio_health(summary)
 
     # SECTION 2 — Portfolio Quadrant Scatter
-    y_axis_label = st.radio("Y-axis", ["Absolute Profit", "Margin %"], horizontal=True)
+    y_axis_label = st.radio(
+        "Y-axis",
+        ["Absolute Profit", "Margin %"],
+        horizontal=True,
+        key="client_quadrant_y_axis",
+    )
     y_mode = "margin_pct" if y_axis_label == "Margin %" else "profit"
     quadrant_df, median_x, median_y = compute_client_quadrants(df_window, y_mode=y_mode)
     quote_rollup = safe_quote_rollup(df_window, ["client"])
@@ -153,9 +154,6 @@ def main():
     selected_quadrant = st.selectbox(
         "Focus Quadrant",
         options=quadrant_options,
-        index=quadrant_options.index(get_state("selected_client_quadrant"))
-        if get_state("selected_client_quadrant") in quadrant_options
-        else 0,
         key="selected_client_quadrant",
     )
 
@@ -164,9 +162,6 @@ def main():
     selected_mode = st.radio(
         "Queue Mode",
         options=mode_options,
-        index=mode_options.index(get_state("client_queue_mode"))
-        if get_state("client_queue_mode") in mode_options
-        else 0,
         key="client_queue_mode",
         horizontal=True,
     )
@@ -214,39 +209,112 @@ def main():
     df_client_window = df_window[df_window["client"].isin(selected_clients)].copy()
 
     # Canonical drill chain filters
+    chain_key_map = {
+        "job": "client_job_filter",
+        "dept": "client_department_filter",
+        "category": "client_category_filter",
+        "task": "client_task_filter",
+        "staff": "client_staff_filter",
+    }
+    for key in chain_key_map.values():
+        if key not in st.session_state:
+            st.session_state[key] = "All"
+
+    def _reset_chain_from(level: str):
+        order = ["job", "dept", "category", "task", "staff"]
+        if level not in order:
+            return
+        start = order.index(level) + 1
+        for downstream in order[start:]:
+            st.session_state[chain_key_map[downstream]] = "All"
+
     chain_cols = st.columns(5)
     with chain_cols[0]:
         job_options = ["All"] + sorted(df_client_window["job_no"].dropna().unique().tolist())
-        selected_job = st.selectbox("Job", job_options)
+        if st.session_state[chain_key_map["job"]] not in job_options:
+            st.session_state[chain_key_map["job"]] = "All"
+        selected_job = st.selectbox(
+            "Job",
+            job_options,
+            key=chain_key_map["job"],
+            on_change=_reset_chain_from,
+            args=("job",),
+        )
     if selected_job != "All":
         df_client_window = df_client_window[df_client_window["job_no"] == selected_job]
 
     with chain_cols[1]:
         dept_options = ["All"] + sorted(df_client_window["department_final"].dropna().unique().tolist())
-        selected_dept = st.selectbox("Department", dept_options)
+        if st.session_state[chain_key_map["dept"]] not in dept_options:
+            st.session_state[chain_key_map["dept"]] = "All"
+        selected_dept = st.selectbox(
+            "Department",
+            dept_options,
+            key=chain_key_map["dept"],
+            on_change=_reset_chain_from,
+            args=("dept",),
+        )
     if selected_dept != "All":
         df_client_window = df_client_window[df_client_window["department_final"] == selected_dept]
 
     category_col = get_category_col(df_client_window)
     with chain_cols[2]:
         category_options = ["All"] + sorted(df_client_window[category_col].dropna().unique().tolist())
-        selected_category = st.selectbox("Job Category", category_options)
+        if st.session_state[chain_key_map["category"]] not in category_options:
+            st.session_state[chain_key_map["category"]] = "All"
+        selected_category = st.selectbox(
+            "Job Category",
+            category_options,
+            key=chain_key_map["category"],
+            on_change=_reset_chain_from,
+            args=("category",),
+        )
     if selected_category != "All":
         df_client_window = df_client_window[df_client_window[category_col] == selected_category]
 
     with chain_cols[3]:
         task_options = ["All"] + sorted(df_client_window["task_name"].dropna().unique().tolist())
-        selected_task = st.selectbox("Task", task_options)
+        if st.session_state[chain_key_map["task"]] not in task_options:
+            st.session_state[chain_key_map["task"]] = "All"
+        selected_task = st.selectbox(
+            "Task",
+            task_options,
+            key=chain_key_map["task"],
+            on_change=_reset_chain_from,
+            args=("task",),
+        )
     if selected_task != "All":
         df_client_window = df_client_window[df_client_window["task_name"] == selected_task]
 
     with chain_cols[4]:
         staff_options = ["All"] + sorted(df_client_window["staff_name"].dropna().unique().tolist())
-        selected_staff = st.selectbox("FTE", staff_options)
+        if st.session_state[chain_key_map["staff"]] not in staff_options:
+            st.session_state[chain_key_map["staff"]] = "All"
+        selected_staff = st.selectbox(
+            "FTE",
+            staff_options,
+            key=chain_key_map["staff"],
+        )
     if selected_staff != "All":
         df_client_window = df_client_window[df_client_window["staff_name"] == selected_staff]
 
     client_rollup = profitability_rollup(df_client_window)
+    quote_rollup = safe_quote_rollup(df_client_window, [])
+    quoted_revenue = np.nan
+    quoted_hours = np.nan
+    quoted_cost = np.nan
+    quoted_margin_pct = np.nan
+    if len(quote_rollup) > 0:
+        quoted_revenue = quote_rollup["quoted_amount"].iloc[0]
+        quoted_hours = quote_rollup["quoted_hours"].iloc[0]
+        total_hours = df_client_window["hours_raw"].sum()
+        total_cost = df_client_window["base_cost"].sum()
+        cost_rate = total_cost / total_hours if total_hours > 0 else np.nan
+        if pd.notna(quoted_hours) and pd.notna(cost_rate):
+            quoted_cost = quoted_hours * cost_rate
+        if pd.notna(quoted_revenue) and quoted_revenue > 0 and pd.notna(quoted_cost):
+            quoted_margin_pct = (quoted_revenue - quoted_cost) / quoted_revenue * 100
+
     if len(client_rollup) > 0:
         client_rollup = client_rollup.iloc[0]
         jobs_count = df_client_window["job_no"].nunique()
@@ -256,10 +324,24 @@ def main():
             "Margin %": client_rollup["margin_pct"],
             "Realised Rate": client_rollup["realised_rate"],
             "Jobs": jobs_count,
+            "Quoted Revenue": quoted_revenue,
+            "Quoted Cost": quoted_cost,
+            "Quoted Margin %": quoted_margin_pct,
+            "Quoted Hours": quoted_hours,
         }
         grade = _health_grade(client_rollup["margin_pct"], client_rollup["margin"])
     else:
-        metrics = {"Revenue": 0, "Profit": 0, "Margin %": np.nan, "Realised Rate": np.nan, "Jobs": 0}
+        metrics = {
+            "Revenue": 0,
+            "Profit": 0,
+            "Margin %": np.nan,
+            "Realised Rate": np.nan,
+            "Jobs": 0,
+            "Quoted Revenue": quoted_revenue,
+            "Quoted Cost": quoted_cost,
+            "Quoted Margin %": quoted_margin_pct,
+            "Quoted Hours": quoted_hours,
+        }
         grade = "Unknown"
 
     ledger = compute_client_job_ledger(df_client_window)

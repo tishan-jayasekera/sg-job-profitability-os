@@ -288,6 +288,10 @@ def render_client_deep_dive(client_name: str, metrics: Dict[str, float], grade: 
         "Margin %": "percent",
         "Realised Rate": "rate",
         "Jobs": "count",
+        "Quoted Revenue": "currency",
+        "Quoted Cost": "currency",
+        "Quoted Margin %": "percent",
+        "Quoted Hours": "hours",
         "Health Grade": "text",
     }
     kpi_strip(metrics, format_map=format_map)
@@ -305,6 +309,9 @@ def render_client_deep_dive(client_name: str, metrics: Dict[str, float], grade: 
                 "cost": "Cost",
                 "margin": "Margin",
                 "margin_pct": "Margin %",
+                "quoted_amount": "Quoted Revenue",
+                "quoted_cost": "Quoted Cost",
+                "quoted_margin_pct": "Quoted Margin %",
                 "realised_rate": "Realised Rate",
             }),
             use_container_width=True,
@@ -315,6 +322,9 @@ def render_client_deep_dive(client_name: str, metrics: Dict[str, float], grade: 
                 "Cost": st.column_config.NumberColumn(format="$%.0f"),
                 "Margin": st.column_config.NumberColumn(format="$%.0f"),
                 "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+                "Quoted Revenue": st.column_config.NumberColumn(format="$%.0f"),
+                "Quoted Cost": st.column_config.NumberColumn(format="$%.0f"),
+                "Quoted Margin %": st.column_config.NumberColumn(format="%.1f%%"),
                 "Realised Rate": st.column_config.NumberColumn(format="$%.0f"),
             },
         )
@@ -328,9 +338,33 @@ def render_client_driver_forensics(task_table: pd.DataFrame, staffing_table: pd.
                                    task_benchmark_fig=None, delivery_burn_fig=None,
                                    erosion_table: Optional[pd.DataFrame] = None):
     st.subheader("Section 5 — Driver Forensics")
+    summary_lines = []
+    if task_table is not None and len(task_table) > 0:
+        top_task = task_table.iloc[0]
+        summary_lines.append(
+            f"Task mix skew: {top_task.get('task_name', 'Top task')} is +{top_task.get('delta_pp', 0):.1f}pp vs global median."
+        )
+    if senior_flag:
+        summary_lines.append("Staffing mix: blended cost rate is >20% above company average.")
+    if erosion_table is not None and len(erosion_table) > 0:
+        worst_margin = pd.to_numeric(erosion_table.get("Margin %", pd.Series(dtype=float)), errors="coerce").min()
+        worst_overrun = pd.to_numeric(erosion_table.get("Hours Overrun %", pd.Series(dtype=float)), errors="coerce").max()
+        erosion_note = f"Erosion watchlist: {len(erosion_table)} jobs below 10% margin or >10% hours overrun."
+        if pd.notna(worst_margin):
+            erosion_note += f" Worst margin: {worst_margin:.1f}%."
+        if pd.notna(worst_overrun):
+            erosion_note += f" Worst overrun: {worst_overrun:.1f}%."
+        summary_lines.append(erosion_note)
+
+    if summary_lines:
+        st.markdown("**Signal Summary**")
+        st.markdown("\n".join([f"- {line}" for line in summary_lines]))
+    else:
+        st.info("No material driver anomalies detected for this slice.")
+
     tabs = st.tabs(["Delivery Drivers", "Staffing Mix"])
     with tabs[0]:
-        st.markdown("Tasks where this client spends disproportionately more time than the global median.")
+        st.markdown("Task mix deltas, burn-rate vs quote, and job-level erosion flags for this client slice.")
         if task_benchmark_fig is not None:
             st.plotly_chart(task_benchmark_fig, use_container_width=True)
         if task_time_fig is not None:
@@ -375,8 +409,9 @@ def render_client_driver_forensics(task_table: pd.DataFrame, staffing_table: pd.
         if staff_cost_time_fig is not None:
             st.plotly_chart(staff_cost_time_fig, use_container_width=True)
         if len(staffing_table) == 0:
-            st.info("No staffing mix data available.")
+            st.info("No staffing mix data available for this slice.")
         else:
+            st.markdown("Top contributors by hours and cost rate (use to validate staffing mix).")
             st.dataframe(
                 staffing_table.rename(columns={
                     "staff_name": "Staff",

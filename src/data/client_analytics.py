@@ -8,7 +8,7 @@ import numpy as np
 import streamlit as st
 from typing import Optional, Dict, Tuple
 
-from src.data.semantic import profitability_rollup, quote_delivery_metrics, get_category_col
+from src.data.semantic import profitability_rollup, quote_delivery_metrics, get_category_col, safe_quote_rollup
 
 
 def _as_datetime(df: pd.DataFrame, col: str) -> pd.Series:
@@ -214,10 +214,32 @@ def compute_client_job_ledger(df: pd.DataFrame) -> pd.DataFrame:
         revenue=("rev_alloc", "sum"),
     ).reset_index()
 
+    # Safe quote rollup at job level
+    quote = safe_quote_rollup(df, ["job_no"])
+    if len(quote) > 0:
+        ledger = ledger.merge(
+            quote[["job_no", "quoted_hours", "quoted_amount"]],
+            on="job_no",
+            how="left",
+        )
+    else:
+        ledger["quoted_hours"] = np.nan
+        ledger["quoted_amount"] = np.nan
+
     ledger["margin"] = ledger["revenue"] - ledger["cost"]
     ledger["margin_pct"] = np.where(
         ledger["revenue"] > 0,
         ledger["margin"] / ledger["revenue"] * 100,
+        np.nan,
+    )
+    ledger["quoted_cost"] = np.where(
+        ledger["hours"] > 0,
+        ledger["quoted_hours"] * (ledger["cost"] / ledger["hours"]),
+        np.nan,
+    )
+    ledger["quoted_margin_pct"] = np.where(
+        ledger["quoted_amount"] > 0,
+        (ledger["quoted_amount"] - ledger["quoted_cost"]) / ledger["quoted_amount"] * 100,
         np.nan,
     )
     ledger["realised_rate"] = np.where(

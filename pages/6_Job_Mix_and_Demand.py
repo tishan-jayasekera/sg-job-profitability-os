@@ -2103,240 +2103,6 @@ planned hours aren’t inflated.
                         },
                     )
 
-            # Profitability evolution (selected quadrant + chain filters)
-            if "rev_alloc" in df_window.columns and "base_cost" in df_window.columns:
-                profit_month = df_window.groupby(["month_key", "job_no"]).agg(
-                    revenue=("rev_alloc", "sum"),
-                    cost=("base_cost", "sum"),
-                    hours=("hours_raw", "sum"),
-                ).reset_index()
-                profit_month["margin"] = profit_month["revenue"] - profit_month["cost"]
-                profit_month["margin_pct"] = np.where(
-                    profit_month["revenue"] > 0,
-                    profit_month["margin"] / profit_month["revenue"] * 100,
-                    np.nan,
-                )
-                profit_month["realised_rate"] = np.where(
-                    profit_month["hours"] > 0,
-                    profit_month["revenue"] / profit_month["hours"],
-                    np.nan,
-                )
-
-                prof_jobs = set(quadrant_jobs["job_no"].unique().tolist())
-                prof_slice = profit_month[profit_month["job_no"].isin(prof_jobs)]
-                if len(prof_slice) > 0:
-                    trend = prof_slice.groupby("month_key").agg(
-                        revenue=("revenue", "sum"),
-                        cost=("cost", "sum"),
-                        hours=("hours", "sum"),
-                    ).reset_index()
-                    trend["margin"] = trend["revenue"] - trend["cost"]
-                    trend["margin_pct"] = np.where(
-                        trend["revenue"] > 0,
-                        trend["margin"] / trend["revenue"] * 100,
-                        np.nan,
-                    )
-                    trend["realised_rate"] = np.where(
-                        trend["hours"] > 0,
-                        trend["revenue"] / trend["hours"],
-                        np.nan,
-                    )
-
-                    trend = trend.sort_values("month_key")
-                    st.markdown(
-                        """
-                        <div class="profit-frame">
-                            <h4>Profitability Storyboard — Selected Quadrant</h4>
-                            <p>Track value capture over time, isolate margin drift, and identify where delivery economics are breaking.</p>
-                        </div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-                    control_cols = st.columns([1.2, 1.1, 1.1, 1.4])
-                    with control_cols[0]:
-                        focus_metric = st.selectbox(
-                            "Focus metric",
-                            ["Margin %", "Realised Rate", "Revenue", "Cost", "Margin $"],
-                        )
-                    with control_cols[1]:
-                        smoothing = st.selectbox("Smoothing", ["None", "3-month MA"])
-                    with control_cols[2]:
-                        view_mode = st.selectbox("View mode", ["Executive", "Diagnostic"])
-                    with control_cols[3]:
-                        risk_floor = st.slider("Margin risk floor (%)", -20, 40, 15, step=5)
-
-                    trend_plot = trend.copy()
-                    if smoothing == "3-month MA":
-                        trend_plot["margin_pct"] = trend_plot["margin_pct"].rolling(3, min_periods=1).mean()
-                        trend_plot["realised_rate"] = trend_plot["realised_rate"].rolling(3, min_periods=1).mean()
-                        trend_plot["revenue"] = trend_plot["revenue"].rolling(3, min_periods=1).mean()
-                        trend_plot["cost"] = trend_plot["cost"].rolling(3, min_periods=1).mean()
-                        trend_plot["margin"] = trend_plot["margin"].rolling(3, min_periods=1).mean()
-
-                    latest = trend_plot.tail(1).iloc[0]
-                    prev = trend_plot.tail(2).head(1).iloc[0] if len(trend_plot) > 1 else latest
-
-                    metric_cols = st.columns(4)
-                    metric_cols[0].metric(
-                        "Latest Margin %",
-                        fmt_percent(latest["margin_pct"]) if pd.notna(latest["margin_pct"]) else "—",
-                        delta=fmt_percent(latest["margin_pct"] - prev["margin_pct"]) if pd.notna(prev["margin_pct"]) else None,
-                    )
-                    metric_cols[1].metric(
-                        "Latest Realised Rate",
-                        fmt_currency(latest["realised_rate"]) if pd.notna(latest["realised_rate"]) else "—",
-                        delta=fmt_currency(latest["realised_rate"] - prev["realised_rate"]) if pd.notna(prev["realised_rate"]) else None,
-                    )
-                    metric_cols[2].metric(
-                        "Revenue (Latest)",
-                        fmt_currency(latest["revenue"]) if pd.notna(latest["revenue"]) else "—",
-                        delta=fmt_currency(latest["revenue"] - prev["revenue"]) if pd.notna(prev["revenue"]) else None,
-                    )
-                    metric_cols[3].metric(
-                        "Margin $ (Latest)",
-                        fmt_currency(latest["margin"]) if pd.notna(latest["margin"]) else "—",
-                        delta=fmt_currency(latest["margin"] - prev["margin"]) if pd.notna(prev["margin"]) else None,
-                    )
-
-                    risk_share = None
-                    risk_jobs = None
-                    band_mix = None
-                    job_margin = None
-
-                    latest_month = trend_plot["month_key"].max()
-                    latest_jobs = prof_slice[prof_slice["month_key"] == latest_month].copy()
-                    if len(latest_jobs) > 0:
-                        job_margin = latest_jobs.groupby("job_no").agg(
-                            revenue=("revenue", "sum"),
-                            cost=("cost", "sum"),
-                        ).reset_index()
-                        job_margin["margin_pct"] = np.where(
-                            job_margin["revenue"] > 0,
-                            (job_margin["revenue"] - job_margin["cost"]) / job_margin["revenue"] * 100,
-                            np.nan,
-                        )
-                        bands = [-np.inf, 0, 10, 20, 35, np.inf]
-                        labels = ["<0%", "0-10%", "10-20%", "20-35%", ">35%"]
-                        job_margin["band"] = pd.cut(job_margin["margin_pct"], bins=bands, labels=labels)
-                        band_mix = job_margin["band"].value_counts().reindex(labels, fill_value=0).reset_index()
-                        band_mix.columns = ["band", "jobs"]
-                        band_mix["share"] = np.where(
-                            band_mix["jobs"].sum() > 0,
-                            band_mix["jobs"] / band_mix["jobs"].sum() * 100,
-                            0,
-                        )
-                        risk_jobs = int((job_margin["margin_pct"] < risk_floor).sum())
-                        risk_share = (
-                            risk_jobs / len(job_margin) * 100
-                            if len(job_margin) > 0
-                            else None
-                        )
-
-                    risk_share_label = f"{risk_share:.1f}% of jobs" if risk_share is not None else "n/a"
-                    risk_jobs_label = f"{risk_jobs} jobs" if risk_jobs is not None else "n/a"
-
-                    st.markdown(
-                        "<div class='signal-row'>"
-                        f"<div class='signal-card'><small>Focus</small><strong>{focus_metric}</strong></div>"
-                        f"<div class='signal-card'><small>Trend window</small><strong>{len(trend_plot)} months</strong></div>"
-                        f"<div class='signal-card'><small>Below risk floor</small><strong>{risk_share_label}</strong></div>"
-                        f"<div class='signal-card'><small>At-risk count</small><strong>{risk_jobs_label}</strong></div>"
-                        "</div>",
-                        unsafe_allow_html=True,
-                    )
-
-                    st.markdown("#### 1) Profitability Trend")
-                    fig = go.Figure()
-                    if focus_metric in ["Margin %", "Realised Rate", "Revenue", "Cost", "Margin $"]:
-                        fig.add_trace(
-                            go.Scatter(
-                                x=trend_plot["month_key"],
-                                y=trend_plot["margin_pct"],
-                                name="Margin %",
-                                mode="lines+markers",
-                                line=dict(color="#54a24b", width=3 if focus_metric == "Margin %" else 1.5),
-                            )
-                        )
-                        fig.add_trace(
-                            go.Scatter(
-                                x=trend_plot["month_key"],
-                                y=trend_plot["realised_rate"],
-                                name="Realised Rate",
-                                mode="lines+markers",
-                                yaxis="y2",
-                                line=dict(color="#4c78a8", width=3 if focus_metric == "Realised Rate" else 1.5),
-                            )
-                        )
-
-                    fig.update_layout(
-                        yaxis=dict(title="Margin %"),
-                        yaxis2=dict(title="Realised Rate", overlaying="y", side="right"),
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                        title="Margin % and Realised Rate Over Time",
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-
-                    if band_mix is not None:
-                        st.markdown("#### 2) Margin Band Mix (Latest Month)")
-                        band_fig = go.Figure()
-                        band_fig.add_trace(
-                            go.Bar(
-                                x=band_mix["band"],
-                                y=band_mix["share"],
-                                marker_color="#f58518",
-                            )
-                        )
-                        band_fig.update_layout(
-                            yaxis=dict(title="% of Jobs"),
-                            xaxis=dict(title="Margin Band"),
-                            title="Job Mix by Margin Band",
-                        )
-                        st.plotly_chart(band_fig, use_container_width=True)
-
-                    st.markdown("#### 3) Detail Table")
-                    with st.expander("Show profitability ledger", expanded=view_mode == "Diagnostic"):
-                        st.dataframe(
-                            trend.rename(columns={
-                                "month_key": "Month",
-                                "revenue": "Revenue",
-                                "cost": "Cost",
-                                "margin": "Margin",
-                                "margin_pct": "Margin %",
-                                "realised_rate": "Realised Rate",
-                            }),
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "Month": st.column_config.DateColumn(format="YYYY-MM"),
-                                "Revenue": st.column_config.NumberColumn(format="$%.0f"),
-                                "Cost": st.column_config.NumberColumn(format="$%.0f"),
-                                "Margin": st.column_config.NumberColumn(format="$%.0f"),
-                                "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
-                                "Realised Rate": st.column_config.NumberColumn(format="$%.0f"),
-                            },
-                        )
-                        if job_margin is not None:
-                            st.markdown("**At-risk jobs (latest month)**")
-                            st.dataframe(
-                                job_margin[job_margin["margin_pct"] < risk_floor]
-                                .sort_values("margin_pct", ascending=True)
-                                .head(10)
-                                .rename(columns={
-                                    "job_no": "Job",
-                                    "revenue": "Revenue",
-                                    "cost": "Cost",
-                                    "margin_pct": "Margin %",
-                                }),
-                                use_container_width=True,
-                                hide_index=True,
-                                column_config={
-                                    "Revenue": st.column_config.NumberColumn(format="$%.0f"),
-                                    "Cost": st.column_config.NumberColumn(format="$%.0f"),
-                                    "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
-                                },
-                            )
-
             st.info(
                 """
 Operational signals:
@@ -2499,25 +2265,32 @@ Do we have true spare capacity, or are we fully loaded once we account for how p
 Capacity must reconcile across teams. If a person splits time across multiple areas, we split their capacity
 the same way — so totals add up cleanly and no one is double‑counted.
 
+**Turnover and staffing changes**  
+This method naturally reflects turnover because it only counts people who actually logged time in the month.  
+If someone leaves or joins mid‑period, their capacity is included only for the time they were active.
+
 **How we build supply (capacity)**  
-1) **Start with real activity**: only staff who logged time in the month are counted.  
-2) **Compute effective FTE**:  
-   - If `fte_hours_scaling` exists, use a hours‑weighted average for that staff‑month.  
-   - If it doesn’t, assume 1.0.  
-3) **Convert to monthly capacity**: 38 hours/week × 4.33 weeks × effective FTE.  
-4) **Allocate capacity across slices**: split a person’s capacity in proportion to their timesheet hours.
+1) We start with people who actually logged time in that month.  
+2) We treat each person’s available time as a “standard working month,” adjusted if their role is part‑time.  
+3) We then split that available time across teams based on where they actually spent their hours.
 
 **How we measure demand**  
-- **Actual Hours**: total hours delivered in the month.  
-- **Billable vs Non‑Billable**: split using the `is_billable` flag.
+- We total the hours delivered in that month.  
+- We separate those hours into billable and non‑billable so you can see the mix.
 
 **How to read the output**  
-- **Utilisation (Total)** = (Billable + Non‑Billable Hours) ÷ Capacity Hours.  
-- **Billable Utilisation** = Billable Hours ÷ Capacity Hours.  
-- **Slack Hours** = Capacity Hours − Actual Hours.  
-- **Slack %** = 100% − Utilisation (Total).  
+- **Utilisation (Total)** shows how much of the available time was used.  
+- **Billable Utilisation** shows how much of the available time went to billable work.  
+- **Slack Hours** show unused time.  
 
-This produces an apples‑to‑apples view of capacity vs delivery that reconciles at the company total.
+**Plain‑English example**  
+Two people worked this month. Ava is full‑time and Ben is half‑time.  
+Together they have about 1.5 “people‑months” of capacity.  
+If Ava spent 70% of her time in Department A and 30% in Department B, we split her available time the same way.  
+Ben spent all his time in Department B, so all of his capacity goes there.  
+Now when we compare capacity to actual hours in each department, the totals still add up and no one is counted twice.
+
+This gives a fair, plain‑English view of whether we have spare capacity or are overloaded, without double‑counting people who work across teams.
                 """
             )
 
@@ -2722,6 +2495,107 @@ This produces an apples‑to‑apples view of capacity vs delivery that reconcil
             "`fte_hours_scaling` when available (otherwise assuming 1.0). "
             "This avoids double counting and makes hotspots comparable across levels."
         )
+        if "department_final" in drill_df.columns and "staff_name" in drill_df.columns:
+            dept_options = sorted(drill_df["department_final"].dropna().unique().tolist())
+            if dept_options:
+                default_dept = selections.get("department_final") if "selections" in locals() else None
+                if default_dept not in dept_options:
+                    default_dept = dept_options[0]
+                focus_dept = st.selectbox(
+                    "Department capacity composition (reconciled)",
+                    options=dept_options,
+                    index=dept_options.index(default_dept),
+                    key="dept_capacity_composition",
+                )
+                dept_df = drill_df[drill_df["department_final"] == focus_dept].copy()
+                base_staff_df = df_base_window if df_base_window is not None else drill_df
+                if "staff_name" in base_staff_df.columns and "hours_raw" in base_staff_df.columns:
+                    staff_total_hours = base_staff_df.groupby("staff_name")["hours_raw"].sum().rename("staff_total_hours")
+                    dept_hours = dept_df.groupby("staff_name")["hours_raw"].sum().rename("dept_hours")
+                    composition = pd.concat([dept_hours, staff_total_hours], axis=1).reset_index()
+                    composition["dept_share_of_staff_time"] = np.where(
+                        composition["staff_total_hours"] > 0,
+                        composition["dept_hours"] / composition["staff_total_hours"] * 100,
+                        np.nan,
+                    )
+
+                    if "fte_hours_scaling" in base_staff_df.columns and "month_key" in base_staff_df.columns:
+                        base_for_capacity = base_staff_df.copy()
+                        base_for_capacity["month_key"] = pd.to_datetime(base_for_capacity["month_key"], errors="coerce")
+                        base_for_capacity["fte_hours_scaling"] = base_for_capacity["fte_hours_scaling"].fillna(1.0)
+                        base_for_capacity["weighted_fte"] = base_for_capacity["hours_raw"] * base_for_capacity["fte_hours_scaling"]
+                        staff_month = base_for_capacity.groupby(["staff_name", "month_key"]).agg(
+                            hours=("hours_raw", "sum"),
+                            weighted_fte=("weighted_fte", "sum"),
+                        ).reset_index()
+                        staff_month["effective_fte"] = np.where(
+                            staff_month["hours"] > 0,
+                            staff_month["weighted_fte"] / staff_month["hours"],
+                            1.0,
+                        )
+                        staff_month["capacity_hours"] = staff_month["effective_fte"] * 4.33 * config.CAPACITY_HOURS_PER_WEEK
+                        staff_capacity = staff_month.groupby("staff_name")["capacity_hours"].sum().rename("staff_capacity_hours")
+                        composition = composition.merge(staff_capacity.reset_index(), on="staff_name", how="left")
+                    else:
+                        composition["staff_capacity_hours"] = np.nan
+
+                    composition["dept_capacity_hours"] = np.where(
+                        composition["staff_total_hours"] > 0,
+                        composition["staff_capacity_hours"] * (composition["dept_hours"] / composition["staff_total_hours"]),
+                        np.nan,
+                    )
+                    composition["dept_capacity_share"] = np.where(
+                        composition["dept_capacity_hours"].sum() > 0,
+                        composition["dept_capacity_hours"] / composition["dept_capacity_hours"].sum() * 100,
+                        np.nan,
+                    )
+                    composition = composition.sort_values("dept_capacity_hours", ascending=False)
+
+                    st.markdown("**Department Capacity Composition (Effective)**")
+                    comp_fig = go.Figure()
+                    comp_fig.add_trace(
+                        go.Bar(
+                            x=composition.head(12)["staff_name"],
+                            y=composition.head(12)["dept_capacity_hours"],
+                            marker_color="#54a24b",
+                            name="Allocated Capacity Hours",
+                        )
+                    )
+                    comp_fig.update_layout(
+                        title=f"Who Makes Up {focus_dept} (Capacity-Weighted)",
+                        xaxis=dict(title="Staff"),
+                        yaxis=dict(title="Allocated Capacity Hours"),
+                    )
+                    st.plotly_chart(comp_fig, use_container_width=True)
+
+                    st.dataframe(
+                        composition.rename(columns={
+                            "staff_name": "Staff",
+                            "dept_hours": "Dept Hours",
+                            "staff_total_hours": "Total Hours (All Depts)",
+                            "dept_share_of_staff_time": "Share of Staff Time in Dept",
+                            "dept_capacity_hours": "Allocated Capacity Hours",
+                            "dept_capacity_share": "Share of Dept Capacity",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Dept Hours": st.column_config.NumberColumn(format="%.1f"),
+                            "Total Hours (All Depts)": st.column_config.NumberColumn(format="%.1f"),
+                            "Share of Staff Time in Dept": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Allocated Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                            "Share of Dept Capacity": st.column_config.NumberColumn(format="%.1f%%"),
+                        },
+                    )
+
+                    st.info(
+                        "Decision lens: prioritize capacity actions based on dedication. "
+                        "If most slack comes from people with low % time in the department, treat it as shared capacity "
+                        "and validate availability before committing. If slack is concentrated in highly dedicated staff, "
+                        "you can redeploy or reprice work more confidently. A department with heavy reliance on shared staff "
+                        "may need formal allocation or cross‑unit planning to prevent silent overload elsewhere."
+                    )
+
         hotspot_levels = [
             ("department_final", "Department"),
             (category_col, "Category"),
@@ -2741,19 +2615,26 @@ This produces an apples‑to‑apples view of capacity vs delivery that reconcil
 Where is real spare capacity once we account for how people actually spent their time?
 
 **Why this method is fair**  
-We anchor capacity to real timesheets and then split it across the same slices of work.  
-That way, people who work across areas aren’t counted twice.
+We anchor capacity to real timesheets and split it across the same slices of work.  
+This means a person’s available time is only counted once, then shared across teams in the same proportions as their actual work.
 
 **How we calculate slack (in four steps)**  
 1) **Estimate effective FTE per staff‑month**  
-   - Use hours‑weighted `fte_hours_scaling` when available; otherwise assume 1.0.  
-2) **Convert FTE to monthly capacity**  
-   - 38 hours/week × 4.33 weeks × effective FTE.  
-3) **Allocate capacity to the slice**  
-   - Based on each slice’s share of that person’s hours.  
+   - If we have a part‑time scaling factor, we use a weighted average for that month.  
+   - If not, we assume full‑time.  
+2) **Convert FTE to a monthly capacity baseline**  
+   - We use a standard working month (38 hours/week × 4.33 weeks) and scale it by effective FTE.  
+3) **Allocate capacity to each slice**  
+   - We split each person’s capacity across departments/categories in the same share as their hours.  
 4) **Compute slack**  
    - Slack = allocated capacity − actual hours.  
    - Slack % = 100% − utilisation.  
+
+**Defensibility check**  
+- Capacity allocation always reconciles back to the company total.  
+- People who work across areas are not double‑counted.  
+- The method reflects how work actually happened, not a static org chart.
+ - Turnover is handled by using actual monthly activity, not a fixed headcount list.
 
 **Interpretation**  
 High slack means unutilised capacity; negative slack indicates overload.

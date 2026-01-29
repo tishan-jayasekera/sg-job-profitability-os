@@ -200,3 +200,8 @@ pytest -v tests/
 ## License
 
 Proprietary - SG Internal Use Only
+
+
+#Complete jobs view
+#pg.1 value freq dist
+#client analysis
