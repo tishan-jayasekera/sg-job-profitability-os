@@ -205,19 +205,49 @@ def client_quadrant_scatter(
     if len(df) == 0:
         return apply_layout(go.Figure(), title=title)
 
+    df_plot = df.copy()
+    if "margin" in df_plot.columns:
+        df_plot["margin_sign"] = np.where(df_plot["margin"] >= 0, "Accretive", "Erosive")
+    else:
+        df_plot["margin_sign"] = "Accretive"
+
     fig = px.scatter(
-        df,
+        df_plot,
         x=x_col,
         y=y_col,
         size=size_col,
-        color=quadrant_col,
+        color="margin_sign",
+        symbol=quadrant_col,
         hover_name="client",
         hover_data=["revenue", "margin", "margin_pct", "hours", "realised_rate"],
         title=title,
+        color_discrete_map={
+            "Accretive": "#2ca02c",
+            "Erosive": "#d62728",
+        },
     )
 
     fig.add_vline(x=median_x, line_dash="dash", line_color=CHART_COLORS["neutral"])
     fig.add_hline(y=median_y, line_dash="dash", line_color=CHART_COLORS["neutral"])
+    fig.add_hline(y=0, line_dash="dot", line_color=CHART_COLORS["danger"])
+    fig.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=0.02,
+        y=0.98,
+        text="Margin Accretive",
+        showarrow=False,
+        font=dict(color="#2ca02c"),
+    )
+    fig.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=0.02,
+        y=0.02,
+        text="Margin Erosive",
+        showarrow=False,
+        font=dict(color="#d62728"),
+    )
     fig.update_layout(xaxis_title=x_title, yaxis_title=y_title, dragmode="select")
 
     return apply_layout(fig)
