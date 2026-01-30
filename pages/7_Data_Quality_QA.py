@@ -19,7 +19,7 @@ from src.data.loader import (
     load_audit_unallocated, get_data_status
 )
 from src.data.schema import validate_schema, get_column_info
-from src.data.semantic import get_category_col
+from src.data.semantic import get_category_col, safe_quote_rollup
 from src.config import config, REQUIRED_COLUMNS, OPTIONAL_COLUMNS
 
 
@@ -338,9 +338,105 @@ def main():
         st.info("Quote match data not available")
     
     st.markdown("---")
+
+    # =========================================================================
+    # SECTION F: QUOTED VS REALISED (COMPLETED JOBS)
+    # =========================================================================
+    section_header("Quoted vs Realised — Completed Jobs")
+
+    if "job_no" in df.columns and "rev_alloc" in df.columns:
+        job_cols = ["job_no"]
+        if "job_completed_date" in df.columns:
+            job_cols.append("job_completed_date")
+        if "job_status" in df.columns:
+            job_cols.append("job_status")
+        if "client" in df.columns:
+            job_cols.append("client")
+
+        job_meta = df[job_cols].drop_duplicates(subset=["job_no"])
+        completed_flag = pd.Series(False, index=job_meta.index)
+        if "job_completed_date" in job_meta.columns:
+            completed_flag = completed_flag | job_meta["job_completed_date"].notna()
+        if "job_status" in job_meta.columns:
+            completed_flag = completed_flag | job_meta["job_status"].str.contains("completed", case=False, na=False)
+        completed_jobs = job_meta.loc[completed_flag, "job_no"]
+
+        if len(completed_jobs) > 0:
+            job_rev = df.groupby("job_no").agg(
+                realised_revenue=("rev_alloc", "sum"),
+                hours=("hours_raw", "sum") if "hours_raw" in df.columns else ("rev_alloc", "count"),
+            ).reset_index()
+
+            quote = safe_quote_rollup(df, ["job_no"])
+            job_quote = quote[["job_no", "quoted_amount"]].copy() if len(quote) > 0 else pd.DataFrame({"job_no": [], "quoted_amount": []})
+
+            job_comp = job_rev.merge(job_quote, on="job_no", how="left")
+            job_comp = job_comp.merge(job_meta, on="job_no", how="left")
+            job_comp = job_comp[job_comp["job_no"].isin(completed_jobs)].copy()
+            job_comp["quoted_amount"] = job_comp["quoted_amount"].fillna(0)
+            job_comp["variance"] = job_comp["realised_revenue"] - job_comp["quoted_amount"]
+            job_comp["variance_pct"] = np.where(
+                job_comp["quoted_amount"] > 0,
+                job_comp["variance"] / job_comp["quoted_amount"] * 100,
+                np.nan,
+            )
+
+            threshold = st.slider("Variance threshold (%)", 5, 50, 15, step=5)
+            flagged = job_comp[
+                (job_comp["quoted_amount"] > 0)
+                & (job_comp["realised_revenue"] > 0)
+                & (job_comp["variance_pct"].abs() >= threshold)
+            ].copy()
+
+            kpi_cols = st.columns(4)
+            with kpi_cols[0]:
+                st.metric("Completed Jobs", fmt_count(job_comp["job_no"].nunique()))
+            with kpi_cols[1]:
+                st.metric("Quoted $ (Completed)", fmt_currency(job_comp["quoted_amount"].sum()))
+            with kpi_cols[2]:
+                st.metric("Realised $ (Completed)", fmt_currency(job_comp["realised_revenue"].sum()))
+            with kpi_cols[3]:
+                st.metric("Flagged Jobs", fmt_count(len(flagged)))
+
+            if len(flagged) > 0:
+                st.markdown("**Completed Jobs with Quote vs Realised Variance (All)**")
+                flagged_view = flagged.sort_values("variance_pct", ascending=True).rename(columns={
+                    "job_no": "Job",
+                    "client": "Client",
+                    "quoted_amount": "Quoted $",
+                    "realised_revenue": "Realised $",
+                    "variance": "Variance $",
+                    "variance_pct": "Variance %",
+                })
+                st.dataframe(
+                    flagged_view,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Quoted $": st.column_config.NumberColumn(format="$%.0f"),
+                        "Realised $": st.column_config.NumberColumn(format="$%.0f"),
+                        "Variance $": st.column_config.NumberColumn(format="$%.0f"),
+                        "Variance %": st.column_config.NumberColumn(format="%.1f%%"),
+                    },
+                )
+                csv = flagged_view.to_csv(index=False)
+                st.download_button(
+                    "Download full list (CSV)",
+                    data=csv,
+                    file_name="completed_jobs_quote_vs_realised.csv",
+                    mime="text/csv",
+                )
+            else:
+                st.success("✓ No completed jobs exceed the variance threshold.")
+        else:
+            st.info("No completed jobs found to compare.")
+    else:
+        st.info("Quoted vs realised comparison not available (missing job_no or rev_alloc).")
+
+    st.markdown("---")
     
     # =========================================================================
-    # SECTION F: ALLOCATION MODE DISTRIBUTION
+    # SECTION G: ALLOCATION MODE DISTRIBUTION
     # =========================================================================
     section_header("Allocation Mode Distribution")
     
@@ -369,7 +465,7 @@ def main():
     st.markdown("---")
     
     # =========================================================================
-    # SECTION G: DEPARTMENT PROVENANCE
+    # SECTION H: DEPARTMENT PROVENANCE
     # =========================================================================
     section_header("Department Source")
     
@@ -399,7 +495,7 @@ def main():
     st.markdown("---")
     
     # =========================================================================
-    # SECTION H: ANOMALIES
+    # SECTION I: ANOMALIES
     # =========================================================================
     section_header("Data Anomalies")
     

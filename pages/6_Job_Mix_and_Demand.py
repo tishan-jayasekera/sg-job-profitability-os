@@ -2495,107 +2495,6 @@ This gives a fair, plain‑English view of whether we have spare capacity or are
             "`fte_hours_scaling` when available (otherwise assuming 1.0). "
             "This avoids double counting and makes hotspots comparable across levels."
         )
-        if "department_final" in drill_df.columns and "staff_name" in drill_df.columns:
-            dept_options = sorted(drill_df["department_final"].dropna().unique().tolist())
-            if dept_options:
-                default_dept = selections.get("department_final") if "selections" in locals() else None
-                if default_dept not in dept_options:
-                    default_dept = dept_options[0]
-                focus_dept = st.selectbox(
-                    "Department capacity composition (reconciled)",
-                    options=dept_options,
-                    index=dept_options.index(default_dept),
-                    key="dept_capacity_composition",
-                )
-                dept_df = drill_df[drill_df["department_final"] == focus_dept].copy()
-                base_staff_df = df_base_window if df_base_window is not None else drill_df
-                if "staff_name" in base_staff_df.columns and "hours_raw" in base_staff_df.columns:
-                    staff_total_hours = base_staff_df.groupby("staff_name")["hours_raw"].sum().rename("staff_total_hours")
-                    dept_hours = dept_df.groupby("staff_name")["hours_raw"].sum().rename("dept_hours")
-                    composition = pd.concat([dept_hours, staff_total_hours], axis=1).reset_index()
-                    composition["dept_share_of_staff_time"] = np.where(
-                        composition["staff_total_hours"] > 0,
-                        composition["dept_hours"] / composition["staff_total_hours"] * 100,
-                        np.nan,
-                    )
-
-                    if "fte_hours_scaling" in base_staff_df.columns and "month_key" in base_staff_df.columns:
-                        base_for_capacity = base_staff_df.copy()
-                        base_for_capacity["month_key"] = pd.to_datetime(base_for_capacity["month_key"], errors="coerce")
-                        base_for_capacity["fte_hours_scaling"] = base_for_capacity["fte_hours_scaling"].fillna(1.0)
-                        base_for_capacity["weighted_fte"] = base_for_capacity["hours_raw"] * base_for_capacity["fte_hours_scaling"]
-                        staff_month = base_for_capacity.groupby(["staff_name", "month_key"]).agg(
-                            hours=("hours_raw", "sum"),
-                            weighted_fte=("weighted_fte", "sum"),
-                        ).reset_index()
-                        staff_month["effective_fte"] = np.where(
-                            staff_month["hours"] > 0,
-                            staff_month["weighted_fte"] / staff_month["hours"],
-                            1.0,
-                        )
-                        staff_month["capacity_hours"] = staff_month["effective_fte"] * 4.33 * config.CAPACITY_HOURS_PER_WEEK
-                        staff_capacity = staff_month.groupby("staff_name")["capacity_hours"].sum().rename("staff_capacity_hours")
-                        composition = composition.merge(staff_capacity.reset_index(), on="staff_name", how="left")
-                    else:
-                        composition["staff_capacity_hours"] = np.nan
-
-                    composition["dept_capacity_hours"] = np.where(
-                        composition["staff_total_hours"] > 0,
-                        composition["staff_capacity_hours"] * (composition["dept_hours"] / composition["staff_total_hours"]),
-                        np.nan,
-                    )
-                    composition["dept_capacity_share"] = np.where(
-                        composition["dept_capacity_hours"].sum() > 0,
-                        composition["dept_capacity_hours"] / composition["dept_capacity_hours"].sum() * 100,
-                        np.nan,
-                    )
-                    composition = composition.sort_values("dept_capacity_hours", ascending=False)
-
-                    st.markdown("**Department Capacity Composition (Effective)**")
-                    comp_fig = go.Figure()
-                    comp_fig.add_trace(
-                        go.Bar(
-                            x=composition.head(12)["staff_name"],
-                            y=composition.head(12)["dept_capacity_hours"],
-                            marker_color="#54a24b",
-                            name="Allocated Capacity Hours",
-                        )
-                    )
-                    comp_fig.update_layout(
-                        title=f"Who Makes Up {focus_dept} (Capacity-Weighted)",
-                        xaxis=dict(title="Staff"),
-                        yaxis=dict(title="Allocated Capacity Hours"),
-                    )
-                    st.plotly_chart(comp_fig, use_container_width=True)
-
-                    st.dataframe(
-                        composition.rename(columns={
-                            "staff_name": "Staff",
-                            "dept_hours": "Dept Hours",
-                            "staff_total_hours": "Total Hours (All Depts)",
-                            "dept_share_of_staff_time": "Share of Staff Time in Dept",
-                            "dept_capacity_hours": "Allocated Capacity Hours",
-                            "dept_capacity_share": "Share of Dept Capacity",
-                        }),
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            "Dept Hours": st.column_config.NumberColumn(format="%.1f"),
-                            "Total Hours (All Depts)": st.column_config.NumberColumn(format="%.1f"),
-                            "Share of Staff Time in Dept": st.column_config.NumberColumn(format="%.1f%%"),
-                            "Allocated Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
-                            "Share of Dept Capacity": st.column_config.NumberColumn(format="%.1f%%"),
-                        },
-                    )
-
-                    st.info(
-                        "Decision lens: prioritize capacity actions based on dedication. "
-                        "If most slack comes from people with low % time in the department, treat it as shared capacity "
-                        "and validate availability before committing. If slack is concentrated in highly dedicated staff, "
-                        "you can redeploy or reprice work more confidently. A department with heavy reliance on shared staff "
-                        "may need formal allocation or cross‑unit planning to prevent silent overload elsewhere."
-                    )
-
         hotspot_levels = [
             ("department_final", "Department"),
             (category_col, "Category"),
@@ -2812,6 +2711,368 @@ High slack means unutilised capacity; negative slack indicates overload.
             )
     else:
         st.caption("Need at least 6 months of data to compute the trend comparison.")
+    _section_end()
+
+    # =========================================================================
+    # SECTION G: DEPARTMENT CAPACITY COMPOSITION (RECONCILED)
+    # =========================================================================
+    _section_start("band-capacity-composition")
+    _section_intro(
+        "Department Capacity Composition (Reconciled)",
+        "Shows who really makes up each department and what work they actually do.",
+        "Use this to separate dedicated capacity from shared capacity before making resourcing decisions."
+    )
+    st.caption(
+        "This section uses the current drill selection. It allocates each person’s capacity across departments "
+        "based on where they actually spent time, so totals reconcile and shared staff aren’t double‑counted."
+    )
+
+    base_staff_df = df_base_window if df_base_window is not None else df_window
+    if "department_final" in drill_df.columns and "staff_name" in drill_df.columns:
+        staff_total_hours = base_staff_df.groupby("staff_name")["hours_raw"].sum().rename("staff_total_hours")
+        dept_staff_hours = drill_df.groupby(["department_final", "staff_name"])["hours_raw"].sum().reset_index()
+        dept_staff_hours = dept_staff_hours.rename(columns={"hours_raw": "dept_hours"})
+
+        staff_capacity = None
+        if "fte_hours_scaling" in base_staff_df.columns and "month_key" in base_staff_df.columns:
+            base_for_capacity = base_staff_df.copy()
+            base_for_capacity["month_key"] = pd.to_datetime(base_for_capacity["month_key"], errors="coerce")
+            base_for_capacity["fte_hours_scaling"] = base_for_capacity["fte_hours_scaling"].fillna(1.0)
+            base_for_capacity["weighted_fte"] = base_for_capacity["hours_raw"] * base_for_capacity["fte_hours_scaling"]
+            staff_month = base_for_capacity.groupby(["staff_name", "month_key"]).agg(
+                hours=("hours_raw", "sum"),
+                weighted_fte=("weighted_fte", "sum"),
+            ).reset_index()
+            staff_month["effective_fte"] = np.where(
+                staff_month["hours"] > 0,
+                staff_month["weighted_fte"] / staff_month["hours"],
+                1.0,
+            )
+            staff_month["capacity_hours"] = staff_month["effective_fte"] * 4.33 * config.CAPACITY_HOURS_PER_WEEK
+            staff_capacity = staff_month.groupby("staff_name")["capacity_hours"].sum().rename("staff_capacity_hours")
+
+        composition = dept_staff_hours.merge(staff_total_hours.reset_index(), on="staff_name", how="left")
+        if staff_capacity is not None:
+            composition = composition.merge(staff_capacity.reset_index(), on="staff_name", how="left")
+        else:
+            composition["staff_capacity_hours"] = np.nan
+
+        composition["dept_share_of_staff_time"] = np.where(
+            composition["staff_total_hours"] > 0,
+            composition["dept_hours"] / composition["staff_total_hours"] * 100,
+            np.nan,
+        )
+        composition["staff_capacity_hours"] = composition["staff_capacity_hours"].fillna(composition["staff_total_hours"])
+        composition["dept_capacity_hours"] = np.where(
+            composition["staff_total_hours"] > 0,
+            composition["staff_capacity_hours"] * (composition["dept_hours"] / composition["staff_total_hours"]),
+            np.nan,
+        )
+
+        composition["shared_flag"] = composition["dept_share_of_staff_time"] < 40
+        composition["dedicated_flag"] = composition["dept_share_of_staff_time"] >= 70
+
+        dept_summary = composition.groupby("department_final").agg(
+            dept_capacity_hours=("dept_capacity_hours", "sum"),
+            shared_capacity_hours=("dept_capacity_hours", lambda x: x[composition.loc[x.index, "shared_flag"]].sum()),
+            dedicated_capacity_hours=("dept_capacity_hours", lambda x: x[composition.loc[x.index, "dedicated_flag"]].sum()),
+        ).reset_index()
+
+        staff_counts = composition.groupby("department_final").agg(
+            contributing_staff=("staff_name", "nunique"),
+            dedicated_staff=("staff_name", lambda x: x[composition.loc[x.index, "dedicated_flag"]].nunique()),
+        ).reset_index()
+        dept_summary = dept_summary.merge(staff_counts, on="department_final", how="left")
+        dept_summary["shared_capacity_share"] = np.where(
+            dept_summary["dept_capacity_hours"] > 0,
+            dept_summary["shared_capacity_hours"] / dept_summary["dept_capacity_hours"] * 100,
+            np.nan,
+        )
+        dept_summary["dedicated_capacity_share"] = np.where(
+            dept_summary["dept_capacity_hours"] > 0,
+            dept_summary["dedicated_capacity_hours"] / dept_summary["dept_capacity_hours"] * 100,
+            np.nan,
+        )
+        dept_summary = dept_summary.sort_values("dept_capacity_hours", ascending=False)
+
+        st.markdown("**Department Mix at a Glance**")
+        st.dataframe(
+            dept_summary.rename(columns={
+                "department_final": "Department",
+                "dept_capacity_hours": "Dept Capacity Hours",
+                "shared_capacity_share": "Shared Capacity Share",
+                "dedicated_capacity_share": "Dedicated Capacity Share",
+                "contributing_staff": "Contributing Staff",
+                "dedicated_staff": "Dedicated Staff",
+            }),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Dept Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                "Shared Capacity Share": st.column_config.NumberColumn(format="%.1f%%"),
+                "Dedicated Capacity Share": st.column_config.NumberColumn(format="%.1f%%"),
+                "Contributing Staff": st.column_config.NumberColumn(format="%.0f"),
+                "Dedicated Staff": st.column_config.NumberColumn(format="%.0f"),
+            },
+        )
+
+        st.info(
+            "Decision lens: departments with high shared‑capacity share require cross‑unit coordination before redeploying people. "
+            "Departments with high dedicated‑capacity share can usually absorb new work or release capacity faster."
+        )
+
+        st.markdown("**Operational Detail by Department**")
+        top_departments = dept_summary["department_final"].head(6).tolist()
+        for dept_name in top_departments:
+            with st.expander(f"{dept_name} — composition and work footprint", expanded=False):
+                dept_comp = composition[composition["department_final"] == dept_name].copy()
+                dept_comp = dept_comp.sort_values("dept_capacity_hours", ascending=False).head(12)
+
+                st.markdown("**Effective Make‑Up (Capacity‑Weighted)**")
+                st.dataframe(
+                    dept_comp.rename(columns={
+                        "staff_name": "Staff",
+                        "dept_hours": "Dept Hours",
+                        "staff_total_hours": "Total Hours (All Depts)",
+                        "dept_share_of_staff_time": "Share of Staff Time in Dept",
+                        "dept_capacity_hours": "Allocated Capacity Hours",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Dept Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Total Hours (All Depts)": st.column_config.NumberColumn(format="%.1f"),
+                        "Share of Staff Time in Dept": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Allocated Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                    },
+                )
+
+                dept_df = drill_df[drill_df["department_final"] == dept_name].copy()
+                if len(dept_df) > 0:
+                    if "task_name" in dept_df.columns:
+                        task_roll = dept_df.groupby("task_name")["hours_raw"].sum().reset_index()
+                        task_roll = task_roll.sort_values("hours_raw", ascending=False).head(10)
+                        st.markdown("**Top Tasks Performed**")
+                        st.dataframe(
+                            task_roll.rename(columns={"task_name": "Task", "hours_raw": "Hours"}),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={"Hours": st.column_config.NumberColumn(format="%.1f")},
+                        )
+
+                    if category_col in dept_df.columns:
+                        cat_roll = dept_df.groupby(category_col)["hours_raw"].sum().reset_index()
+                        cat_roll["share"] = np.where(
+                            cat_roll["hours_raw"].sum() > 0,
+                            cat_roll["hours_raw"] / cat_roll["hours_raw"].sum() * 100,
+                            np.nan,
+                        )
+                        cat_roll = cat_roll.sort_values("hours_raw", ascending=False).head(8)
+                        st.markdown("**Job Categories Supported**")
+                        st.dataframe(
+                            cat_roll.rename(columns={category_col: "Category", "hours_raw": "Hours", "share": "Share"}),
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Hours": st.column_config.NumberColumn(format="%.1f"),
+                                "Share": st.column_config.NumberColumn(format="%.1f%%"),
+                            },
+                        )
+
+                    if "job_no" in dept_df.columns:
+                        agg_map = {"hours": ("hours_raw", "sum")}
+                        if "rev_alloc" in dept_df.columns:
+                            agg_map["revenue"] = ("rev_alloc", "sum")
+                        if "base_cost" in dept_df.columns:
+                            agg_map["cost"] = ("base_cost", "sum")
+                        job_roll = dept_df.groupby("job_no").agg(**agg_map).reset_index()
+                        if "revenue" in job_roll.columns and "cost" in job_roll.columns:
+                            job_roll["margin"] = job_roll["revenue"] - job_roll["cost"]
+                            job_roll["margin_pct"] = np.where(
+                                job_roll["revenue"] > 0,
+                                job_roll["margin"] / job_roll["revenue"] * 100,
+                                np.nan,
+                            )
+                        if "client" in dept_df.columns:
+                            job_roll = job_roll.merge(
+                                dept_df[["job_no", "client"]].drop_duplicates(),
+                                on="job_no",
+                                how="left",
+                            )
+                        job_roll = job_roll.sort_values("hours", ascending=False).head(10)
+                        job_roll = job_roll.rename(columns={
+                            "job_no": "Job",
+                            "client": "Client",
+                            "hours": "Hours",
+                            "revenue": "Revenue",
+                            "cost": "Cost",
+                            "margin": "Margin",
+                            "margin_pct": "Margin %",
+                        })
+                        cols = ["Job", "Hours"]
+                        if "Client" in job_roll.columns:
+                            cols.insert(1, "Client")
+                        if "Revenue" in job_roll.columns:
+                            cols.append("Revenue")
+                        if "Cost" in job_roll.columns:
+                            cols.append("Cost")
+                        if "Margin" in job_roll.columns:
+                            cols.append("Margin")
+                        if "Margin %" in job_roll.columns:
+                            cols.append("Margin %")
+                        st.markdown("**Top Jobs Touched**")
+                        st.dataframe(
+                            job_roll[cols],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Hours": st.column_config.NumberColumn(format="%.1f"),
+                                "Revenue": st.column_config.NumberColumn(format="$%.0f"),
+                                "Cost": st.column_config.NumberColumn(format="$%.0f"),
+                                "Margin": st.column_config.NumberColumn(format="$%.0f"),
+                                "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+                            },
+                        )
+
+                st.info(
+                    "Resourcing lens: redeploy capacity into tasks and job types already dominant in this department to minimize ramp time. "
+                    "If the footprint is heavy in low‑margin work, prioritize shifting effort toward higher‑margin jobs before adding headcount."
+                )
+
+        st.markdown("**Shared Capacity Demand — Cross‑Department Reliance**")
+        st.caption(
+            "This isolates work delivered by shared staff (people contributing <40% of their time to a department). "
+            "Use this to spot categories, tasks, or jobs that depend on cross‑department capacity."
+        )
+        shared_staff = composition.loc[composition["shared_flag"], "staff_name"].dropna().unique().tolist()
+        shared_slice = drill_df[drill_df["staff_name"].isin(shared_staff)].copy()
+        if len(shared_slice) > 0:
+            shared_slice["shared_hours"] = shared_slice["hours_raw"]
+            base_hours = drill_df["hours_raw"].sum()
+            shared_hours_total = shared_slice["shared_hours"].sum()
+            shared_fte_equiv = shared_hours_total / (4.33 * config.CAPACITY_HOURS_PER_WEEK) if base_hours > 0 else np.nan
+
+            kpi_cols = st.columns(3)
+            with kpi_cols[0]:
+                st.metric("Shared Hours (All Depts)", fmt_hours(shared_hours_total))
+            with kpi_cols[1]:
+                st.metric("Shared Share of Total Hours", fmt_percent(shared_hours_total / base_hours * 100) if base_hours > 0 else "—")
+            with kpi_cols[2]:
+                st.metric("Shared FTE Equiv", f"{shared_fte_equiv:.2f}" if pd.notna(shared_fte_equiv) else "—")
+
+            shared_category = None
+            if category_col in shared_slice.columns:
+                shared_category = shared_slice.groupby(category_col)["shared_hours"].sum().reset_index()
+                total_category = drill_df.groupby(category_col)["hours_raw"].sum().reset_index().rename(columns={"hours_raw": "total_hours"})
+                shared_category = shared_category.merge(total_category, on=category_col, how="left")
+                shared_category["shared_share"] = np.where(
+                    shared_category["total_hours"] > 0,
+                    shared_category["shared_hours"] / shared_category["total_hours"] * 100,
+                    np.nan,
+                )
+                shared_category["shared_fte_equiv"] = shared_category["shared_hours"] / (4.33 * config.CAPACITY_HOURS_PER_WEEK)
+                shared_category = shared_category.sort_values("shared_hours", ascending=False).head(10)
+
+                st.markdown("**Categories Reliant on Shared Capacity**")
+                st.dataframe(
+                    shared_category.rename(columns={
+                        category_col: "Category",
+                        "shared_hours": "Shared Hours",
+                        "total_hours": "Total Hours",
+                        "shared_share": "Shared Share",
+                        "shared_fte_equiv": "Shared FTE Equiv",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Shared Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Total Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Shared Share": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Shared FTE Equiv": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+
+            if "task_name" in shared_slice.columns:
+                shared_task = shared_slice.groupby("task_name")["shared_hours"].sum().reset_index()
+                total_task = drill_df.groupby("task_name")["hours_raw"].sum().reset_index().rename(columns={"hours_raw": "total_hours"})
+                shared_task = shared_task.merge(total_task, on="task_name", how="left")
+                shared_task["shared_share"] = np.where(
+                    shared_task["total_hours"] > 0,
+                    shared_task["shared_hours"] / shared_task["total_hours"] * 100,
+                    np.nan,
+                )
+                shared_task["shared_fte_equiv"] = shared_task["shared_hours"] / (4.33 * config.CAPACITY_HOURS_PER_WEEK)
+                shared_task = shared_task.sort_values("shared_hours", ascending=False).head(10)
+
+                st.markdown("**Tasks Reliant on Shared Capacity**")
+                st.dataframe(
+                    shared_task.rename(columns={
+                        "task_name": "Task",
+                        "shared_hours": "Shared Hours",
+                        "total_hours": "Total Hours",
+                        "shared_share": "Shared Share",
+                        "shared_fte_equiv": "Shared FTE Equiv",
+                    }),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Shared Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Total Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Shared Share": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Shared FTE Equiv": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+
+            if "job_no" in shared_slice.columns:
+                shared_jobs = shared_slice.groupby("job_no")["shared_hours"].sum().reset_index()
+                total_jobs = drill_df.groupby("job_no")["hours_raw"].sum().reset_index().rename(columns={"hours_raw": "total_hours"})
+                shared_jobs = shared_jobs.merge(total_jobs, on="job_no", how="left")
+                shared_jobs["shared_share"] = np.where(
+                    shared_jobs["total_hours"] > 0,
+                    shared_jobs["shared_hours"] / shared_jobs["total_hours"] * 100,
+                    np.nan,
+                )
+                shared_jobs["shared_fte_equiv"] = shared_jobs["shared_hours"] / (4.33 * config.CAPACITY_HOURS_PER_WEEK)
+                if "client" in shared_slice.columns:
+                    shared_jobs = shared_jobs.merge(
+                        shared_slice[["job_no", "client"]].drop_duplicates(),
+                        on="job_no",
+                        how="left",
+                    )
+                shared_jobs = shared_jobs.sort_values("shared_hours", ascending=False).head(10)
+                st.markdown("**Jobs Reliant on Shared Capacity**")
+                shared_jobs = shared_jobs.rename(columns={
+                    "job_no": "Job",
+                    "client": "Client",
+                    "shared_hours": "Shared Hours",
+                    "total_hours": "Total Hours",
+                    "shared_share": "Shared Share",
+                    "shared_fte_equiv": "Shared FTE Equiv",
+                })
+                cols = ["Job", "Shared Hours", "Total Hours", "Shared Share", "Shared FTE Equiv"]
+                if "Client" in shared_jobs.columns:
+                    cols.insert(1, "Client")
+                st.dataframe(
+                    shared_jobs[cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Shared Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Total Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Shared Share": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Shared FTE Equiv": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+
+            st.info(
+                "Resourcing lens: if a category or task has high shared share and high shared FTE, treat it as a cross‑department "
+                "service line and plan capacity centrally. If shared reliance is high but total hours are low, prioritize simplification "
+                "or automation. Use this view to decide where to build dedicated pods versus maintain flexible shared pools."
+            )
+        else:
+            st.info("No shared‑capacity staff detected in the current selection.")
+    else:
+        st.info("Department composition requires department and staff data to be present in the current selection.")
     _section_end()
 
 

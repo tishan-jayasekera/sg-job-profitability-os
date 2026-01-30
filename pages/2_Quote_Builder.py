@@ -248,8 +248,72 @@ def main():
         mask = (df_filtered["department_final"] == selected_dept) & \
                (df_filtered[category_col] == selected_cat)
         df_slice = df_filtered[mask]
+
+        # =====================================================================
+        # COMPARABLE JOB FILTERS
+        # =====================================================================
+        section_header("Comparable Jobs", "Narrow benchmarks to specific clients or jobs")
+
+        if "client" in df_slice.columns:
+            client_options = sorted(df_slice["client"].dropna().unique().tolist())
+        else:
+            client_options = []
+
+        selected_clients = st.multiselect(
+            "Client(s) to compare",
+            options=client_options,
+            key="quote_compare_clients",
+        )
+
+        if selected_clients:
+            df_client_slice = df_slice[df_slice["client"].isin(selected_clients)]
+        else:
+            df_client_slice = df_slice
+
+        job_options = sorted(df_client_slice["job_no"].dropna().unique().tolist()) if "job_no" in df_client_slice.columns else []
+        job_category_lookup = {}
+        if "job_category_quote" in df_client_slice.columns and job_options:
+            job_category_lookup = (
+                df_client_slice[["job_no", "job_category_quote"]]
+                .dropna()
+                .groupby("job_no")["job_category_quote"]
+                .agg(lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else x.iloc[0])
+                .to_dict()
+            )
+        use_all_jobs = st.checkbox(
+            "Use all jobs from selected clients",
+            value=True,
+            disabled=len(selected_clients) == 0,
+            help="Uncheck to pick a subset of jobs.",
+            key="quote_use_all_jobs",
+        )
+
+        selected_jobs = []
+        if selected_clients and not use_all_jobs and job_options:
+            selected_jobs = st.multiselect(
+                "Select specific jobs",
+                options=job_options,
+                format_func=lambda j: f"{j} — {job_category_lookup.get(j, 'Unknown')}"
+                if job_category_lookup
+                else str(j),
+                key="quote_compare_jobs",
+            )
+
+        if selected_jobs:
+            df_compare = df_client_slice[df_client_slice["job_no"].isin(selected_jobs)]
+        else:
+            df_compare = df_client_slice
+
+        if len(df_compare) == 0:
+            st.warning("No jobs found for the selected comparable filters.")
+            return
+
+        st.caption(
+            f"Comparable set: {df_compare['job_no'].nunique()} jobs"
+            + (f", {df_compare['client'].nunique()} clients" if "client" in df_compare.columns else "")
+        )
         
-        meta = get_benchmark_metadata(df_slice, recency_weighted=recency_weighted)
+        meta = get_benchmark_metadata(df_compare, recency_weighted=recency_weighted)
         
         # Display metadata
         st.markdown(f"**Benchmark:** {meta['n_jobs']} jobs, {meta['n_staff']} staff")
@@ -260,7 +324,7 @@ def main():
         
         # Get task benchmarks
         benchmarks = get_task_benchmarks(
-            df_filtered, selected_dept, selected_cat,
+            df_compare, selected_dept, selected_cat,
             recency_weighted=recency_weighted
         )
         
@@ -271,50 +335,130 @@ def main():
         # =====================================================================
         # TASK TEMPLATE TABLE
         # =====================================================================
-        section_header("Task Template", "Select tasks and adjust hours for your quote")
+        section_header("Task Template", "Select tasks, adjust hours, and build a usable quote plan fast")
         
-        # Initialize plan in session state if not exists
-        plan_key = f"quote_plan_{selected_dept}_{selected_cat}"
-        
-        if plan_key not in st.session_state:
-            # Default: include tasks with >50% inclusion rate
+        # Initialize table in session state if not exists or context changes
+        table_key = (selected_dept, selected_cat, benchmark_window, tuple(selected_clients), tuple(selected_jobs))
+        if st.session_state.get("quote_task_table_key") != table_key:
             default_tasks = benchmarks[benchmarks["inclusion_rate"] >= 50]["task_name"].tolist()
-            st.session_state[plan_key] = {
-                task: benchmarks[benchmarks["task_name"] == task]["quoted_hours_p50"].iloc[0]
-                for task in default_tasks
-            }
-        
-        # Display editable table
-        edited_df = st.data_editor(
-            benchmarks[[
-                "task_name", "inclusion_rate", "quoted_hours_p50",
-                "quoted_hours_p25", "quoted_hours_p75",
-                "overrun_risk", "cost_per_hour", "quote_rate"
-            ]].rename(columns={
+            base_table = benchmarks.rename(columns={
                 "task_name": "Task",
                 "inclusion_rate": "Inclusion %",
-                "quoted_hours_p50": "Suggested Hours",
+                "quoted_hours_p50": "Median (p50)",
                 "quoted_hours_p25": "Low (p25)",
                 "quoted_hours_p75": "High (p75)",
                 "overrun_risk": "Overrun Risk %",
                 "cost_per_hour": "Cost/hr",
                 "quote_rate": "Quote Rate",
-            }),
+            })[[
+                "Task", "Inclusion %", "Median (p50)", "Low (p25)", "High (p75)",
+                "Overrun Risk %", "Cost/hr", "Quote Rate"
+            ]].copy()
+            base_table["Include"] = base_table["Task"].isin(default_tasks)
+            base_table["Hours"] = np.where(
+                base_table["Include"],
+                base_table["Median (p50)"],
+                0.0,
+            )
+            st.session_state["quote_task_table"] = base_table
+            st.session_state["quote_task_table_key"] = table_key
+
+        task_table = st.session_state["quote_task_table"].copy()
+
+        # Usability controls
+        st.caption(
+            "Legend: ✅ Editable (your quote) · 📊 Empirical benchmarks (read‑only). "
+            "Use Hours + Include to build the quote; benchmarks show historical ranges."
+        )
+        control_cols = st.columns([1.2, 1, 1, 1, 1.4])
+        with control_cols[0]:
+            task_search = st.text_input("Search tasks", value="", placeholder="Type to filter tasks")
+        with control_cols[1]:
+            min_inclusion = st.slider("Min inclusion %", 0, 100, 0, step=10)
+        with control_cols[2]:
+            show_only_selected = st.checkbox("Show selected only", value=False)
+        with control_cols[3]:
+            sort_by = st.selectbox("Sort by", ["Inclusion %", "Overrun Risk %", "Hours"], index=0)
+        with control_cols[4]:
+            bulk_set = st.selectbox("Set hours to", ["Keep current", "Low (p25)", "Median (p50)", "High (p75)"])
+
+        action_cols = st.columns(3)
+        with action_cols[0]:
+            if st.button("Select common tasks (≥50%)"):
+                task_table["Include"] = task_table["Inclusion %"] >= 50
+                task_table.loc[task_table["Include"], "Hours"] = task_table.loc[task_table["Include"], "Median (p50)"]
+        with action_cols[1]:
+            if st.button("Select all"):
+                task_table["Include"] = True
+                task_table.loc[task_table["Include"], "Hours"] = task_table.loc[task_table["Include"], "Median (p50)"]
+        with action_cols[2]:
+            if st.button("Clear all"):
+                task_table["Include"] = False
+                task_table["Hours"] = 0.0
+
+        if bulk_set != "Keep current":
+            task_table.loc[task_table["Include"], "Hours"] = task_table.loc[
+                task_table["Include"], bulk_set
+            ]
+
+        # Apply filters for display
+        view_table = task_table.copy()
+        if task_search:
+            view_table = view_table[view_table["Task"].str.contains(task_search, case=False, na=False)]
+        view_table = view_table[view_table["Inclusion %"] >= min_inclusion]
+        if show_only_selected:
+            view_table = view_table[view_table["Include"]]
+        view_table = view_table.sort_values(sort_by, ascending=False)
+
+        st.markdown(
+            """
+            <style>
+            /* Highlight editable columns in the task editor (Include + Hours) */
+            [data-testid="stDataEditor"] div[role="columnheader"]:nth-child(1),
+            [data-testid="stDataEditor"] div[role="columnheader"]:nth-child(3),
+            [data-testid="stDataEditor"] div[role="gridcell"]:nth-child(1),
+            [data-testid="stDataEditor"] div[role="gridcell"]:nth-child(3) {
+                background: #fff7cc;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        edited_view = st.data_editor(
+            view_table[[
+                "Include", "Task", "Hours", "Inclusion %",
+                "Low (p25)", "Median (p50)", "High (p75)",
+                "Overrun Risk %", "Cost/hr", "Quote Rate"
+            ]],
             column_config={
+                "Include": st.column_config.CheckboxColumn("✅ Include"),
                 "Task": st.column_config.TextColumn("Task", disabled=True),
-                "Inclusion %": st.column_config.NumberColumn("Inclusion %", format="%.1f%%", disabled=True),
-                "Suggested Hours": st.column_config.NumberColumn("Hours", min_value=0, step=0.5),
-                "Low (p25)": st.column_config.NumberColumn("Low", format="%.1f", disabled=True),
-                "High (p75)": st.column_config.NumberColumn("High", format="%.1f", disabled=True),
-                "Overrun Risk %": st.column_config.NumberColumn("Risk %", format="%.0f%%", disabled=True),
-                "Cost/hr": st.column_config.NumberColumn("Cost/hr", format="$%.0f", disabled=True),
-                "Quote Rate": st.column_config.NumberColumn("Rate", format="$%.0f/hr", disabled=True),
+                "Hours": st.column_config.NumberColumn("✅ Quote Hours", min_value=0, step=0.5),
+                "Inclusion %": st.column_config.NumberColumn("📊 Inclusion %", format="%.1f%%", disabled=True),
+                "Low (p25)": st.column_config.NumberColumn("📊 Low (p25)", format="%.1f", disabled=True),
+                "Median (p50)": st.column_config.NumberColumn("📊 Median (p50)", format="%.1f", disabled=True),
+                "High (p75)": st.column_config.NumberColumn("📊 High (p75)", format="%.1f", disabled=True),
+                "Overrun Risk %": st.column_config.NumberColumn("📊 Overrun Risk %", format="%.0f%%", disabled=True),
+                "Cost/hr": st.column_config.NumberColumn("📊 Cost/hr", format="$%.0f", disabled=True),
+                "Quote Rate": st.column_config.NumberColumn("📊 Quote Rate", format="$%.0f/hr", disabled=True),
             },
             use_container_width=True,
             hide_index=True,
-            num_rows="dynamic",
+            num_rows="fixed",
             key="task_editor"
         )
+
+        # Merge edits back into full table
+        if len(edited_view) > 0:
+            update_cols = ["Include", "Hours"]
+            task_table.set_index("Task", inplace=True)
+            edited_view.set_index("Task", inplace=True)
+            task_table.loc[edited_view.index, update_cols] = edited_view[update_cols]
+            task_table.reset_index(inplace=True)
+            st.session_state["quote_task_table"] = task_table
+
+        edited_df = task_table[task_table["Include"]].copy()
         
         st.markdown("---")
         
@@ -324,7 +468,7 @@ def main():
         section_header("Quote Economics")
         
         # Calculate totals from edited data
-        total_hours = edited_df["Suggested Hours"].sum()
+        total_hours = edited_df["Hours"].sum()
         
         # Merge back cost/rate info
         edited_df = edited_df.merge(
@@ -347,10 +491,10 @@ def main():
             if "quote_rate_bench" in edited_df.columns
             else ("quote_rate" if "quote_rate" in edited_df.columns else "Quote Rate")
         )
-        edited_df["task_cost"] = edited_df["Suggested Hours"] * edited_df[cost_col].fillna(
+        edited_df["task_cost"] = edited_df["Hours"] * edited_df[cost_col].fillna(
             benchmarks["cost_per_hour"].median()
         )
-        edited_df["task_value"] = edited_df["Suggested Hours"] * edited_df[rate_col].fillna(
+        edited_df["task_value"] = edited_df["Hours"] * edited_df[rate_col].fillna(
             benchmarks["quote_rate"].median()
         )
         
@@ -389,10 +533,10 @@ def main():
                 # Build plan object
                 tasks = []
                 for _, row in edited_df.iterrows():
-                    if row["Suggested Hours"] > 0:
+                    if row["Hours"] > 0:
                         tasks.append(QuotePlanTask(
                             task_name=row["Task"],
-                            hours=row["Suggested Hours"],
+                            hours=row["Hours"],
                             cost_per_hour=row.get(cost_col, 0) or 0,
                             quote_rate=row.get(rate_col, 0) or 0,
                         ))
@@ -414,10 +558,10 @@ def main():
                 # Save and redirect
                 tasks = []
                 for _, row in edited_df.iterrows():
-                    if row["Suggested Hours"] > 0:
+                    if row["Hours"] > 0:
                         tasks.append(QuotePlanTask(
                             task_name=row["Task"],
-                            hours=row["Suggested Hours"],
+                            hours=row["Hours"],
                             cost_per_hour=row.get(cost_col, 0) or 0,
                             quote_rate=row.get(rate_col, 0) or 0,
                         ))
@@ -436,7 +580,7 @@ def main():
         
         with action_cols[2]:
             # Export as CSV
-            export_df = edited_df[["Task", "Suggested Hours"]].copy()
+            export_df = edited_df[["Task", "Hours"]].copy()
             export_df["Department"] = selected_dept
             export_df["Category"] = selected_cat
             
