@@ -305,6 +305,8 @@ def main():
         )
 
         selected_jobs = []
+        if "quote_compare_jobs_override" in st.session_state:
+            st.session_state["quote_compare_jobs"] = st.session_state.pop("quote_compare_jobs_override")
         if selected_clients and not use_all_jobs and job_options:
             keyword_matches = []
             if "job_description" in df_client_slice.columns:
@@ -511,7 +513,169 @@ def main():
         if len(benchmarks) == 0:
             st.warning("No task data available for this selection.")
             return
-        
+
+        st.markdown(
+            """
+            <style>
+            .dispersion-highlight {
+                background: #fff7cc;
+                border: 1px solid #f2d675;
+                border-radius: 12px;
+                padding: 12px 14px;
+                margin: 6px 0 12px 0;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div class="dispersion-highlight">', unsafe_allow_html=True)
+        st.markdown("#### Job Dispersion (Quoted vs Actual)")
+        if "job_no" in df_compare.columns:
+            job_actual = df_compare.groupby("job_no").agg(
+                actual_hours=("hours_raw", "sum") if "hours_raw" in df_compare.columns else ("job_no", "count"),
+                actual_value=("rev_alloc", "sum") if "rev_alloc" in df_compare.columns else ("job_no", "count"),
+            ).reset_index()
+        else:
+            job_actual = pd.DataFrame()
+
+        job_quote = safe_quote_job_task(df_compare)
+        if len(job_quote) > 0:
+            job_quote = job_quote.groupby("job_no").agg(
+                quoted_hours=("quoted_time_total", "sum") if "quoted_time_total" in job_quote.columns else ("job_no", "count"),
+                quoted_value=("quoted_amount_total", "sum") if "quoted_amount_total" in job_quote.columns else ("job_no", "count"),
+            ).reset_index()
+        else:
+            job_quote = pd.DataFrame()
+
+        job_disp = None
+        if len(job_actual) > 0 or len(job_quote) > 0:
+            job_disp = job_actual.merge(job_quote, on="job_no", how="outer")
+            metrics = {
+                "Quoted Value": job_disp["quoted_value"] if "quoted_value" in job_disp.columns else pd.Series(dtype=float),
+                "Quoted Hours": job_disp["quoted_hours"] if "quoted_hours" in job_disp.columns else pd.Series(dtype=float),
+                "Actual Hours": job_disp["actual_hours"] if "actual_hours" in job_disp.columns else pd.Series(dtype=float),
+            }
+            rows = []
+            for label, series in metrics.items():
+                if len(series.dropna()) == 0:
+                    continue
+                s = series.dropna()
+                p25 = s.quantile(0.25)
+                p75 = s.quantile(0.75)
+                med = s.median()
+                iqr = p75 - p25
+                spread = iqr / med if med and med != 0 else np.nan
+                rows.append({
+                    "Metric": label,
+                    "Min": s.min(),
+                    "P25": p25,
+                    "Median": med,
+                    "P75": p75,
+                    "Max": s.max(),
+                    "IQR/Median": spread,
+                })
+            if rows:
+                dispersion_df = pd.DataFrame(rows)
+                dispersion_df["Flag"] = np.where(
+                    dispersion_df["IQR/Median"] >= 1.0, "Wide",
+                    np.where(dispersion_df["IQR/Median"] >= 0.5, "Moderate", "Tight")
+                )
+                st.dataframe(
+                    dispersion_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Min": st.column_config.NumberColumn(format="%.1f"),
+                        "P25": st.column_config.NumberColumn(format="%.1f"),
+                        "Median": st.column_config.NumberColumn(format="%.1f"),
+                        "P75": st.column_config.NumberColumn(format="%.1f"),
+                        "Max": st.column_config.NumberColumn(format="%.1f"),
+                        "IQR/Median": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+                wide_metrics = dispersion_df[dispersion_df["Flag"] == "Wide"]["Metric"].tolist()
+                if wide_metrics:
+                    st.warning(
+                        "Dispersion alert: "
+                        + ", ".join(wide_metrics)
+                        + " are wide. Consider narrowing the comparable set or applying filters before quoting."
+                    )
+                    # Identify dispersion contributors + most similar jobs
+                    contrib_df = job_disp.copy()
+                    metric_cols = []
+                    for col in ["quoted_value", "quoted_hours", "actual_value", "actual_hours"]:
+                        if col in contrib_df.columns:
+                            metric_cols.append(col)
+                    if metric_cols:
+                        # Normalize by median to avoid scale bias
+                        for col in metric_cols:
+                            med = contrib_df[col].median()
+                            denom = med if med and med != 0 else (contrib_df[col].std() or 1.0)
+                            contrib_df[f"{col}_norm"] = (contrib_df[col] - med).abs() / denom
+                        norm_cols = [f"{c}_norm" for c in metric_cols]
+                        contrib_df["dispersion_score"] = contrib_df[norm_cols].mean(axis=1, skipna=True)
+                        contrib_df["job_label"] = contrib_df["job_no"].apply(lambda j: format_job_label(j, job_name_lookup))
+
+                        outliers = contrib_df.sort_values("dispersion_score", ascending=False).head(8)
+                        outlier_ids = set(outliers["job_no"].astype(str).tolist())
+                        similar = (
+                            contrib_df[~contrib_df["job_no"].astype(str).isin(outlier_ids)]
+                            .sort_values("dispersion_score", ascending=True)
+                            .head(8)
+                        )
+
+                        st.markdown("**Dispersion Contributors (Review These Jobs)**")
+                        st.dataframe(
+                            outliers[["job_label", "dispersion_score"] + metric_cols],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "dispersion_score": st.column_config.NumberColumn("Dispersion Score", format="%.2f"),
+                                "quoted_value": st.column_config.NumberColumn("Quoted Value", format="$%.0f"),
+                                "quoted_hours": st.column_config.NumberColumn("Quoted Hours", format="%.1f"),
+                                "actual_value": st.column_config.NumberColumn("Actual Value", format="$%.0f"),
+                                "actual_hours": st.column_config.NumberColumn("Actual Hours", format="%.1f"),
+                            },
+                        )
+                        remove_choices = outliers["job_no"].astype(str).tolist()
+                        remove_labels = dict(zip(outliers["job_no"].astype(str), outliers["job_label"]))
+                        to_remove = st.multiselect(
+                            "Deselect dispersion contributors",
+                            options=remove_choices,
+                            format_func=lambda j: remove_labels.get(str(j), str(j)),
+                            key="quote_remove_dispersion_jobs",
+                        )
+                        if st.button("Remove selected jobs and refresh quote", key="quote_remove_dispersion_apply"):
+                            existing = st.session_state.get("quote_compare_jobs", []) or []
+                            remaining = [j for j in existing if str(j) not in set(map(str, to_remove))]
+                            st.session_state["quote_compare_jobs_override"] = remaining
+                            st.session_state["quote_task_locked"] = False
+                            st.session_state["quote_task_locked_table"] = None
+                            st.rerun()
+
+                        st.markdown("**Most Similar Jobs (Closest to Median)**")
+                        st.dataframe(
+                            similar[["job_label", "dispersion_score"] + metric_cols],
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "dispersion_score": st.column_config.NumberColumn("Similarity Score", format="%.2f"),
+                                "quoted_value": st.column_config.NumberColumn("Quoted Value", format="$%.0f"),
+                                "quoted_hours": st.column_config.NumberColumn("Quoted Hours", format="%.1f"),
+                                "actual_value": st.column_config.NumberColumn("Actual Value", format="$%.0f"),
+                                "actual_hours": st.column_config.NumberColumn("Actual Hours", format="%.1f"),
+                            },
+                        )
+                else:
+                    st.caption(
+                        "Dispersion looks tight/moderate across key metrics — comparable set is consistent."
+                    )
+            else:
+                st.caption("No dispersion metrics available for the current selection.")
+        else:
+            st.caption("No dispersion metrics available for the current selection.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
         # =====================================================================
         # TASK TEMPLATE TABLE
         # =====================================================================
@@ -819,63 +983,96 @@ def main():
         with econ_cols[4]:
             st.metric("Margin %", fmt_percent(margin_pct))
 
-        # What-if: compare selected jobs' quoted vs actuals (per-job averages)
-        what_if_line = None
+        # What-if: build economics from selected jobs (avg-based)
         job_count = df_compare["job_no"].nunique() if "job_no" in df_compare.columns else 0
-        if job_count > 0:
-            actual_by_job = df_compare.groupby("job_no").agg(
-                actual_hours=("hours_raw", "sum") if "hours_raw" in df_compare.columns else ("job_no", "count"),
-                actual_cost=("base_cost", "sum") if "base_cost" in df_compare.columns else ("job_no", "count"),
-                actual_value=("rev_alloc", "sum") if "rev_alloc" in df_compare.columns else ("job_no", "count"),
+        actual_by_job = df_compare.groupby("job_no").agg(
+            actual_hours=("hours_raw", "sum") if "hours_raw" in df_compare.columns else ("job_no", "count"),
+            actual_cost=("base_cost", "sum") if "base_cost" in df_compare.columns else ("job_no", "count"),
+            actual_value=("rev_alloc", "sum") if "rev_alloc" in df_compare.columns else ("job_no", "count"),
+        ).reset_index() if job_count > 0 else pd.DataFrame()
+
+        avg_actual_hours = actual_by_job["actual_hours"].mean() if "actual_hours" in actual_by_job.columns else np.nan
+        total_actual_cost = actual_by_job["actual_cost"].sum() if "actual_cost" in actual_by_job.columns else np.nan
+        total_actual_hours = actual_by_job["actual_hours"].sum() if "actual_hours" in actual_by_job.columns else np.nan
+        avg_actual_cost_per_hour = (
+            total_actual_cost / total_actual_hours
+            if pd.notna(total_actual_cost) and pd.notna(total_actual_hours) and total_actual_hours > 0
+            else np.nan
+        )
+
+        quote_job_task = safe_quote_job_task(df_compare)
+        if len(quote_job_task) > 0:
+            quoted_by_job = quote_job_task.groupby("job_no").agg(
+                quoted_hours=("quoted_time_total", "sum") if "quoted_time_total" in quote_job_task.columns else ("job_no", "count"),
+                quoted_value=("quoted_amount_total", "sum") if "quoted_amount_total" in quote_job_task.columns else ("job_no", "count"),
             ).reset_index()
-            actual_by_job["actual_margin"] = actual_by_job["actual_value"] - actual_by_job["actual_cost"]
-            actual_by_job["actual_margin_pct"] = np.where(
-                actual_by_job["actual_value"] > 0,
-                actual_by_job["actual_margin"] / actual_by_job["actual_value"] * 100,
-                np.nan,
+        else:
+            quoted_by_job = pd.DataFrame()
+
+        avg_quoted_hours = quoted_by_job["quoted_hours"].mean() if "quoted_hours" in quoted_by_job.columns else np.nan
+        avg_quoted_value = quoted_by_job["quoted_value"].mean() if "quoted_value" in quoted_by_job.columns else np.nan
+        avg_quoted_rate = avg_quoted_value / avg_quoted_hours if pd.notna(avg_quoted_value) and avg_quoted_hours > 0 else np.nan
+
+        what_if_est_cost = (
+            avg_actual_cost_per_hour * avg_quoted_hours
+            if pd.notna(avg_actual_cost_per_hour) and pd.notna(avg_quoted_hours)
+            else np.nan
+        )
+        what_if_est_value = avg_quoted_rate * avg_quoted_hours if pd.notna(avg_quoted_rate) and pd.notna(avg_quoted_hours) else np.nan
+        what_if_margin = what_if_est_value - what_if_est_cost if pd.notna(what_if_est_value) and pd.notna(what_if_est_cost) else np.nan
+        what_if_margin_pct = what_if_margin / what_if_est_value * 100 if pd.notna(what_if_margin) and what_if_est_value and what_if_est_value > 0 else np.nan
+
+        if job_count > 0:
+            st.markdown("#### What‑If (Avg per Job from Selected Jobs)")
+            st.caption(
+                "Explainer: This section estimates what an average job looks like based on the selected comparable "
+                "jobs. We use average quoted hours and average quoted $/hour to estimate value, and average actual "
+                "cost to estimate cost. This makes the what‑if comparable to the quote you are building."
             )
+            what_if_cols = st.columns(6)
+            with what_if_cols[0]:
+                st.metric("Avg Quoted Hours", fmt_hours(avg_quoted_hours))
+            with what_if_cols[1]:
+                st.metric("Avg Actual Hours", fmt_hours(avg_actual_hours))
+            with what_if_cols[2]:
+                st.metric("Est. Cost (Weighted Actual)", fmt_currency(what_if_est_cost))
+            with what_if_cols[3]:
+                st.metric("Est. Value (Quoted Rate × Hours)", fmt_currency(what_if_est_value))
+            with what_if_cols[4]:
+                st.metric("Est. Margin", fmt_currency(what_if_margin))
+            with what_if_cols[5]:
+                st.metric("Margin %", fmt_percent(what_if_margin_pct))
 
-            quote_job_task = safe_quote_job_task(df_compare)
-            if len(quote_job_task) > 0:
-                quoted_by_job = quote_job_task.groupby("job_no").agg(
-                    quoted_hours=("quoted_time_total", "sum") if "quoted_time_total" in quote_job_task.columns else ("job_no", "count"),
-                    quoted_value=("quoted_amount_total", "sum") if "quoted_amount_total" in quote_job_task.columns else ("job_no", "count"),
-                ).reset_index()
-            else:
-                quoted_by_job = pd.DataFrame({"job_no": []})
-
-            if len(quoted_by_job) > 0:
-                quoted_by_job = quoted_by_job.merge(
-                    actual_by_job[["job_no", "actual_cost"]],
-                    on="job_no",
-                    how="left",
+            # Avg time to completion + range (days)
+            if "job_start_date" in df_compare.columns and "job_completed_date" in df_compare.columns:
+                durations = (
+                    df_compare[["job_no", "job_start_date", "job_completed_date"]]
+                    .dropna(subset=["job_no", "job_start_date", "job_completed_date"])
+                    .drop_duplicates(subset=["job_no"])
+                    .copy()
                 )
-                quoted_by_job["quoted_margin"] = quoted_by_job["quoted_value"] - quoted_by_job["actual_cost"]
-                quoted_by_job["quoted_margin_pct"] = np.where(
-                    quoted_by_job["quoted_value"] > 0,
-                    quoted_by_job["quoted_margin"] / quoted_by_job["quoted_value"] * 100,
-                    np.nan,
-                )
+                if len(durations) > 0:
+                    durations["job_start_date"] = pd.to_datetime(durations["job_start_date"], errors="coerce")
+                    durations["job_completed_date"] = pd.to_datetime(durations["job_completed_date"], errors="coerce")
+                    durations = durations.dropna(subset=["job_start_date", "job_completed_date"])
+                    durations["duration_days"] = (
+                        durations["job_completed_date"] - durations["job_start_date"]
+                    ).dt.days
+                    durations = durations[durations["duration_days"] >= 0]
+                if len(durations) > 0:
+                    avg_days = durations["duration_days"].mean()
+                    p25_days = durations["duration_days"].quantile(0.25)
+                    p75_days = durations["duration_days"].quantile(0.75)
+                    expected_end = pd.Timestamp.today().normalize() + pd.Timedelta(days=int(round(avg_days)))
+                    st.caption(
+                        f"Avg time to completion: {avg_days:.0f} days "
+                        f"(p25–p75: {p25_days:.0f}–{p75_days:.0f}). "
+                        f"Imputed expected end date: {expected_end.strftime('%b %d, %Y')}."
+                    )
+                else:
+                    st.caption("Avg time to completion: — (insufficient completed jobs with start/end dates).")
             else:
-                quoted_by_job = pd.DataFrame({"quoted_hours": [], "quoted_value": [], "quoted_margin_pct": []})
-
-            avg_quoted_hours = quoted_by_job["quoted_hours"].mean() if "quoted_hours" in quoted_by_job.columns else np.nan
-            avg_quoted_value = quoted_by_job["quoted_value"].mean() if "quoted_value" in quoted_by_job.columns else np.nan
-            avg_quoted_margin_pct = quoted_by_job["quoted_margin_pct"].mean() if "quoted_margin_pct" in quoted_by_job.columns else np.nan
-
-            avg_actual_hours = actual_by_job["actual_hours"].mean() if "actual_hours" in actual_by_job.columns else np.nan
-            avg_actual_value = actual_by_job["actual_value"].mean() if "actual_value" in actual_by_job.columns else np.nan
-            avg_actual_margin_pct = actual_by_job["actual_margin_pct"].mean() if "actual_margin_pct" in actual_by_job.columns else np.nan
-
-            what_if_line = (
-                f"WHAT‑IF (Avg per job, {job_count} jobs): "
-                f"Quoted {fmt_hours(avg_quoted_hours)} hrs @ {fmt_currency(avg_quoted_value)} "
-                f"({fmt_percent(avg_quoted_margin_pct)} margin) "
-                f"vs Actual {fmt_hours(avg_actual_hours)} hrs @ {fmt_currency(avg_actual_value)} "
-                f"({fmt_percent(avg_actual_margin_pct)} margin)."
-            )
-        if what_if_line:
-            st.caption(what_if_line)
+                st.caption("Avg time to completion: — (job start/completed dates not available).")
 
         st.markdown("#### Margin Scenarios")
         st.dataframe(
@@ -960,12 +1157,13 @@ def main():
         st.markdown("#### Target Margin Solver")
         solver_cols = st.columns([1.1, 1.1, 1, 1.2])
         with solver_cols[0]:
-            target_margin_pct = st.slider(
+            target_margin_pct = st.number_input(
                 "Target margin %",
-                min_value=0,
-                max_value=60,
-                value=int(round(margin_pct)),
-                step=1,
+                min_value=0.0,
+                max_value=100.0,
+                value=float(round(margin_pct, 1)),
+                step=0.5,
+                format="%.1f",
             )
         with solver_cols[1]:
             lever = st.selectbox(
