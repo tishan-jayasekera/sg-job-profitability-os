@@ -621,13 +621,15 @@ def main():
 
         locked = st.session_state.get("quote_task_locked", False)
         edited_view = None
-        with st.form("quote_task_editor_form", clear_on_submit=False):
-            edited_view = st.data_editor(
-                view_table[[
+        view_editor_table = view_table[[
                     "Include", "Task", "Hours", "Inclusion %",
                     "Low (p25)", "Median (p50)", "High (p75)",
                     "Overrun Risk %", "Cost/hr", "Quote Rate"
-                ]],
+                ]].copy().reset_index(drop=True)
+        st.session_state["quote_task_view"] = view_editor_table
+        with st.form("quote_task_editor_form", clear_on_submit=False):
+            edited_view = st.data_editor(
+                view_editor_table,
                 column_config={
                     "Include": st.column_config.CheckboxColumn("✅ Include", disabled=locked),
                     "Task": st.column_config.TextColumn("Task", disabled=True),
@@ -665,16 +667,36 @@ def main():
         with lock_cols[0]:
             if st.button("Lock task selection", disabled=locked):
                 editor_state = st.session_state.get("task_editor")
+                update_cols = ["Include", "Hours"]
                 if isinstance(editor_state, pd.DataFrame) and len(editor_state) > 0:
-                    update_cols = ["Include", "Hours"]
+                    if st.session_state.get("quote_lock_visible_only", True):
+                        task_table["Include"] = False
+                        task_table["Hours"] = 0.0
                     task_table.set_index("Task", inplace=True)
                     editor_state = editor_state.set_index("Task")
                     task_table.loc[editor_state.index, update_cols] = editor_state[update_cols]
                     task_table.reset_index(inplace=True)
                     st.session_state["quote_task_table"] = task_table
+                elif isinstance(editor_state, dict) and "edited_rows" in editor_state:
+                    view_snapshot = st.session_state.get("quote_task_view")
+                    if isinstance(view_snapshot, pd.DataFrame) and len(view_snapshot) > 0:
+                        view_snapshot = view_snapshot.copy()
+                        if st.session_state.get("quote_lock_visible_only", True):
+                            task_table["Include"] = False
+                            task_table["Hours"] = 0.0
+                        for row_idx, changes in editor_state.get("edited_rows", {}).items():
+                            if 0 <= int(row_idx) < len(view_snapshot):
+                                for col, val in changes.items():
+                                    if col in update_cols:
+                                        view_snapshot.at[int(row_idx), col] = val
+                        task_table.set_index("Task", inplace=True)
+                        view_snapshot.set_index("Task", inplace=True)
+                        task_table.loc[view_snapshot.index, update_cols] = view_snapshot[update_cols]
+                        task_table.reset_index(inplace=True)
+                        st.session_state["quote_task_table"] = task_table
                 st.session_state["quote_task_locked"] = True
                 st.session_state["quote_task_locked_table"] = task_table.copy()
-                st.session_state["quote_econ_ready"] = False
+                st.session_state["quote_econ_ready"] = True
                 st.rerun()
         with lock_cols[1]:
             if st.button("Unlock", disabled=not locked):
@@ -691,6 +713,12 @@ def main():
                 st.caption("Selection locked. Unlock to edit tasks or hours.")
             else:
                 st.caption("Edit tasks/hours, then lock to compute economics.")
+            st.checkbox(
+                "Lock only tasks shown in the table",
+                value=True,
+                key="quote_lock_visible_only",
+                help="When enabled, locking will include only tasks visible in the current table view.",
+            )
 
         st.markdown("---")
         
@@ -699,20 +727,17 @@ def main():
         # =====================================================================
         section_header("Quote Economics")
         
-        if not st.session_state.get("quote_econ_ready", False):
-            st.info("Lock your task selection and click **Compute quote economics** to update totals.")
-            return
-
         locked_table = st.session_state.get("quote_task_locked_table")
-        if locked_table is None:
-            st.warning("No locked selection found. Lock tasks to compute economics.")
+        if not st.session_state.get("quote_task_locked", False) or locked_table is None:
+            st.info("Lock your task selection to update totals.")
             return
 
+        locked_table = locked_table.copy()
+        locked_table["Hours"] = pd.to_numeric(locked_table["Hours"], errors="coerce").fillna(0.0)
         edited_df = locked_table[locked_table["Include"]].copy()
-        edited_df["Hours"] = pd.to_numeric(edited_df["Hours"], errors="coerce").fillna(0.0)
 
         # Calculate totals from edited data
-        total_hours = edited_df["Hours"].sum()
+        total_hours = float(locked_table.loc[locked_table["Include"], "Hours"].sum())
         
         # Merge back cost/rate info
         edited_df = edited_df.merge(
@@ -794,34 +819,60 @@ def main():
         with econ_cols[4]:
             st.metric("Margin %", fmt_percent(margin_pct))
 
-        # What-if: compare selected jobs' quoted vs actuals
+        # What-if: compare selected jobs' quoted vs actuals (per-job averages)
         what_if_line = None
-        if "hours_raw" in df_compare.columns:
-            actual_hours = df_compare["hours_raw"].sum()
-        else:
-            actual_hours = np.nan
-        actual_cost = df_compare["base_cost"].sum() if "base_cost" in df_compare.columns else np.nan
-        actual_value = df_compare["rev_alloc"].sum() if "rev_alloc" in df_compare.columns else np.nan
-        actual_margin = actual_value - actual_cost if pd.notna(actual_value) and pd.notna(actual_cost) else np.nan
-        actual_margin_pct = actual_margin / actual_value * 100 if pd.notna(actual_margin) and actual_value > 0 else np.nan
+        job_count = df_compare["job_no"].nunique() if "job_no" in df_compare.columns else 0
+        if job_count > 0:
+            actual_by_job = df_compare.groupby("job_no").agg(
+                actual_hours=("hours_raw", "sum") if "hours_raw" in df_compare.columns else ("job_no", "count"),
+                actual_cost=("base_cost", "sum") if "base_cost" in df_compare.columns else ("job_no", "count"),
+                actual_value=("rev_alloc", "sum") if "rev_alloc" in df_compare.columns else ("job_no", "count"),
+            ).reset_index()
+            actual_by_job["actual_margin"] = actual_by_job["actual_value"] - actual_by_job["actual_cost"]
+            actual_by_job["actual_margin_pct"] = np.where(
+                actual_by_job["actual_value"] > 0,
+                actual_by_job["actual_margin"] / actual_by_job["actual_value"] * 100,
+                np.nan,
+            )
 
-        quote_job_task = safe_quote_job_task(df_compare)
-        if len(quote_job_task) > 0:
-            quoted_hours = quote_job_task["quoted_time_total"].sum() if "quoted_time_total" in quote_job_task.columns else np.nan
-            quoted_value = quote_job_task["quoted_amount_total"].sum() if "quoted_amount_total" in quote_job_task.columns else np.nan
-        else:
-            quoted_hours = np.nan
-            quoted_value = np.nan
-        quoted_margin = quoted_value - actual_cost if pd.notna(quoted_value) and pd.notna(actual_cost) else np.nan
-        quoted_margin_pct = quoted_margin / quoted_value * 100 if pd.notna(quoted_margin) and quoted_value > 0 else np.nan
+            quote_job_task = safe_quote_job_task(df_compare)
+            if len(quote_job_task) > 0:
+                quoted_by_job = quote_job_task.groupby("job_no").agg(
+                    quoted_hours=("quoted_time_total", "sum") if "quoted_time_total" in quote_job_task.columns else ("job_no", "count"),
+                    quoted_value=("quoted_amount_total", "sum") if "quoted_amount_total" in quote_job_task.columns else ("job_no", "count"),
+                ).reset_index()
+            else:
+                quoted_by_job = pd.DataFrame({"job_no": []})
 
-        if pd.notna(quoted_hours) or pd.notna(actual_hours):
+            if len(quoted_by_job) > 0:
+                quoted_by_job = quoted_by_job.merge(
+                    actual_by_job[["job_no", "actual_cost"]],
+                    on="job_no",
+                    how="left",
+                )
+                quoted_by_job["quoted_margin"] = quoted_by_job["quoted_value"] - quoted_by_job["actual_cost"]
+                quoted_by_job["quoted_margin_pct"] = np.where(
+                    quoted_by_job["quoted_value"] > 0,
+                    quoted_by_job["quoted_margin"] / quoted_by_job["quoted_value"] * 100,
+                    np.nan,
+                )
+            else:
+                quoted_by_job = pd.DataFrame({"quoted_hours": [], "quoted_value": [], "quoted_margin_pct": []})
+
+            avg_quoted_hours = quoted_by_job["quoted_hours"].mean() if "quoted_hours" in quoted_by_job.columns else np.nan
+            avg_quoted_value = quoted_by_job["quoted_value"].mean() if "quoted_value" in quoted_by_job.columns else np.nan
+            avg_quoted_margin_pct = quoted_by_job["quoted_margin_pct"].mean() if "quoted_margin_pct" in quoted_by_job.columns else np.nan
+
+            avg_actual_hours = actual_by_job["actual_hours"].mean() if "actual_hours" in actual_by_job.columns else np.nan
+            avg_actual_value = actual_by_job["actual_value"].mean() if "actual_value" in actual_by_job.columns else np.nan
+            avg_actual_margin_pct = actual_by_job["actual_margin_pct"].mean() if "actual_margin_pct" in actual_by_job.columns else np.nan
+
             what_if_line = (
-                f"WHAT‑IF (Selected jobs): "
-                f"Quoted {fmt_hours(quoted_hours)} hrs @ {fmt_currency(quoted_value)} "
-                f"({fmt_percent(quoted_margin_pct)} margin) "
-                f"vs Actual {fmt_hours(actual_hours)} hrs @ {fmt_currency(actual_value)} "
-                f"({fmt_percent(actual_margin_pct)} margin)."
+                f"WHAT‑IF (Avg per job, {job_count} jobs): "
+                f"Quoted {fmt_hours(avg_quoted_hours)} hrs @ {fmt_currency(avg_quoted_value)} "
+                f"({fmt_percent(avg_quoted_margin_pct)} margin) "
+                f"vs Actual {fmt_hours(avg_actual_hours)} hrs @ {fmt_currency(avg_actual_value)} "
+                f"({fmt_percent(avg_actual_margin_pct)} margin)."
             )
         if what_if_line:
             st.caption(what_if_line)
