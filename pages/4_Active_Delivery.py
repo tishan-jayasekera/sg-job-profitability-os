@@ -16,7 +16,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.ui.state import init_state
 from src.ui.layout import section_header
-from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent, fmt_rate
+from src.ui.formatting import (
+    fmt_currency,
+    fmt_hours,
+    fmt_percent,
+    fmt_rate,
+    build_job_name_lookup,
+    format_job_label,
+)
 from src.data.loader import load_fact_timesheet
 from src.data.semantic import safe_quote_job_task, get_category_col
 from src.data.cohorts import get_active_jobs
@@ -467,9 +474,15 @@ def main():
         st.warning("No active jobs found for the selected filters.")
         return
 
+    job_name_lookup = build_job_name_lookup(df_scope)
     job_options = ["Auto"] + sorted(jobs_df["job_no"].dropna().unique().tolist())
     with job_col:
-        selected_job_choice = st.selectbox("Job", job_options, key="ad_job")
+        selected_job_choice = st.selectbox(
+            "Job",
+            job_options,
+            key="ad_job",
+            format_func=lambda j: format_job_label(j, job_name_lookup),
+        )
 
     with band_col:
         band_filter = st.multiselect(

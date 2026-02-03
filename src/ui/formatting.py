@@ -3,7 +3,7 @@ Consistent number and display formatting.
 """
 import pandas as pd
 import numpy as np
-from typing import Union, Optional, Any
+from typing import Union, Optional, Any, Dict
 
 try:
     from pandas.io.formats.style import Styler
@@ -61,6 +61,45 @@ def fmt_variance(value: Union[float, int, None], is_percent: bool = False) -> st
     if is_percent:
         return f"{sign}{value:,.1f}%"
     return f"{sign}${value:,.0f}"
+
+
+# =============================================================================
+# LABEL HELPERS
+# =============================================================================
+
+def build_job_name_lookup(
+    df: pd.DataFrame,
+    job_no_col: str = "job_no",
+    job_name_col: str = "job_name",
+) -> Dict[str, str]:
+    """Build a job_no -> job_name lookup from a dataframe."""
+    if job_no_col not in df.columns or job_name_col not in df.columns:
+        return {}
+
+    subset = df[[job_no_col, job_name_col]].dropna(subset=[job_no_col]).copy()
+    if len(subset) == 0:
+        return {}
+
+    subset[job_no_col] = subset[job_no_col].astype(str)
+    lookup = (
+        subset.drop_duplicates()
+        .groupby(job_no_col)[job_name_col]
+        .agg(lambda x: x.dropna().iloc[0] if len(x.dropna()) > 0 else "")
+        .to_dict()
+    )
+    return {str(k): v for k, v in lookup.items() if isinstance(k, str) or k is not None}
+
+
+def format_job_label(job_no: Any, job_name_lookup: Optional[Dict[str, str]] = None) -> str:
+    """Format job label as 'JOB_NO — JOB_NAME' when available."""
+    if job_no is None or (isinstance(job_no, float) and pd.isna(job_no)):
+        return "—"
+    job_key = str(job_no)
+    if job_name_lookup:
+        job_name = job_name_lookup.get(job_key)
+        if job_name is not None and str(job_name).strip():
+            return f"{job_key} — {job_name}"
+    return job_key
 
 
 # =============================================================================

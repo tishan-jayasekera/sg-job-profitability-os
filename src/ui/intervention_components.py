@@ -16,7 +16,14 @@ import numpy as np
 from typing import Optional, Dict, List, Tuple
 from datetime import datetime
 
-from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent, fmt_rate
+from src.ui.formatting import (
+    fmt_currency,
+    fmt_hours,
+    fmt_percent,
+    fmt_rate,
+    build_job_name_lookup,
+    format_job_label,
+)
 from src.modeling.intervention import (
     compute_quadrant_health_summary,
     build_intervention_queue,
@@ -204,11 +211,13 @@ def render_intervention_queue(
     st.dataframe(display_df, use_container_width=True, hide_index=True)
     
     # Optional: row selection (if callback provided)
+    job_name_lookup = build_job_name_lookup(quadrant_jobs)
     selected_job = st.selectbox(
         "Select a job for detailed review",
         options=["—"] + queue_display["job_no"].tolist(),
         key="intervention_job_select",
         label_visibility="collapsed",
+        format_func=lambda j: format_job_label(j, job_name_lookup),
     )
     
     if selected_job != "—":

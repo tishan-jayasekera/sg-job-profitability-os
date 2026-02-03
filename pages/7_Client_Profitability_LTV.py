@@ -39,6 +39,7 @@ from src.ui.components import (
 )
 from src.ui import charts as charts
 from src.ui.state import init_state, get_state, set_state
+from src.ui.formatting import build_job_name_lookup, format_job_label
 
 
 st.set_page_config(page_title="Client Profitability & LTV", page_icon="📈", layout="wide")
@@ -230,6 +231,7 @@ def main():
 
     chain_cols = st.columns(5)
     with chain_cols[0]:
+        job_name_lookup = build_job_name_lookup(df_client_window)
         job_options = ["All"] + sorted(df_client_window["job_no"].dropna().unique().tolist())
         if st.session_state[chain_key_map["job"]] not in job_options:
             st.session_state[chain_key_map["job"]] = "All"
@@ -239,6 +241,7 @@ def main():
             key=chain_key_map["job"],
             on_change=_reset_chain_from,
             args=("job",),
+            format_func=lambda j: format_job_label(j, job_name_lookup),
         )
     if selected_job != "All":
         df_client_window = df_client_window[df_client_window["job_no"] == selected_job]

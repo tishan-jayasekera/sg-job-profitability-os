@@ -18,7 +18,14 @@ from src.ui.state import (
     QuotePlan, QuotePlanTask, get_quote_plan, set_quote_plan
 )
 from src.ui.layout import section_header
-from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent, fmt_rate
+from src.ui.formatting import (
+    fmt_currency,
+    fmt_hours,
+    fmt_percent,
+    fmt_rate,
+    build_job_name_lookup,
+    format_job_label,
+)
 from src.data.loader import load_fact_timesheet, load_mart
 from src.data.semantic import safe_quote_job_task, get_category_col
 from src.data.cohorts import (
@@ -262,6 +269,7 @@ def main():
         selected_clients = st.multiselect(
             "Client(s) to compare",
             options=client_options,
+            default=client_options,
             key="quote_compare_clients",
         )
 
@@ -271,15 +279,23 @@ def main():
             df_client_slice = df_slice
 
         job_options = sorted(df_client_slice["job_no"].dropna().unique().tolist()) if "job_no" in df_client_slice.columns else []
+        job_name_lookup = build_job_name_lookup(df_client_slice)
         job_category_lookup = {}
         if "job_category_quote" in df_client_slice.columns and job_options:
             job_category_lookup = (
                 df_client_slice[["job_no", "job_category_quote"]]
                 .dropna()
+                .assign(job_no=lambda d: d["job_no"].astype(str))
                 .groupby("job_no")["job_category_quote"]
                 .agg(lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else x.iloc[0])
                 .to_dict()
             )
+        def _parse_keywords(raw: str) -> list[str]:
+            if not raw:
+                return []
+            parts = [p.strip() for p in raw.replace("\n", ",").split(",")]
+            return [p for p in parts if p]
+
         use_all_jobs = st.checkbox(
             "Use all jobs from selected clients",
             value=True,
@@ -290,12 +306,162 @@ def main():
 
         selected_jobs = []
         if selected_clients and not use_all_jobs and job_options:
+            keyword_matches = []
+            if "job_description" in df_client_slice.columns:
+                st.markdown("**Keyword Search (Job Description)**")
+                keyword_input = st.text_area(
+                    "Enter keywords or phrases (comma or new line separated)",
+                    placeholder="e.g. retainer, performance marketing, SEO audit",
+                    key="quote_job_keyword_input",
+                )
+                exclude_input = st.text_area(
+                    "Exclude keywords or phrases (comma or new line separated)",
+                    placeholder="e.g. brand, offline",
+                    key="quote_job_keyword_exclude_input",
+                )
+                match_mode = st.selectbox(
+                    "Match mode",
+                    options=["Match any keyword", "Match all keywords"],
+                    key="quote_job_keyword_mode",
+                )
+                use_regex = st.checkbox(
+                    "Regex mode",
+                    value=False,
+                    help="Treat keywords as regex patterns.",
+                    key="quote_job_keyword_regex",
+                )
+                keywords = _parse_keywords(keyword_input)
+                exclude_keywords = _parse_keywords(exclude_input)
+
+                if keywords:
+                    desc_df = (
+                        df_client_slice[["job_no", "job_description"]]
+                        .dropna(subset=["job_no", "job_description"])
+                        .drop_duplicates(subset=["job_no"])
+                        .copy()
+                    )
+                    desc_df["job_no"] = desc_df["job_no"].astype(str)
+                    descriptions = desc_df.set_index("job_no")["job_description"].astype(str).str.lower()
+                    keyword_hits = []
+                    for keyword in keywords:
+                        keyword_l = keyword.lower()
+                        hits = descriptions.index[
+                            descriptions.str.contains(keyword_l, regex=use_regex, na=False)
+                        ]
+                        keyword_hits.append(set(hits.tolist()))
+
+                    if keyword_hits:
+                        if match_mode == "Match all keywords":
+                            matched = set.intersection(*keyword_hits)
+                        else:
+                            matched = set.union(*keyword_hits)
+                        keyword_matches = sorted(matched)
+
+                if keyword_matches and exclude_keywords:
+                    exclude_hits = set()
+                    for keyword in exclude_keywords:
+                        keyword_l = keyword.lower()
+                        hits = descriptions.index[
+                            descriptions.str.contains(keyword_l, regex=use_regex, na=False)
+                        ]
+                        exclude_hits.update(hits.tolist())
+                    keyword_matches = sorted(set(keyword_matches) - exclude_hits)
+
+                if keyword_matches:
+                    st.caption(f"Keyword matches: {len(keyword_matches)} jobs")
+                    if st.button("Select all keyword matches", key="quote_select_keyword_jobs"):
+                        existing = st.session_state.get("quote_compare_jobs", []) or []
+                        st.session_state["quote_compare_jobs"] = sorted(set(existing) | set(keyword_matches))
+                        st.rerun()
+                elif keywords:
+                    st.caption("Keyword matches: 0 jobs")
+
+                st.markdown("**Find similar jobs from a pasted description**")
+                paste_desc = st.text_area(
+                    "Paste a job description to find similar jobs",
+                    placeholder="Paste a brief job description here...",
+                    key="quote_job_similarity_input",
+                )
+                top_k = st.slider(
+                    "Results to show",
+                    min_value=3,
+                    max_value=15,
+                    value=8,
+                    step=1,
+                    key="quote_job_similarity_topk",
+                )
+
+                def _tokenize(text: str) -> list[str]:
+                    if not text:
+                        return []
+                    text = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
+                    tokens = [t for t in text.split() if len(t) > 2]
+                    stop = {
+                        "the", "and", "for", "with", "from", "that", "this", "into", "onto",
+                        "your", "our", "their", "was", "were", "are", "is", "to", "of", "in",
+                        "on", "by", "as", "an", "a", "at", "or", "be", "it", "its", "we"
+                    }
+                    return [t for t in tokens if t not in stop]
+
+                if paste_desc:
+                    desc_df = (
+                        df_client_slice[["job_no", "job_description"]]
+                        .dropna(subset=["job_no", "job_description"])
+                        .drop_duplicates(subset=["job_no"])
+                        .copy()
+                    )
+                    desc_df["job_no"] = desc_df["job_no"].astype(str)
+                    query_tokens = set(_tokenize(paste_desc))
+                    if len(query_tokens) == 0:
+                        st.info("Paste a longer description to match.")
+                    else:
+                        rows = []
+                        for _, row in desc_df.iterrows():
+                            tokens = set(_tokenize(str(row["job_description"])))
+                            if not tokens:
+                                continue
+                            overlap = query_tokens.intersection(tokens)
+                            jaccard = len(overlap) / len(query_tokens.union(tokens))
+                            if jaccard == 0:
+                                continue
+                            rows.append({
+                                "job_no": row["job_no"],
+                                "score": jaccard,
+                                "overlap_terms": ", ".join(sorted(list(overlap))[:8]),
+                            })
+
+                        if rows:
+                            sim_df = pd.DataFrame(rows).sort_values("score", ascending=False).head(top_k)
+                            sim_df["job_label"] = sim_df["job_no"].apply(
+                                lambda j: format_job_label(j, job_name_lookup)
+                            )
+                            st.dataframe(
+                                sim_df[["job_label", "score", "overlap_terms"]].rename(columns={
+                                    "job_label": "Job",
+                                    "score": "Similarity",
+                                    "overlap_terms": "Why (overlap terms)",
+                                }),
+                                use_container_width=True,
+                                hide_index=True,
+                                column_config={
+                                    "Similarity": st.column_config.NumberColumn(format="%.2f"),
+                                },
+                            )
+                            if st.button("Select all similar jobs", key="quote_select_similar_jobs"):
+                                existing = st.session_state.get("quote_compare_jobs", []) or []
+                                st.session_state["quote_compare_jobs"] = sorted(set(existing) | set(sim_df["job_no"].tolist()))
+                                st.rerun()
+                        else:
+                            st.caption("No close matches found for the pasted description.")
+
             selected_jobs = st.multiselect(
                 "Select specific jobs",
                 options=job_options,
-                format_func=lambda j: f"{j} — {job_category_lookup.get(j, 'Unknown')}"
-                if job_category_lookup
-                else str(j),
+                format_func=lambda j: (
+                    f"{format_job_label(j, job_name_lookup)} — {job_category_lookup.get(str(j), 'Unknown')}"
+                    if job_category_lookup
+                    else format_job_label(j, job_name_lookup)
+                ),
                 key="quote_compare_jobs",
             )
 
@@ -322,11 +488,25 @@ def main():
         
         st.markdown("---")
         
-        # Get task benchmarks
-        benchmarks = get_task_benchmarks(
-            df_compare, selected_dept, selected_cat,
-            recency_weighted=recency_weighted
+        bench_key = (
+            "quote_benchmarks",
+            selected_dept,
+            selected_cat,
+            benchmark_window,
+            tuple(selected_clients),
+            tuple(selected_jobs),
+            bool(recency_weighted),
         )
+        if st.session_state.get("quote_bench_key") != bench_key:
+            # Get task benchmarks
+            benchmarks = get_task_benchmarks(
+                df_compare, selected_dept, selected_cat,
+                recency_weighted=recency_weighted
+            )
+            st.session_state["quote_bench_key"] = bench_key
+            st.session_state["quote_benchmarks"] = benchmarks
+        else:
+            benchmarks = st.session_state.get("quote_benchmarks", pd.DataFrame())
         
         if len(benchmarks) == 0:
             st.warning("No task data available for this selection.")
@@ -362,6 +542,9 @@ def main():
             )
             st.session_state["quote_task_table"] = base_table
             st.session_state["quote_task_table_key"] = table_key
+            st.session_state["quote_task_locked"] = False
+            st.session_state["quote_task_locked_table"] = None
+            st.session_state["quote_econ_ready"] = False
 
         task_table = st.session_state["quote_task_table"].copy()
 
@@ -387,19 +570,30 @@ def main():
             if st.button("Select common tasks (≥50%)"):
                 task_table["Include"] = task_table["Inclusion %"] >= 50
                 task_table.loc[task_table["Include"], "Hours"] = task_table.loc[task_table["Include"], "Median (p50)"]
+                st.session_state["quote_task_table"] = task_table
+                st.session_state["quote_econ_ready"] = False
+                st.rerun()
         with action_cols[1]:
             if st.button("Select all"):
                 task_table["Include"] = True
                 task_table.loc[task_table["Include"], "Hours"] = task_table.loc[task_table["Include"], "Median (p50)"]
+                st.session_state["quote_task_table"] = task_table
+                st.session_state["quote_econ_ready"] = False
+                st.rerun()
         with action_cols[2]:
             if st.button("Clear all"):
                 task_table["Include"] = False
                 task_table["Hours"] = 0.0
+                st.session_state["quote_task_table"] = task_table
+                st.session_state["quote_econ_ready"] = False
+                st.rerun()
 
         if bulk_set != "Keep current":
             task_table.loc[task_table["Include"], "Hours"] = task_table.loc[
                 task_table["Include"], bulk_set
             ]
+            st.session_state["quote_task_table"] = task_table
+            st.session_state["quote_econ_ready"] = False
 
         # Apply filters for display
         view_table = task_table.copy()
@@ -425,41 +619,71 @@ def main():
             unsafe_allow_html=True,
         )
 
-        edited_view = st.data_editor(
-            view_table[[
-                "Include", "Task", "Hours", "Inclusion %",
-                "Low (p25)", "Median (p50)", "High (p75)",
-                "Overrun Risk %", "Cost/hr", "Quote Rate"
-            ]],
-            column_config={
-                "Include": st.column_config.CheckboxColumn("✅ Include"),
-                "Task": st.column_config.TextColumn("Task", disabled=True),
-                "Hours": st.column_config.NumberColumn("✅ Quote Hours", min_value=0, step=0.5),
-                "Inclusion %": st.column_config.NumberColumn("📊 Inclusion %", format="%.1f%%", disabled=True),
-                "Low (p25)": st.column_config.NumberColumn("📊 Low (p25)", format="%.1f", disabled=True),
-                "Median (p50)": st.column_config.NumberColumn("📊 Median (p50)", format="%.1f", disabled=True),
-                "High (p75)": st.column_config.NumberColumn("📊 High (p75)", format="%.1f", disabled=True),
-                "Overrun Risk %": st.column_config.NumberColumn("📊 Overrun Risk %", format="%.0f%%", disabled=True),
-                "Cost/hr": st.column_config.NumberColumn("📊 Cost/hr", format="$%.0f", disabled=True),
-                "Quote Rate": st.column_config.NumberColumn("📊 Quote Rate", format="$%.0f/hr", disabled=True),
-            },
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            key="task_editor"
-        )
+        locked = st.session_state.get("quote_task_locked", False)
+        edited_view = None
+        with st.form("quote_task_editor_form", clear_on_submit=False):
+            edited_view = st.data_editor(
+                view_table[[
+                    "Include", "Task", "Hours", "Inclusion %",
+                    "Low (p25)", "Median (p50)", "High (p75)",
+                    "Overrun Risk %", "Cost/hr", "Quote Rate"
+                ]],
+                column_config={
+                    "Include": st.column_config.CheckboxColumn("✅ Include", disabled=locked),
+                    "Task": st.column_config.TextColumn("Task", disabled=True),
+                    "Hours": st.column_config.NumberColumn("✅ Quote Hours", min_value=0, step=0.5, disabled=locked),
+                    "Inclusion %": st.column_config.NumberColumn("📊 Inclusion %", format="%.1f%%", disabled=True),
+                    "Low (p25)": st.column_config.NumberColumn("📊 Low (p25)", format="%.1f", disabled=True),
+                    "Median (p50)": st.column_config.NumberColumn("📊 Median (p50)", format="%.1f", disabled=True),
+                    "High (p75)": st.column_config.NumberColumn("📊 High (p75)", format="%.1f", disabled=True),
+                    "Overrun Risk %": st.column_config.NumberColumn("📊 Overrun Risk %", format="%.0f%%", disabled=True),
+                    "Cost/hr": st.column_config.NumberColumn("📊 Cost/hr", format="$%.0f", disabled=True),
+                    "Quote Rate": st.column_config.NumberColumn("📊 Quote Rate", format="$%.0f/hr", disabled=True),
+                },
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key="task_editor"
+            )
+            apply_edits = st.form_submit_button(
+                "Apply task edits",
+                disabled=locked,
+                help="Apply your Include/Hours changes without recomputing until you lock.",
+            )
 
-        # Merge edits back into full table
-        if len(edited_view) > 0:
+        # Merge edits back into full table only on submit
+        if apply_edits and edited_view is not None and len(edited_view) > 0 and not locked:
             update_cols = ["Include", "Hours"]
             task_table.set_index("Task", inplace=True)
             edited_view.set_index("Task", inplace=True)
             task_table.loc[edited_view.index, update_cols] = edited_view[update_cols]
             task_table.reset_index(inplace=True)
             st.session_state["quote_task_table"] = task_table
+            st.session_state["quote_econ_ready"] = False
 
-        edited_df = task_table[task_table["Include"]].copy()
-        
+        lock_cols = st.columns([1.2, 1, 1, 1.8])
+        with lock_cols[0]:
+            if st.button("Lock task selection", disabled=locked):
+                st.session_state["quote_task_locked"] = True
+                st.session_state["quote_task_locked_table"] = task_table.copy()
+                st.session_state["quote_econ_ready"] = False
+                st.rerun()
+        with lock_cols[1]:
+            if st.button("Unlock", disabled=not locked):
+                st.session_state["quote_task_locked"] = False
+                st.session_state["quote_task_locked_table"] = None
+                st.session_state["quote_econ_ready"] = False
+                st.rerun()
+        with lock_cols[2]:
+            if st.button("Compute quote economics", disabled=not locked):
+                st.session_state["quote_econ_ready"] = True
+                st.rerun()
+        with lock_cols[3]:
+            if locked:
+                st.caption("Selection locked. Unlock to edit tasks or hours.")
+            else:
+                st.caption("Edit tasks/hours, then lock to compute economics.")
+
         st.markdown("---")
         
         # =====================================================================
@@ -467,6 +691,17 @@ def main():
         # =====================================================================
         section_header("Quote Economics")
         
+        if not st.session_state.get("quote_econ_ready", False):
+            st.info("Lock your task selection and click **Compute quote economics** to update totals.")
+            return
+
+        locked_table = st.session_state.get("quote_task_locked_table")
+        if locked_table is None:
+            st.warning("No locked selection found. Lock tasks to compute economics.")
+            return
+
+        edited_df = locked_table[locked_table["Include"]].copy()
+
         # Calculate totals from edited data
         total_hours = edited_df["Hours"].sum()
         
@@ -502,24 +737,282 @@ def main():
         total_value = edited_df["task_value"].sum()
         total_margin = total_value - total_cost
         margin_pct = total_margin / total_value * 100 if total_value > 0 else 0
-        
+
+        # Scenario analytics
+        scenario_hours = {
+            "Low (p25)": edited_df["Low (p25)"].fillna(0.0),
+            "Median (p50)": edited_df["Median (p50)"].fillna(0.0),
+            "High (p75)": edited_df["High (p75)"].fillna(0.0),
+        }
+        scenario_rows = []
+        for label, hours_series in scenario_hours.items():
+            scenario_cost = (hours_series * edited_df[cost_col].fillna(benchmarks["cost_per_hour"].median())).sum()
+            scenario_value = (hours_series * edited_df[rate_col].fillna(benchmarks["quote_rate"].median())).sum()
+            scenario_margin = scenario_value - scenario_cost
+            scenario_margin_pct = scenario_margin / scenario_value * 100 if scenario_value > 0 else 0
+            scenario_rows.append({
+                "Scenario": label,
+                "Total Hours": hours_series.sum(),
+                "Est. Cost": scenario_cost,
+                "Est. Value": scenario_value,
+                "Est. Margin": scenario_margin,
+                "Margin %": scenario_margin_pct,
+            })
+        scenario_df = pd.DataFrame(scenario_rows)
+
+        # Task-level diagnostics
+        edited_df["Hours Delta vs Median"] = edited_df["Hours"] - edited_df["Median (p50)"].fillna(0.0)
+        edited_df["Quote Bias"] = np.where(
+            edited_df["Hours Delta vs Median"] > 0.01, "Over median",
+            np.where(edited_df["Hours Delta vs Median"] < -0.01, "Under median", "On median")
+        )
+        edited_df["Overrun Risk Band"] = np.where(
+            edited_df["Overrun Risk %"] >= 60, "High",
+            np.where(edited_df["Overrun Risk %"] >= 30, "Medium", "Low")
+        )
+
         # Display
+        st.markdown("#### Snapshot")
         econ_cols = st.columns(5)
-        
         with econ_cols[0]:
             st.metric("Total Hours", fmt_hours(total_hours))
-        
         with econ_cols[1]:
             st.metric("Est. Cost", fmt_currency(total_cost))
-        
         with econ_cols[2]:
             st.metric("Est. Value", fmt_currency(total_value))
-        
         with econ_cols[3]:
             st.metric("Est. Margin", fmt_currency(total_margin))
-        
         with econ_cols[4]:
             st.metric("Margin %", fmt_percent(margin_pct))
+
+        st.markdown("#### Margin Scenarios")
+        st.dataframe(
+            scenario_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Total Hours": st.column_config.NumberColumn(format="%.1f"),
+                "Est. Cost": st.column_config.NumberColumn(format="$%.0f"),
+                "Est. Value": st.column_config.NumberColumn(format="$%.0f"),
+                "Est. Margin": st.column_config.NumberColumn(format="$%.0f"),
+                "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
+            },
+        )
+
+        st.markdown("#### Task Diagnostics")
+        diag_df = edited_df[[
+            "Task",
+            "Hours",
+            "Low (p25)",
+            "Median (p50)",
+            "High (p75)",
+            "Hours Delta vs Median",
+            "Quote Bias",
+            "Overrun Risk %",
+            "Overrun Risk Band",
+            "Cost/hr",
+            "Quote Rate",
+        ]].copy()
+        st.dataframe(
+            diag_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Hours": st.column_config.NumberColumn(format="%.1f"),
+                "Low (p25)": st.column_config.NumberColumn(format="%.1f"),
+                "Median (p50)": st.column_config.NumberColumn(format="%.1f"),
+                "High (p75)": st.column_config.NumberColumn(format="%.1f"),
+                "Hours Delta vs Median": st.column_config.NumberColumn(format="%+.1f"),
+                "Overrun Risk %": st.column_config.NumberColumn(format="%.0f%%"),
+                "Cost/hr": st.column_config.NumberColumn(format="$%.0f"),
+                "Quote Rate": st.column_config.NumberColumn(format="$%.0f/hr"),
+            },
+        )
+
+        st.markdown("#### Prevalent Tasks Not Selected")
+        prevalence_threshold = st.slider(
+            "Flag tasks with inclusion % ≥",
+            min_value=0,
+            max_value=100,
+            value=50,
+            step=5,
+        )
+        missing_df = locked_table[
+            (locked_table["Include"] == False) &
+            (locked_table["Inclusion %"] >= prevalence_threshold)
+        ].copy()
+        if len(missing_df) > 0:
+            st.dataframe(
+                missing_df[[
+                    "Task",
+                    "Inclusion %",
+                    "Low (p25)",
+                    "Median (p50)",
+                    "High (p75)",
+                    "Overrun Risk %",
+                ]].sort_values("Inclusion %", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Inclusion %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Low (p25)": st.column_config.NumberColumn(format="%.1f"),
+                    "Median (p50)": st.column_config.NumberColumn(format="%.1f"),
+                    "High (p75)": st.column_config.NumberColumn(format="%.1f"),
+                    "Overrun Risk %": st.column_config.NumberColumn(format="%.0f%%"),
+                },
+            )
+            st.caption("These tasks are empirically common but currently excluded (possible human error).")
+        else:
+            st.caption("No high-prevalence tasks excluded.")
+
+        st.markdown("#### Target Margin Solver")
+        solver_cols = st.columns([1.1, 1.1, 1, 1.2])
+        with solver_cols[0]:
+            target_margin_pct = st.slider(
+                "Target margin %",
+                min_value=0,
+                max_value=60,
+                value=int(round(margin_pct)),
+                step=1,
+            )
+        with solver_cols[1]:
+            lever = st.selectbox(
+                "Lever",
+                options=["Adjust quote rates", "Adjust hours", "Adjust hours + rates"],
+                index=0,
+                help="Adjust rates and/or hours within bounds to reach the target margin.",
+            )
+        with solver_cols[2]:
+            max_uplift = st.slider("Max rate uplift %", 0, 80, 30, step=5)
+        with solver_cols[3]:
+            min_discount = st.slider("Max rate discount %", 0, 50, 0, step=5)
+
+        risk_weight = st.slider(
+            "Overrun risk weighting",
+            min_value=0.0,
+            max_value=1.5,
+            value=0.5,
+            step=0.1,
+            help="Higher values push more uplift to high-risk tasks.",
+        )
+
+        solver_df = edited_df.copy()
+        solver_df["Hours"] = solver_df["Hours"].fillna(0.0)
+        solver_df["Base Rate"] = solver_df[rate_col].fillna(benchmarks["quote_rate"].median())
+        solver_df["Cost/hr"] = solver_df[cost_col].fillna(benchmarks["cost_per_hour"].median())
+        solver_df["Overrun Risk %"] = solver_df["Overrun Risk %"].fillna(0.0)
+        solver_df["Low (p25)"] = solver_df["Low (p25)"].fillna(0.0)
+        solver_df["Median (p50)"] = solver_df["Median (p50)"].fillna(solver_df["Hours"])
+        solver_df["High (p75)"] = solver_df["High (p75)"].fillna(solver_df["Hours"])
+
+        # Risk weighting (normalized to mean 1)
+        risk_scale = 1 + (solver_df["Overrun Risk %"] / 100.0) * risk_weight
+        risk_scale = risk_scale / risk_scale.mean() if risk_scale.mean() else 1.0
+
+        def _solve_hours_mix() -> pd.Series:
+            base_hours = solver_df["Hours"].where(solver_df["Hours"] > 0, solver_df["Median (p50)"])
+            min_hours = solver_df["Low (p25)"].clip(lower=0.0)
+            max_hours = solver_df["High (p75)"].clip(lower=min_hours)
+            margin_per_hour = (solver_df["Base Rate"] - solver_df["Cost/hr"]).fillna(0.0)
+            if margin_per_hour.std() == 0:
+                return base_hours.clip(lower=min_hours, upper=max_hours)
+            margin_z = (margin_per_hour - margin_per_hour.mean()) / (margin_per_hour.std() + 1e-9)
+
+            def _margin_pct(hours: pd.Series) -> float:
+                value = (hours * solver_df["Base Rate"]).sum()
+                cost = (hours * solver_df["Cost/hr"]).sum()
+                return (value - cost) / value * 100 if value > 0 else 0.0
+
+            target = target_margin_pct
+            lo, hi = -1.5, 1.5
+            best = base_hours.copy()
+            for _ in range(40):
+                mid = (lo + hi) / 2
+                scaled = base_hours * (1 + mid * margin_z)
+                scaled = scaled.clip(lower=min_hours, upper=max_hours)
+                pct = _margin_pct(scaled)
+                best = scaled
+                if pct < target:
+                    lo = mid
+                else:
+                    hi = mid
+            return best
+
+        suggested_hours = solver_df["Hours"]
+        if lever in ["Adjust hours", "Adjust hours + rates"]:
+            suggested_hours = _solve_hours_mix()
+            solver_df["Suggested Hours"] = suggested_hours
+        else:
+            solver_df["Suggested Hours"] = solver_df["Hours"]
+
+        if lever in ["Adjust quote rates", "Adjust hours + rates"]:
+            total_cost = (solver_df["Suggested Hours"] * solver_df["Cost/hr"]).sum()
+            target_margin = target_margin_pct / 100.0
+            target_value = total_cost / (1 - target_margin) if target_margin < 0.99 else None
+
+            min_mult = 1 - (min_discount / 100.0)
+            max_mult = 1 + (max_uplift / 100.0)
+
+            if target_value is None:
+                st.warning("Target margin too high to solve safely.")
+                solver_df["Suggested Rate"] = solver_df["Base Rate"]
+            else:
+                def _total_value(scale: float) -> float:
+                    multipliers = (scale * risk_scale).clip(lower=min_mult, upper=max_mult)
+                    return float((solver_df["Suggested Hours"] * solver_df["Base Rate"] * multipliers).sum())
+
+                min_value = _total_value(0.0)
+                max_value = _total_value(10.0)
+
+                if target_value <= min_value:
+                    st.info("Target margin below achievable range at current bounds. Showing minimum rates.")
+                    chosen_scale = 0.0
+                elif target_value >= max_value:
+                    st.info("Target margin above achievable range at current bounds. Showing maximum rates.")
+                    chosen_scale = 10.0
+                else:
+                    lo, hi = 0.0, 10.0
+                    for _ in range(40):
+                        mid = (lo + hi) / 2
+                        if _total_value(mid) < target_value:
+                            lo = mid
+                        else:
+                            hi = mid
+                    chosen_scale = (lo + hi) / 2
+
+                multipliers = (chosen_scale * risk_scale).clip(lower=min_mult, upper=max_mult)
+                solver_df["Suggested Rate"] = solver_df["Base Rate"] * multipliers
+        else:
+            solver_df["Suggested Rate"] = solver_df["Base Rate"]
+
+        solver_df["Suggested Value"] = solver_df["Suggested Hours"] * solver_df["Suggested Rate"]
+        solver_df["Suggested Cost"] = solver_df["Suggested Hours"] * solver_df["Cost/hr"]
+        suggested_value = solver_df["Suggested Value"].sum()
+        suggested_cost = solver_df["Suggested Cost"].sum()
+        suggested_margin = suggested_value - suggested_cost
+        suggested_margin_pct = suggested_margin / suggested_value * 100 if suggested_value > 0 else 0
+
+        st.caption(
+            f"Suggested margin: {suggested_margin_pct:.1f}% "
+            f"(target {target_margin_pct:.0f}%). "
+            f"Avg rate change: {((solver_df['Suggested Rate'] / solver_df['Base Rate']).mean() - 1) * 100:.1f}%. "
+            f"Avg hours change: {((solver_df['Suggested Hours'] / solver_df['Hours'].replace(0, np.nan)).mean() - 1) * 100:.1f}%"
+        )
+
+        solver_view_cols = ["Task", "Hours", "Suggested Hours", "Base Rate", "Suggested Rate", "Overrun Risk %"]
+        solver_view = solver_df[solver_view_cols].copy()
+        st.dataframe(
+            solver_view,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Hours": st.column_config.NumberColumn(format="%.1f"),
+                "Suggested Hours": st.column_config.NumberColumn(format="%.1f"),
+                "Base Rate": st.column_config.NumberColumn(format="$%.0f/hr"),
+                "Suggested Rate": st.column_config.NumberColumn(format="$%.0f/hr"),
+                "Overrun Risk %": st.column_config.NumberColumn(format="%.0f%%"),
+            },
+        )
         
         st.markdown("---")
         

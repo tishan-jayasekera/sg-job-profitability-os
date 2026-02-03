@@ -15,7 +15,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.ui.state import init_state, get_state, set_state
 from src.ui.layout import section_header
-from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent, fmt_count
+from src.ui.formatting import (
+    fmt_currency,
+    fmt_hours,
+    fmt_percent,
+    fmt_count,
+    build_job_name_lookup,
+    format_job_label,
+)
 from src.ui.charts import time_series, quadrant_scatter, horizontal_bar
 from src.ui.intervention_components import (
     render_quadrant_health_summary,
@@ -1585,10 +1592,12 @@ planned hours aren’t inflated.
                 },
             )
 
+            job_name_lookup = build_job_name_lookup(deep_df)
             selected_job = st.selectbox(
                 "Select job for deep‑dive",
                 shortlist["job_no"].tolist() if len(shortlist) > 0 else [],
                 key="deep_job_select",
+                format_func=lambda j: format_job_label(j, job_name_lookup),
             )
 
             if selected_job:
