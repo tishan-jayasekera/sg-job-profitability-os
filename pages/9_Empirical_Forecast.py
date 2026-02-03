@@ -29,7 +29,6 @@ from src.ui.formatting import (
     fmt_hours,
     fmt_percent,
     fmt_rate,
-    format_job_label,
 )
 from src.ui.layout import section_header
 from src.ui.state import init_state
@@ -136,6 +135,15 @@ def _build_job_label_series(job_no_series: pd.Series, job_name_lookup: dict) -> 
     return pd.Series(labelled, index=job_no_series.index)
 
 
+def _fill_missing_from_job(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    if col not in df.columns or "job_no" not in df.columns:
+        return df
+    df = df.copy()
+    job_map = df.groupby("job_no")[col].agg(lambda s: s.dropna().iloc[0] if s.dropna().any() else np.nan)
+    df[col] = df[col].fillna(df["job_no"].map(job_map))
+    return df
+
+
 def _rate_frame(actuals: pd.DataFrame, quote: pd.DataFrame, group_keys: list[str]) -> pd.DataFrame:
     if group_keys:
         result = actuals.merge(quote, on=group_keys, how="left")
@@ -193,8 +201,18 @@ def _build_rate_tables(df: pd.DataFrame, category_col: str) -> dict:
             "job": pd.DataFrame(),
         }
 
-    key_mapping = df_base[["job_no", "task_name", "department_final", category_col]].drop_duplicates()
-    job_task = job_task.merge(key_mapping, on=["job_no", "task_name"], how="left")
+    mapping_source = df_base[["job_no", "task_name", "department_final", category_col, "hours_raw"]].copy()
+    mapping_source["hours_raw"] = mapping_source["hours_raw"].fillna(0)
+    mapping = mapping_source.groupby(
+        ["job_no", "task_name", "department_final", category_col],
+        dropna=False,
+    )["hours_raw"].sum().reset_index()
+    mapping = mapping.sort_values("hours_raw", ascending=False).drop_duplicates(["job_no", "task_name"])
+    job_task = job_task.merge(
+        mapping[["job_no", "task_name", "department_final", category_col]],
+        on=["job_no", "task_name"],
+        how="left",
+    )
 
     actuals_company = pd.DataFrame([{
         "hours": df_base["hours_raw"].sum(),
@@ -234,14 +252,12 @@ def _build_rate_tables(df: pd.DataFrame, category_col: str) -> dict:
         quoted_hours=("quoted_time_total", "sum"),
         quoted_amount=("quoted_amount_total", "sum"),
     ).reset_index()
-    job_attr = df_base.groupby("job_no").agg(
-        department_final=("department_final", "first"),
-        **{category_col: (category_col, "first")},
-    ).reset_index()
+    job_dim = df_base.groupby(["job_no", "department_final", category_col], dropna=False)["hours_raw"].sum().reset_index()
+    job_dim = job_dim.sort_values("hours_raw", ascending=False).drop_duplicates(["job_no"])
     if "job_name" in df_base.columns:
         job_name = df_base.groupby("job_no")["job_name"].first().reset_index()
-        job_attr = job_attr.merge(job_name, on="job_no", how="left")
-    job = job_actuals.merge(job_quote, on="job_no", how="left").merge(job_attr, on="job_no", how="left")
+        job_dim = job_dim.merge(job_name, on="job_no", how="left")
+    job = job_actuals.merge(job_quote, on="job_no", how="left").merge(job_dim, on="job_no", how="left")
     job["quote_rate"] = np.where(
         job["quoted_hours"] > 0,
         job["quoted_amount"] / job["quoted_hours"],
@@ -277,6 +293,18 @@ def _get_cached_tables(signature: tuple, df: pd.DataFrame, category_col: str) ->
     return tables
 
 
+def _rate_table_column_config() -> dict:
+    return {
+        "Quote Rate": st.column_config.NumberColumn(format="$%.0f"),
+        "Realised Rate": st.column_config.NumberColumn(format="$%.0f"),
+        "Rate Variance": st.column_config.NumberColumn(format="$%.0f"),
+        "Rate Capture %": st.column_config.NumberColumn(format="%.1f%%"),
+        "Total Leakage": st.column_config.NumberColumn(format="$%.0f"),
+        "Hours": st.column_config.NumberColumn(format="%.1f"),
+        "Revenue": st.column_config.NumberColumn(format="$%.0f"),
+    }
+
+
 def _safe_rate_table(df: pd.DataFrame, label_col: str) -> pd.DataFrame:
     display = df.copy()
     if label_col in display.columns:
@@ -309,10 +337,11 @@ def _compute_scope_creep(df_job: pd.DataFrame) -> tuple[float, float, float]:
     return pct, unquoted_hours, total_hours
 
 
-def _compute_hours_overrun(df_job: pd.DataFrame) -> tuple[float, float, float]:
+def _compute_hours_overrun(df_job: pd.DataFrame, job_task: pd.DataFrame | None = None) -> tuple[float, float, float]:
     if "task_name" not in df_job.columns:
         return np.nan, 0.0, 0.0
-    job_task = safe_quote_job_task(df_job)
+    if job_task is None:
+        job_task = safe_quote_job_task(df_job)
     if len(job_task) == 0 or "quoted_time_total" not in job_task.columns:
         return np.nan, 0.0, 0.0
     matched = job_task
@@ -344,7 +373,7 @@ def _compute_mix_variance(df_job: pd.DataFrame, baseline_cost_rate: float) -> tu
     return job_cost_rate, delta, delta_pct
 
 
-def _build_task_rate_table(df_job: pd.DataFrame) -> pd.DataFrame:
+def _build_task_rate_table(df_job: pd.DataFrame, job_task: pd.DataFrame | None = None) -> pd.DataFrame:
     if "task_name" not in df_job.columns:
         return pd.DataFrame()
     actuals = df_job.groupby("task_name").agg(
@@ -353,7 +382,8 @@ def _build_task_rate_table(df_job: pd.DataFrame) -> pd.DataFrame:
         cost=("base_cost", "sum"),
     ).reset_index()
 
-    job_task = safe_quote_job_task(df_job)
+    if job_task is None:
+        job_task = safe_quote_job_task(df_job)
     if len(job_task) > 0:
         quotes = job_task.groupby("task_name").agg(
             quoted_hours=("quoted_time_total", "sum"),
@@ -393,6 +423,37 @@ def _build_staff_table(df_job: pd.DataFrame) -> pd.DataFrame:
     staff["billable_share_pct"] = np.where(staff["hours"] > 0, staff["billable_hours"] / staff["hours"] * 100, np.nan)
     staff["cost_rate"] = np.where(staff["hours"] > 0, staff["cost"] / staff["hours"], np.nan)
     return staff.sort_values("billable_share_pct")
+
+
+def _build_job_drill(df_job: pd.DataFrame, baseline_cost_rate: float) -> dict:
+    job_task = safe_quote_job_task(df_job)
+    scope_pct, unquoted_hours, total_hours = _compute_scope_creep(df_job)
+    overrun_pct, actual_matched_hours, quoted_matched_hours = _compute_hours_overrun(df_job, job_task)
+    job_cost_rate, mix_delta, mix_delta_pct = _compute_mix_variance(df_job, baseline_cost_rate)
+    task_rates = _build_task_rate_table(df_job, job_task)
+    staff_rates = _build_staff_table(df_job)
+    return {
+        "scope_pct": scope_pct,
+        "unquoted_hours": unquoted_hours,
+        "total_hours": total_hours,
+        "overrun_pct": overrun_pct,
+        "actual_matched_hours": actual_matched_hours,
+        "quoted_matched_hours": quoted_matched_hours,
+        "job_cost_rate": job_cost_rate,
+        "mix_delta": mix_delta,
+        "mix_delta_pct": mix_delta_pct,
+        "task_rates": task_rates,
+        "staff_rates": staff_rates,
+    }
+
+
+def _get_job_drill_cache(signature: tuple, job_no: str, df_job: pd.DataFrame, baseline_cost_rate: float) -> dict:
+    cache = st.session_state.get("rc_job_cache")
+    if cache and cache.get("signature") == signature and cache.get("job_no") == job_no:
+        return cache["data"]
+    data = _build_job_drill(df_job, baseline_cost_rate)
+    st.session_state["rc_job_cache"] = {"signature": signature, "job_no": job_no, "data": data}
+    return data
 
 
 def _render_breadcrumb(job_label: str | None):
@@ -480,35 +541,47 @@ if len(df_filtered) == 0:
     st.stop()
 
 category_col = get_category_col(df_filtered)
-job_name_lookup = build_job_name_lookup(df_filtered)
+if "department_final" in df_filtered.columns:
+    df_filtered = _fill_missing_from_job(df_filtered, "department_final")
+if category_col in df_filtered.columns:
+    df_filtered = _fill_missing_from_job(df_filtered, category_col)
+
+valid_mask = pd.Series(True, index=df_filtered.index)
+if "department_final" in df_filtered.columns:
+    valid_mask = valid_mask & df_filtered["department_final"].notna()
+if category_col in df_filtered.columns:
+    valid_mask = valid_mask & df_filtered[category_col].notna()
+
+excluded_rows = int((~valid_mask).sum())
+df_valid = df_filtered.loc[valid_mask].copy()
+if excluded_rows > 0:
+    excluded_hours = df_filtered.loc[~valid_mask, "hours_raw"].sum() if "hours_raw" in df_filtered.columns else 0
+    st.caption(
+        f"Excluded {excluded_rows:,} rows ({excluded_hours:,.1f} hours) with missing department/category to keep rollups reconciled."
+    )
+
+job_name_lookup = build_job_name_lookup(df_valid)
 
 signature = (
     time_window,
     job_state,
     exclude_leave_toggle,
     include_nonbillable,
-    min_job_hours,
-    len(df_filtered),
-    df_filtered[date_col].min() if date_col in df_filtered.columns else None,
-    df_filtered[date_col].max() if date_col in df_filtered.columns else None,
+    len(df_valid),
+    df_valid[date_col].min() if date_col in df_valid.columns else None,
+    df_valid[date_col].max() if date_col in df_valid.columns else None,
 )
-rate_tables = _get_cached_tables(signature, df_filtered, category_col)
+rate_tables = _get_cached_tables(signature, df_valid, category_col)
 
 # Validate selections against filtered data
-available_departments = df_filtered["department_final"].dropna().unique().tolist()
+available_departments = df_valid["department_final"].dropna().unique().tolist()
 if st.session_state["rc_selected_department"] not in available_departments:
     if st.session_state["rc_selected_department"] is not None:
         _reset_to_company()
 
-selected_department = st.session_state.get("rc_selected_department")
-selected_category = st.session_state.get("rc_selected_category")
-selected_job = st.session_state.get("rc_selected_job")
-
-job_label = None
-if selected_job is not None:
-    job_label = format_job_label(selected_job, job_name_lookup)
-
-_render_breadcrumb(job_label)
+selected_department = None
+selected_category = None
+selected_job = None
 
 # ============================================================================== 
 # LEVEL 0 — COMPANY RATE CAPTURE
@@ -555,9 +628,9 @@ if waterfall_df["value"].notna().any():
 else:
     st.info("Not enough data to render the rate waterfall.")
 
-section_header("Departments by Rate Variance", "Click a department to drill down.")
+section_header("Departments by Rate Variance", "Portfolio view (no drill).")
 
-if "department_final" in df_filtered.columns:
+if "department_final" in df_valid.columns:
     dept_rates = rate_tables["dept"].copy()
     dept_rates = dept_rates.dropna(subset=["rate_variance"], how="all")
     dept_rates["total_leakage"] = np.where(
@@ -577,7 +650,7 @@ if "department_final" in df_filtered.columns:
         "hours",
         "revenue",
     ]
-    dept_display = _safe_rate_table(dept_rates[display_cols].copy(), "department_final")
+    dept_display = dept_rates[display_cols].copy()
     dept_display = dept_display.rename(columns={
         "department_final": "Department",
         "quote_rate": "Quote Rate",
@@ -589,161 +662,130 @@ if "department_final" in df_filtered.columns:
         "revenue": "Revenue",
     })
 
-    selection = st.dataframe(
+    st.dataframe(
         dept_display,
         use_container_width=True,
         hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
-        key="rc_dept_table",
+        column_config=_rate_table_column_config(),
     )
-
-    if selection and selection.selection and selection.selection.rows:
-        selected_idx = selection.selection.rows[0]
-        department_value = dept_rates.iloc[selected_idx]["department_final"]
-        if pd.notna(department_value):
-            _select_department(department_value)
-            st.rerun()
 else:
     st.warning("Department field missing from dataset.")
 
-# ============================================================================== 
-# LEVEL 1 — DEPARTMENT ANALYSIS
-# ============================================================================== 
-if st.session_state.get("rc_level") in ["department", "category", "job", "detail"]:
-    if selected_department is None:
-        st.info("Select a department from the table above to continue.")
-    else:
-        df_dept = df_filtered[df_filtered["department_final"] == selected_department]
+section_header("Department Detail", "Select a department to view category performance.")
 
-        section_header(
-            "Level 1 — Department Analysis",
-            "Is this department's rate leakage driven by specific job types?",
+dept_options = ["All"] + sorted(available_departments)
+selected_department = st.selectbox(
+    "Department",
+    options=dept_options,
+    index=0,
+    key="rc_department_select",
+)
+if selected_department == "All":
+    selected_department = None
+
+if selected_department:
+    df_dept = df_valid[df_valid["department_final"] == selected_department]
+    dept_row = dept_rates[dept_rates["department_final"] == selected_department].head(1)
+    if len(dept_row) > 0:
+        dept_row = dept_row.iloc[0]
+        dept_quote_rate = dept_row.get("quote_rate", np.nan)
+        dept_realised_rate = dept_row.get("realised_rate", np.nan)
+        dept_variance = dept_row.get("rate_variance", np.nan)
+    else:
+        dept_quote_rate = dept_realised_rate = dept_variance = np.nan
+
+    billable_share = np.nan
+    if "is_billable" in df_dept.columns:
+        total_hours = df_dept["hours_raw"].sum()
+        billable_hours = df_dept.loc[df_dept["is_billable"] == True, "hours_raw"].sum()
+        billable_share = (billable_hours / total_hours * 100) if total_hours > 0 else np.nan
+
+    kpi_cols = st.columns(4)
+    with kpi_cols[0]:
+        st.metric("Dept Quote Rate", fmt_rate(dept_quote_rate))
+    with kpi_cols[1]:
+        st.metric("Dept Realised Rate", fmt_rate(dept_realised_rate))
+    with kpi_cols[2]:
+        st.metric("Rate Variance", _fmt_rate_delta(dept_variance))
+    with kpi_cols[3]:
+        st.metric("Billable Share", fmt_percent(billable_share))
+
+    if category_col not in df_dept.columns:
+        st.warning("Category field missing from dataset.")
+    else:
+        cat_rates = rate_tables["category"].copy()
+        cat_rates = cat_rates[cat_rates["department_final"] == selected_department]
+        cat_rates["total_leakage"] = np.where(
+            cat_rates["rate_variance"] < 0,
+            -cat_rates["rate_variance"] * cat_rates["hours"],
+            0,
+        )
+        cat_rates = cat_rates.sort_values("rate_variance").reset_index(drop=True)
+
+        display_cols = [
+            category_col,
+            "quote_rate",
+            "realised_rate",
+            "rate_variance",
+            "rate_capture_pct",
+            "total_leakage",
+            "hours",
+            "revenue",
+        ]
+        cat_display = cat_rates[display_cols].copy()
+        cat_display = cat_display.rename(columns={
+            category_col: "Category",
+            "quote_rate": "Quote Rate",
+            "realised_rate": "Realised Rate",
+            "rate_variance": "Rate Variance",
+            "rate_capture_pct": "Rate Capture %",
+            "total_leakage": "Total Leakage",
+            "hours": "Hours",
+            "revenue": "Revenue",
+        })
+
+        section_header("Categories by Rate Variance", "Department slice (no drill).")
+        st.dataframe(
+            cat_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config=_rate_table_column_config(),
         )
 
-        dept_rates = rate_tables["dept"]
-        dept_row = dept_rates[dept_rates["department_final"] == selected_department].head(1)
-        if len(dept_row) > 0:
-            dept_row = dept_row.iloc[0]
-            dept_quote_rate = dept_row.get("quote_rate", np.nan)
-            dept_realised_rate = dept_row.get("realised_rate", np.nan)
-            dept_variance = dept_row.get("rate_variance", np.nan)
-        else:
-            dept_quote_rate = dept_realised_rate = dept_variance = np.nan
-
-        billable_share = np.nan
-        if "is_billable" in df_dept.columns:
-            total_hours = df_dept["hours_raw"].sum()
-            billable_hours = df_dept.loc[df_dept["is_billable"] == True, "hours_raw"].sum()
-            billable_share = (billable_hours / total_hours * 100) if total_hours > 0 else np.nan
-
-        kpi_cols = st.columns(4)
-        with kpi_cols[0]:
-            st.metric("Dept Quote Rate", fmt_rate(dept_quote_rate))
-        with kpi_cols[1]:
-            st.metric("Dept Realised Rate", fmt_rate(dept_realised_rate))
-        with kpi_cols[2]:
-            st.metric("Rate Variance", _fmt_rate_delta(dept_variance))
-        with kpi_cols[3]:
-            st.metric("Billable Share", fmt_percent(billable_share))
-
-        section_header("Categories by Rate Variance", "Click a category to drill down.")
-        if category_col not in df_dept.columns:
-            st.warning("Category field missing from dataset.")
-        else:
-            cat_rates = rate_tables["category"].copy()
-            cat_rates = cat_rates[cat_rates["department_final"] == selected_department]
-            cat_rates["total_leakage"] = np.where(
-                cat_rates["rate_variance"] < 0,
-                -cat_rates["rate_variance"] * cat_rates["hours"],
-                0,
-            )
-            cat_rates = cat_rates.sort_values("rate_variance").reset_index(drop=True)
-
-            display_cols = [
-                category_col,
-                "quote_rate",
-                "realised_rate",
-                "rate_variance",
-                "rate_capture_pct",
-                "total_leakage",
-                "hours",
-                "revenue",
-            ]
-            cat_display = _safe_rate_table(cat_rates[display_cols].copy(), category_col)
-            cat_display = cat_display.rename(columns={
-                category_col: "Category",
-                "quote_rate": "Quote Rate",
-                "realised_rate": "Realised Rate",
-                "rate_variance": "Rate Variance",
-                "rate_capture_pct": "Rate Capture %",
-                "total_leakage": "Total Leakage",
-                "hours": "Hours",
-                "revenue": "Revenue",
-            })
-
-            selection = st.dataframe(
-                cat_display,
-                use_container_width=True,
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="rc_category_table",
-            )
-
-            if selection and selection.selection and selection.selection.rows:
-                selected_idx = selection.selection.rows[0]
-                category_value = cat_rates.iloc[selected_idx][category_col]
-                if pd.notna(category_value):
-                    _select_category(category_value)
-                    st.rerun()
-
-# ============================================================================== 
-# LEVEL 2 — CATEGORY DISTRIBUTION
-# ============================================================================== 
-if st.session_state.get("rc_level") in ["category", "job", "detail"]:
-    if selected_department is None or selected_category is None:
-        st.info("Select a category to continue.")
-    else:
-        df_dept = df_filtered[df_filtered["department_final"] == selected_department]
-        df_category = df_dept[df_dept[category_col] == selected_category]
-
-        section_header(
-            "Level 2 — Category Distribution",
-            "Within this category, are all jobs leaking rate, or just a few outliers?",
+    show_job_detail = st.checkbox("Show job detail (slower)", value=False, key="rc_show_job_detail")
+    if show_job_detail:
+        job_rates = rate_tables["job"].copy()
+        job_rates = job_rates[job_rates["department_final"] == selected_department]
+        job_rates = job_rates[job_rates["hours"] >= min_job_hours].copy()
+        job_rates["total_leakage"] = np.where(
+            job_rates["rate_variance"] < 0,
+            -job_rates["rate_variance"] * job_rates["hours"],
+            0,
         )
+        job_rates = job_rates.sort_values("rate_variance").reset_index(drop=True)
 
-        if "job_no" not in df_category.columns:
-            st.warning("Job number field missing from dataset. Job drill is unavailable.")
+        if len(job_rates) == 0:
+            st.info("No jobs meet the current filters.")
         else:
-            job_rates = rate_tables["job"].copy()
-            job_rates = job_rates[job_rates["department_final"] == selected_department]
-            job_rates = job_rates[job_rates[category_col] == selected_category]
-            job_rates = job_rates[job_rates["hours"] >= min_job_hours].copy()
-            job_rates["total_leakage"] = np.where(
-                job_rates["rate_variance"] < 0,
-                -job_rates["rate_variance"] * job_rates["hours"],
-                0,
+            show_all_jobs = st.checkbox(
+                "Show all jobs (slow)",
+                value=False,
+                key="rc_jobs_all",
             )
-            job_rates = job_rates.sort_values("rate_variance").reset_index(drop=True)
-
-            job_rates["job_label"] = _build_job_label_series(job_rates["job_no"], job_name_lookup)
-
-            scatter_df = job_rates.dropna(subset=["quote_rate", "realised_rate"], how="any")
-            if len(scatter_df) > 0:
-                fig = charts.rate_scatter(
-                    scatter_df,
-                    group_col="job_label",
-                    revenue_col="revenue",
-                    quote_rate_col="quote_rate",
-                    realised_rate_col="realised_rate",
-                    title="Rate Capture Scatter (Quote vs Realised)",
+            job_limit = 200
+            if not show_all_jobs:
+                job_limit = st.slider(
+                    "Max jobs",
+                    min_value=25,
+                    max_value=500,
+                    value=200,
+                    step=25,
+                    key="rc_jobs_limit",
                 )
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Not enough rate data for the scatter plot.")
 
-            section_header("Worst Performing Jobs", "Click a job to drill down.")
+            display_rates = job_rates if show_all_jobs else job_rates.head(job_limit)
+            display_rates = display_rates.copy()
+            display_rates["job_label"] = _build_job_label_series(display_rates["job_no"], job_name_lookup)
             display_cols = [
                 "job_label",
                 "quote_rate",
@@ -754,8 +796,7 @@ if st.session_state.get("rc_level") in ["category", "job", "detail"]:
                 "hours",
                 "revenue",
             ]
-            job_display = _safe_rate_table(job_rates[display_cols].copy(), "job_label")
-            job_display = job_display.rename(columns={
+            job_display = display_rates[display_cols].rename(columns={
                 "job_label": "Job",
                 "quote_rate": "Quote Rate",
                 "realised_rate": "Realised Rate",
@@ -766,198 +807,12 @@ if st.session_state.get("rc_level") in ["category", "job", "detail"]:
                 "revenue": "Revenue",
             })
 
-            selection = st.dataframe(
+            section_header("Jobs by Rate Variance", "Department slice (optional detail).")
+            st.dataframe(
                 job_display,
                 use_container_width=True,
                 hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="rc_job_table",
+                column_config=_rate_table_column_config(),
             )
-
-            if selection and selection.selection and selection.selection.rows:
-                selected_idx = selection.selection.rows[0]
-                job_value = job_rates.iloc[selected_idx]["job_no"]
-                if pd.notna(job_value):
-                    _select_job(job_value)
-                    st.rerun()
-
-# ============================================================================== 
-# LEVEL 3 — JOB FORENSIC DRILL
-# ============================================================================== 
-if st.session_state.get("rc_level") in ["job", "detail"]:
-    if selected_job is None or "job_no" not in df_filtered.columns:
-        st.info("Select a job from Level 2 to view forensic levers.")
-    else:
-        df_dept = df_filtered[df_filtered["department_final"] == selected_department]
-        df_category = df_dept[df_dept[category_col] == selected_category]
-        df_job = df_category[df_category["job_no"].astype(str) == str(selected_job)].copy()
-
-        section_header(
-            "Level 3 — Job Forensic Drill",
-            "Why did this specific job fail to capture its quoted rate?",
-        )
-
-        job_rates = rate_tables["job"]
-        job_row = job_rates[job_rates["job_no"] == str(selected_job)].head(1)
-        if len(job_row) > 0:
-            row = job_row.iloc[0]
-            st.markdown(f"**Selected Job:** {format_job_label(selected_job, job_name_lookup)}")
-
-            metrics_cols = st.columns(4)
-            with metrics_cols[0]:
-                st.metric("Quote Rate", fmt_rate(row.get("quote_rate", np.nan)))
-            with metrics_cols[1]:
-                st.metric("Realised Rate", fmt_rate(row.get("realised_rate", np.nan)))
-            with metrics_cols[2]:
-                st.metric("Rate Variance", _fmt_rate_delta(row.get("rate_variance", np.nan)))
-            with metrics_cols[3]:
-                st.metric("Job Hours", fmt_hours(row.get("hours", 0)))
-        else:
-            st.info("No rate metrics available for this job.")
-
-        scope_pct, unquoted_hours, total_hours = _compute_scope_creep(df_job)
-        overrun_pct, actual_matched_hours, quoted_matched_hours = _compute_hours_overrun(df_job)
-
-        baseline_cost_rate = np.nan
-        if "hours_raw" in df_filtered.columns and "base_cost" in df_filtered.columns:
-            total_company_hours = df_filtered["hours_raw"].sum()
-            baseline_cost_rate = df_filtered["base_cost"].sum() / total_company_hours if total_company_hours > 0 else np.nan
-
-        job_cost_rate, mix_delta, mix_delta_pct = _compute_mix_variance(df_job, baseline_cost_rate)
-
-        st.markdown("**Levers**")
-        lever_cols = st.columns(3)
-        with lever_cols[0]:
-            st.metric("Scope Creep", fmt_percent(scope_pct))
-            st.caption(f"Unquoted hours: {fmt_hours(unquoted_hours)} / {fmt_hours(total_hours)}")
-            if st.button("Inspect Scope Creep", key="rc_lever_scope"):
-                _select_lever("Scope Creep")
-                st.rerun()
-        with lever_cols[1]:
-            st.metric("Hours Overrun", fmt_percent(overrun_pct))
-            st.caption(f"Matched hours: {fmt_hours(actual_matched_hours)} vs {fmt_hours(quoted_matched_hours)}")
-            if st.button("Inspect Hours Overrun", key="rc_lever_overrun"):
-                _select_lever("Hours Overrun")
-                st.rerun()
-        with lever_cols[2]:
-            st.metric("Mix Variance", fmt_percent(mix_delta_pct))
-            st.caption(f"Cost rate delta: {_fmt_rate_delta(mix_delta)}")
-            if st.button("Inspect Mix Variance", key="rc_lever_mix"):
-                _select_lever("Mix Variance")
-                st.rerun()
-
-        task_rates = _build_task_rate_table(df_job)
-        if len(task_rates) > 0:
-            section_header("Top Task Leakage", "Click a task to drill to level 4.")
-            task_display = task_rates.head(15).copy()
-            task_display["quote_rate"] = task_display["quote_rate"].apply(fmt_rate)
-            task_display["realised_rate"] = task_display["realised_rate"].apply(fmt_rate)
-            task_display["rate_variance"] = task_display["rate_variance"].apply(_fmt_rate_delta)
-            task_display["total_leakage"] = task_display["total_leakage"].apply(fmt_currency)
-            task_display = task_display.rename(columns={
-                "task_name": "Task",
-                "quote_rate": "Quote Rate",
-                "realised_rate": "Realised Rate",
-                "rate_variance": "Rate Variance",
-                "total_leakage": "Leakage",
-            })
-
-            selection = st.dataframe(
-                task_display[["Task", "Quote Rate", "Realised Rate", "Rate Variance", "Leakage"]],
-                use_container_width=True,
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="rc_task_table",
-            )
-
-            if selection and selection.selection and selection.selection.rows:
-                selected_idx = selection.selection.rows[0]
-                task_value = task_rates.iloc[selected_idx]["task_name"]
-                if pd.notna(task_value):
-                    _select_task(task_value)
-                    st.rerun()
-        else:
-            st.info("No task-level quote data available for this job.")
-
-# ============================================================================== 
-# LEVEL 4 — TASK & STAFF LEVERS
-# ============================================================================== 
-if st.session_state.get("rc_level") == "detail":
-    if selected_job is None:
-        st.info("Select a job or lever to continue.")
-    else:
-        df_dept = df_filtered[df_filtered["department_final"] == selected_department]
-        df_category = df_dept[df_dept[category_col] == selected_category]
-        df_job = df_category[df_category["job_no"].astype(str) == str(selected_job)].copy()
-
-        section_header(
-            "Level 4 — Task & Staff Levers",
-            "Which specific task or staff member drove the rate variance?",
-        )
-
-        if st.session_state.get("rc_selected_lever"):
-            st.markdown(f"**Selected Lever:** {st.session_state['rc_selected_lever']}")
-        if st.session_state.get("rc_selected_task"):
-            st.markdown(f"**Selected Task:** {st.session_state['rc_selected_task']}")
-
-        task_rates = _build_task_rate_table(df_job)
-        staff_rates = _build_staff_table(df_job)
-
-        lever = st.session_state.get("rc_selected_lever")
-        if lever == "Scope Creep" and "quote_match_flag" in task_rates.columns:
-            task_rates = task_rates[task_rates["quote_match_flag"] != "matched"]
-        elif lever == "Hours Overrun":
-            task_rates = task_rates[(task_rates["quoted_hours"] > 0) & (task_rates["hours"] > task_rates["quoted_hours"])]
-        elif lever == "Mix Variance":
-            staff_rates = staff_rates.sort_values("cost_rate", ascending=False)
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.markdown("**Task-Level Rate Variance**")
-            if len(task_rates) == 0:
-                st.info("No task-level data available for this lever.")
-            else:
-                task_display = task_rates.copy()
-                task_display["quote_rate"] = task_display["quote_rate"].apply(fmt_rate)
-                task_display["realised_rate"] = task_display["realised_rate"].apply(fmt_rate)
-                task_display["rate_variance"] = task_display["rate_variance"].apply(_fmt_rate_delta)
-                task_display["total_leakage"] = task_display["total_leakage"].apply(fmt_currency)
-                task_display["hours"] = task_display["hours"].apply(fmt_hours)
-                task_display = task_display.rename(columns={
-                    "task_name": "Task",
-                    "quote_rate": "Quote Rate",
-                    "realised_rate": "Realised Rate",
-                    "rate_variance": "Rate Variance",
-                    "total_leakage": "Leakage",
-                    "hours": "Hours",
-                })
-                st.dataframe(
-                    task_display[["Task", "Quote Rate", "Realised Rate", "Rate Variance", "Leakage", "Hours"]],
-                    use_container_width=True,
-                    hide_index=True,
-                )
-
-        with col2:
-            st.markdown("**Staff-Level Billable Share**")
-            if len(staff_rates) == 0:
-                st.info("No staff data available for this job.")
-            else:
-                staff_display = staff_rates.copy()
-                staff_display["hours"] = staff_display["hours"].apply(fmt_hours)
-                staff_display["billable_share_pct"] = staff_display["billable_share_pct"].apply(fmt_percent)
-                staff_display["cost_rate"] = staff_display["cost_rate"].apply(fmt_rate)
-                staff_display = staff_display.rename(columns={
-                    "staff_name": "Staff",
-                    "hours": "Hours",
-                    "billable_share_pct": "Billable Share",
-                    "cost_rate": "Cost Rate",
-                })
-                st.dataframe(
-                    staff_display[["Staff", "Hours", "Billable Share", "Cost Rate"]],
-                    use_container_width=True,
-                    hide_index=True,
-                )
 
 st.caption("Quote fields are deduped at the job-task level to prevent value inflation. Realised rates are hours-weighted.")

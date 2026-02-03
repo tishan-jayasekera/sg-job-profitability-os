@@ -664,6 +664,14 @@ def main():
         lock_cols = st.columns([1.2, 1, 1, 1.8])
         with lock_cols[0]:
             if st.button("Lock task selection", disabled=locked):
+                editor_state = st.session_state.get("task_editor")
+                if isinstance(editor_state, pd.DataFrame) and len(editor_state) > 0:
+                    update_cols = ["Include", "Hours"]
+                    task_table.set_index("Task", inplace=True)
+                    editor_state = editor_state.set_index("Task")
+                    task_table.loc[editor_state.index, update_cols] = editor_state[update_cols]
+                    task_table.reset_index(inplace=True)
+                    st.session_state["quote_task_table"] = task_table
                 st.session_state["quote_task_locked"] = True
                 st.session_state["quote_task_locked_table"] = task_table.copy()
                 st.session_state["quote_econ_ready"] = False
@@ -785,6 +793,38 @@ def main():
             st.metric("Est. Margin", fmt_currency(total_margin))
         with econ_cols[4]:
             st.metric("Margin %", fmt_percent(margin_pct))
+
+        # What-if: compare selected jobs' quoted vs actuals
+        what_if_line = None
+        if "hours_raw" in df_compare.columns:
+            actual_hours = df_compare["hours_raw"].sum()
+        else:
+            actual_hours = np.nan
+        actual_cost = df_compare["base_cost"].sum() if "base_cost" in df_compare.columns else np.nan
+        actual_value = df_compare["rev_alloc"].sum() if "rev_alloc" in df_compare.columns else np.nan
+        actual_margin = actual_value - actual_cost if pd.notna(actual_value) and pd.notna(actual_cost) else np.nan
+        actual_margin_pct = actual_margin / actual_value * 100 if pd.notna(actual_margin) and actual_value > 0 else np.nan
+
+        quote_job_task = safe_quote_job_task(df_compare)
+        if len(quote_job_task) > 0:
+            quoted_hours = quote_job_task["quoted_time_total"].sum() if "quoted_time_total" in quote_job_task.columns else np.nan
+            quoted_value = quote_job_task["quoted_amount_total"].sum() if "quoted_amount_total" in quote_job_task.columns else np.nan
+        else:
+            quoted_hours = np.nan
+            quoted_value = np.nan
+        quoted_margin = quoted_value - actual_cost if pd.notna(quoted_value) and pd.notna(actual_cost) else np.nan
+        quoted_margin_pct = quoted_margin / quoted_value * 100 if pd.notna(quoted_margin) and quoted_value > 0 else np.nan
+
+        if pd.notna(quoted_hours) or pd.notna(actual_hours):
+            what_if_line = (
+                f"WHAT‑IF (Selected jobs): "
+                f"Quoted {fmt_hours(quoted_hours)} hrs @ {fmt_currency(quoted_value)} "
+                f"({fmt_percent(quoted_margin_pct)} margin) "
+                f"vs Actual {fmt_hours(actual_hours)} hrs @ {fmt_currency(actual_value)} "
+                f"({fmt_percent(actual_margin_pct)} margin)."
+            )
+        if what_if_line:
+            st.caption(what_if_line)
 
         st.markdown("#### Margin Scenarios")
         st.dataframe(
