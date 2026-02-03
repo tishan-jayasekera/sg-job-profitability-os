@@ -701,6 +701,7 @@ def main():
             return
 
         edited_df = locked_table[locked_table["Include"]].copy()
+        edited_df["Hours"] = pd.to_numeric(edited_df["Hours"], errors="coerce").fillna(0.0)
 
         # Calculate totals from edited data
         total_hours = edited_df["Hours"].sum()
