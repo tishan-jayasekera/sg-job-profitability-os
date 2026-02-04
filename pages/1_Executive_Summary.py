@@ -2,6 +2,7 @@
 Executive Summary: Causal Root-Cause Drill Engine (v3.1)
 """
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -15,7 +16,28 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data.loader import load_fact_timesheet
 from src.metrics.profitability import classify_department, compute_department_scorecard
+from src.ui.formatting import build_job_name_lookup, format_job_label, fmt_percent, fmt_currency
 
+
+# =============================================================================
+# THEME
+# =============================================================================
+
+COLORS = {
+    "accretive": "#28a745",
+    "mixed": "#ffc107",
+    "erosive": "#dc3545",
+    "subsidiser": "#28a745",
+    "margin_erosive": "#dc3545",
+    "neutral": "#6c757d",
+    "border": "#e9ecef",
+    "background": "#f8f9fa",
+    "primary": "#1565c0",
+    "primary_light": "#e3f2fd",
+    "text_dark": "#1a1a1a",
+    "text_medium": "#666666",
+    "text_light": "#888888",
+}
 
 # =============================================================================
 # DATA LOADING
@@ -50,80 +72,127 @@ def load_data() -> pd.DataFrame:
 
 def render_global_control_bar() -> Tuple[pd.Timestamp, pd.Timestamp, str]:
     """
-    Render sticky global control bar.
+    Polished global control bar with professional styling.
     Returns (start_date, end_date, job_state).
     """
     st.markdown(
         """
         <style>
-        div[data-testid="stVerticalBlock"]:has(> div > span.global-controls-anchor) {
+        div[data-testid="stVerticalBlock"]:has(> div > span.control-bar-anchor) {
             position: sticky;
             top: 4rem;
             z-index: 100;
-            background-color: #f8f9fa;
-            padding: 1rem;
-            border-radius: 8px;
+            background: linear-gradient(180deg, #f8f9fa 0%, #ffffff 100%);
             border: 1px solid #e9ecef;
-            margin-bottom: 1rem;
+            border-radius: 12px;
+            padding: 1rem 1.5rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.04);
+        }
+        .control-label {
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: #666;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 0.35rem;
+        }
+        .context-pill {
+            display: inline-block;
+            background: #e3f2fd;
+            color: #1565c0;
+            padding: 0.5rem 1rem;
+            border-radius: 20px;
+            font-size: 0.85rem;
+            font-weight: 500;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
+    def segmented_or_radio(label: str, options: List[str], default: str, key: str):
+        segmented = getattr(st, "segmented_control", None)
+        if callable(segmented):
+            return segmented(
+                label,
+                options=options,
+                default=default,
+                key=key,
+                label_visibility="collapsed",
+            )
+        return st.radio(
+            label,
+            options=options,
+            horizontal=True,
+            index=options.index(default) if default in options else 0,
+            key=key,
+            label_visibility="collapsed",
+        )
+
+    legacy_map = {
+        "Last 30 Days": "30D",
+        "Last 90 Days": "90D",
+        "Last 6 Months": "6M",
+    }
+    if st.session_state.get("time_preset") in legacy_map:
+        st.session_state["time_preset"] = legacy_map[st.session_state["time_preset"]]
+    if st.session_state.get("time_preset") not in {"30D", "90D", "6M", "Custom"}:
+        st.session_state["time_preset"] = "90D"
+
     with st.container():
-        st.markdown('<span class="global-controls-anchor"></span>', unsafe_allow_html=True)
+        st.markdown('<span class="control-bar-anchor"></span>', unsafe_allow_html=True)
         col1, col2, col3 = st.columns([2, 2, 2])
 
-        # === A. TIME PERIOD SELECTOR ===
         with col1:
-            st.markdown("**📅 Time Period**")
-            time_preset = st.radio(
-                "Period:",
-                options=["Last 30 Days", "Last 90 Days", "Last 6 Months", "Custom"],
-                horizontal=True,
+            st.markdown('<p class="control-label">📅 Time Period</p>', unsafe_allow_html=True)
+            time_preset = segmented_or_radio(
+                "Period",
+                options=["30D", "90D", "6M", "Custom"],
+                default="90D",
                 key="time_preset",
-                label_visibility="collapsed",
             )
 
             today = pd.Timestamp.today().normalize()
+            preset_map = {
+                "30D": (today - pd.Timedelta(days=30), today),
+                "90D": (today - pd.Timedelta(days=90), today),
+                "6M": (today - pd.Timedelta(days=180), today),
+            }
 
-            if time_preset == "Last 30 Days":
-                start_date, end_date = today - pd.Timedelta(days=30), today
-            elif time_preset == "Last 90 Days":
-                start_date, end_date = today - pd.Timedelta(days=90), today
-            elif time_preset == "Last 6 Months":
-                start_date, end_date = today - pd.Timedelta(days=180), today
-            else:
+            if time_preset == "Custom":
                 c1, c2 = st.columns(2)
                 with c1:
                     start_date = pd.Timestamp(
-                        st.date_input("From", value=today - pd.Timedelta(days=90))
+                        st.date_input(
+                            "From",
+                            value=today - pd.Timedelta(days=90),
+                            label_visibility="collapsed",
+                        )
                     )
                 with c2:
-                    end_date = pd.Timestamp(st.date_input("To", value=today))
+                    end_date = pd.Timestamp(
+                        st.date_input("To", value=today, label_visibility="collapsed")
+                    )
+            else:
+                start_date, end_date = preset_map.get(time_preset, preset_map["90D"])
 
-        # === B. JOB STATE TOGGLE ===
         with col2:
-            st.markdown("**🏷️ Job State**")
-            job_state = st.radio(
-                "Show:",
+            st.markdown('<p class="control-label">🏷️ Job State</p>', unsafe_allow_html=True)
+            job_state = segmented_or_radio(
+                "State",
                 options=["Active", "Completed", "All"],
-                horizontal=True,
+                default="All",
                 key="job_state",
-                help=(
-                    "• **Active**: Jobs with activity in period, not yet completed\n"
-                    "• **Completed**: Jobs completed within the period\n"
-                    "• **All**: Union of Active + Completed"
-                ),
             )
 
-        # === C. CONTEXT SUMMARY ===
         with col3:
-            st.markdown("**📊 Current Context**")
-            st.caption(f"Period: {start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}")
-            st.caption(f"Job State: {job_state}")
-            st.caption("_All metrics reflect activity within this context._")
+            st.markdown('<p class="control-label">📊 Current View</p>', unsafe_allow_html=True)
+            period_str = f"{start_date.strftime('%d %b')} – {end_date.strftime('%d %b %Y')}"
+            st.markdown(
+                f'<span class="context-pill">{job_state} • {period_str}</span>',
+                unsafe_allow_html=True,
+            )
 
     return start_date, end_date, job_state
 
@@ -240,6 +309,7 @@ def set_department_with_context(dept: str, classification: str, reasons: List[st
         "classification": classification,
         "reasons": reasons,
     }
+    st.session_state.pop("selected_segment", None)
     st.session_state.drill_path["category"] = None
     st.session_state.drill_path["category_context"] = None
     st.session_state.drill_path["job"] = None
@@ -253,6 +323,7 @@ def set_category_with_context(cat: Optional[str], classification: str, reasons: 
         "classification": classification,
         "reasons": reasons,
     }
+    st.session_state.pop("selected_segment", None)
     st.session_state.drill_path["job"] = None
     st.session_state.drill_path["task"] = None
 
@@ -473,29 +544,105 @@ def compute_rate_bridge(job_df: pd.DataFrame, portfolio_metrics: Dict) -> pd.Dat
 
 
 def render_kpi_strip(metrics: Dict):
-    cols = st.columns(6)
+    kpi_style = """
+    <style>
+    :root { color-scheme: light; }
+    body { margin: 0; font-family: Arial, sans-serif; }
+    .kpi-container {
+        display: grid;
+        grid-template-columns: repeat(6, 1fr);
+        gap: 1rem;
+        margin: 0.25rem 0 0.75rem;
+    }
+    .kpi-card {
+        background: white;
+        border: 1px solid #e9ecef;
+        border-radius: 12px;
+        padding: 1.25rem;
+        text-align: center;
+        transition: all 0.2s;
+    }
+    .kpi-card:hover {
+        border-color: #1565c0;
+        box-shadow: 0 4px 12px rgba(21, 101, 192, 0.1);
+    }
+    .kpi-value {
+        font-size: 1.6rem;
+        font-weight: 700;
+        color: #1a1a1a;
+        line-height: 1.2;
+        margin-bottom: 0.5rem;
+    }
+    .kpi-value.positive { color: #28a745; }
+    .kpi-value.negative { color: #dc3545; }
+    .kpi-label {
+        font-size: 0.75rem;
+        color: #888;
+        text-transform: uppercase;
+        letter-spacing: 0.5px;
+    }
+    .kpi-delta {
+        font-size: 0.85rem;
+        margin-top: 0.25rem;
+    }
+    .kpi-delta.up { color: #28a745; }
+    .kpi-delta.down { color: #dc3545; }
+    @media (max-width: 900px) {
+        .kpi-container { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 600px) {
+        .kpi-container { grid-template-columns: 1fr; }
+    }
+    </style>
+    """
 
-    with cols[0]:
-        st.metric("Quote Rate", f"${metrics['quote_rate']:,.0f}/hr")
+    kpi_config = [
+        ("quote_rate", "Quote Rate", "rate", None),
+        ("realised_rate", "Realised Rate", "rate", "rate_variance"),
+        ("rate_variance", "Rate Variance", "variance", None),
+        ("margin_pct", "Margin", "percent", None),
+        ("pct_jobs_overrun", "% Overrun", "percent0", None),
+        ("pct_jobs_critical_overrun", "% Critical", "percent0", None),
+    ]
 
-    with cols[1]:
-        st.metric(
-            "Realised Rate",
-            f"${metrics['realised_rate']:,.0f}/hr",
-            delta=f"${metrics['rate_variance']:+,.0f}",
+    kpi_items = []
+    for key, label, fmt_type, delta_key in kpi_config:
+        value = metrics.get(key)
+
+        if fmt_type == "rate":
+            display = f"${value:,.0f}/hr" if pd.notna(value) else "—"
+        elif fmt_type == "percent":
+            display = fmt_percent(value) if pd.notna(value) else "—"
+        elif fmt_type == "percent0":
+            display = f"{value:.0f}%" if pd.notna(value) else "—"
+        elif fmt_type == "variance":
+            display = f"${value:+,.0f}/hr" if pd.notna(value) else "—"
+        else:
+            display = str(value) if pd.notna(value) else "—"
+
+        value_class = ""
+        if key in {"rate_variance"} and pd.notna(value):
+            value_class = "positive" if value > 0 else "negative" if value < 0 else ""
+
+        delta_html = ""
+        if delta_key and delta_key in metrics:
+            delta_val = metrics.get(delta_key)
+            if pd.notna(delta_val):
+                delta_class = "up" if delta_val > 0 else "down"
+                delta_html = f'<div class="kpi-delta {delta_class}">{delta_val:+.0f}</div>'
+
+        kpi_items.append(
+            f"""
+            <div class="kpi-card">
+                <div class="kpi-value {value_class}">{display}</div>
+                <div class="kpi-label">{label}</div>
+                {delta_html}
+            </div>
+            """
         )
 
-    with cols[2]:
-        st.metric("Rate Variance", f"${metrics['rate_variance']:+,.0f}/hr")
-
-    with cols[3]:
-        st.metric("Portfolio Margin", f"{metrics['margin_pct']:.1f}%")
-
-    with cols[4]:
-        st.metric("% Jobs Overrun", f"{metrics['pct_jobs_overrun']:.0f}%")
-
-    with cols[5]:
-        st.metric("% Critical Overrun", f"{metrics['pct_jobs_critical_overrun']:.0f}%")
+    kpi_html = f"{kpi_style}<div class='kpi-container'>{''.join(kpi_items)}</div>"
+    components.html(kpi_html, height=260, scrolling=False)
 
 
 def render_rate_bridge(bridge_df: pd.DataFrame):
@@ -530,52 +677,207 @@ def render_rate_bridge(bridge_df: pd.DataFrame):
 # =============================================================================
 
 
+def render_department_card(row: pd.Series, classification: str):
+    """Render a single polished department card."""
+    class_lower = classification.lower()
+    badge_class = f"badge-{class_lower}"
+
+    rate_var = row.get("rate_variance")
+    rate_class = (
+        "negative"
+        if pd.notna(rate_var) and rate_var < 0
+        else "positive"
+        if pd.notna(rate_var) and rate_var > 0
+        else ""
+    )
+    rate_display = f"${rate_var:+.0f}/hr" if pd.notna(rate_var) else "—"
+
+    overrun_pct = row.get("pct_overrun")
+    overrun_display = f"{overrun_pct:.0f}%" if pd.notna(overrun_pct) else "—"
+
+    margin_pct = row.get("margin_pct")
+    margin_display = f"{margin_pct:.0f}%" if pd.notna(margin_pct) else "—"
+
+    reasons_html = ""
+    if row.get("reasons"):
+        reasons_items = "".join([f"<li>{r}</li>" for r in row["reasons"]])
+        reasons_html = f'<ul class="dept-reasons">{reasons_items}</ul>'
+
+    card_html = f"""
+    <div class="dept-card {class_lower}">
+        <div class="dept-header">
+            <h4 class="dept-name">{row['department']}</h4>
+            <span class="dept-badge {badge_class}">{classification}</span>
+        </div>
+        {reasons_html}
+        <div class="dept-metrics">
+            <div class="metric-box">
+                <div class="metric-value {rate_class}">{rate_display}</div>
+                <div class="metric-label">Rate Variance</div>
+            </div>
+            <div class="metric-box">
+                <div class="metric-value">{overrun_display}</div>
+                <div class="metric-label">Jobs Overrun</div>
+            </div>
+            <div class="metric-box">
+                <div class="metric-value">{margin_display}</div>
+                <div class="metric-label">Margin</div>
+            </div>
+        </div>
+    </div>
+    """
+
+    st.markdown(card_html, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col3:
+        if st.button("Explore →", key=f"explore_{row['department']}", type="secondary"):
+            set_department_with_context(
+                row["department"],
+                classification,
+                row.get("reasons", []),
+            )
+            st.rerun()
+
+
 def render_department_scorecard(dept_df: pd.DataFrame):
-    """Render department scorecard as classified cards."""
+    """Render polished department scorecard with professional styling."""
     st.subheader("1️⃣ Department Scorecard")
     st.caption("Departments ranked by attention priority. Click to explore.")
+
+    st.markdown(
+        """
+        <style>
+        .dept-card {
+            background: linear-gradient(135deg, #ffffff 0%, #f8f9fa 100%);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+            border-left: 4px solid;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        .dept-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+        }
+        .dept-card.erosive { border-left-color: #dc3545; }
+        .dept-card.mixed { border-left-color: #ffc107; }
+        .dept-card.accretive { border-left-color: #28a745; }
+
+        .dept-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 1rem;
+        }
+        .dept-name {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: #1a1a1a;
+            margin: 0;
+        }
+        .dept-badge {
+            font-size: 0.75rem;
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .badge-erosive { background: #ffeaea; color: #dc3545; }
+        .badge-mixed { background: #fff8e6; color: #b38600; }
+        .badge-accretive { background: #e8f5e9; color: #28a745; }
+
+        .dept-reasons {
+            font-size: 0.85rem;
+            color: #666;
+            margin: 0.75rem 0;
+            line-height: 1.5;
+        }
+        .dept-reasons li {
+            margin-bottom: 0.25rem;
+        }
+
+        .dept-metrics {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 1rem;
+            margin-top: 1rem;
+            padding-top: 1rem;
+            border-top: 1px solid #eee;
+        }
+        .metric-box { text-align: center; }
+        .metric-value {
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: #1a1a1a;
+            line-height: 1.2;
+        }
+        .metric-value.negative { color: #dc3545; }
+        .metric-value.positive { color: #28a745; }
+        .metric-label {
+            font-size: 0.75rem;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-top: 0.25rem;
+        }
+
+        .section-header {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 1.5rem;
+            padding-bottom: 0.75rem;
+            border-bottom: 2px solid #1a1a1a;
+        }
+        .section-icon { font-size: 1.5rem; }
+        .section-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            color: #1a1a1a;
+            margin: 0;
+        }
+        .section-count {
+            background: #f0f0f0;
+            padding: 0.25rem 0.75rem;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            color: #666;
+        }
+        @media (max-width: 700px) {
+            .dept-metrics { grid-template-columns: 1fr; }
+            .dept-header { flex-direction: column; gap: 0.5rem; }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     if dept_df.empty:
         st.info("No department data available in this context.")
         return
 
     for classification in ["Erosive", "Mixed", "Accretive"]:
-        emoji = {"Accretive": "🟢", "Mixed": "🟡", "Erosive": "🔴"}[classification]
         subset = dept_df[dept_df["classification"] == classification]
-
         if subset.empty:
             continue
 
-        st.markdown(f"### {emoji} {classification} Departments ({len(subset)})")
+        icon = {"Erosive": "🔴", "Mixed": "🟡", "Accretive": "🟢"}[classification]
+        st.markdown(
+            f"""
+            <div class="section-header">
+                <span class="section-icon">{icon}</span>
+                <h3 class="section-title">{classification} Departments</h3>
+                <span class="section-count">{len(subset)}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         for _, row in subset.iterrows():
-            with st.container():
-                col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 1])
-
-                with col1:
-                    st.markdown(f"**{row['department']}**")
-                    for reason in row["reasons"]:
-                        st.caption(f"• {reason}")
-
-                with col2:
-                    st.metric("Rate Δ", f"${row['rate_variance']:+.0f}/hr")
-
-                with col3:
-                    st.metric("% Overrun", f"{row['pct_overrun']:.0f}%")
-
-                with col4:
-                    st.metric("Margin", f"{row['margin_pct']:.0f}%")
-
-                with col5:
-                    if st.button("Explore →", key=f"dept_{row['department']}"):
-                        set_department_with_context(
-                            row["department"],
-                            row["classification"],
-                            row["reasons"],
-                        )
-                        st.rerun()
-
-                st.divider()
+            render_department_card(row, classification)
 
 
 def render_department_selection_gate(dept_df: pd.DataFrame):
@@ -634,37 +936,75 @@ def render_dept_contribution_bars(dept_df: pd.DataFrame):
         fig.update_layout(title="Department Contribution to Portfolio Rate", height=420)
         return fig
 
-    plot_df = dept_df.copy()
-    total_revenue = plot_df["revenue"].sum()
-    total_hours = plot_df["actual_hours"].sum()
+    df = dept_df.copy()
+    total_revenue = df["revenue"].sum()
+    total_hours = df["actual_hours"].sum()
     portfolio_rate = total_revenue / total_hours if total_hours > 0 else 0
 
-    if "realised_rate" not in plot_df.columns:
-        plot_df["realised_rate"] = np.where(
-            plot_df["actual_hours"] > 0,
-            plot_df["revenue"] / plot_df["actual_hours"],
+    if "realised_rate" not in df.columns:
+        df["realised_rate"] = np.where(
+            df["actual_hours"] > 0,
+            df["revenue"] / df["actual_hours"],
             np.nan,
         )
 
-    plot_df["rate_contribution"] = np.where(
+    df["rate_contribution"] = np.where(
         total_revenue > 0,
-        (plot_df["revenue"] / total_revenue) * (plot_df["realised_rate"] - portfolio_rate),
+        (df["revenue"] / total_revenue) * (df["realised_rate"] - portfolio_rate),
         0,
     )
-    plot_df["impact_type"] = np.where(plot_df["rate_contribution"] >= 0, "Subsidiser", "Erosive")
+    df["impact_type"] = np.where(df["rate_contribution"] >= 0, "Subsidiser", "Erosive")
+    df = df.sort_values("rate_contribution", ascending=True)
 
-    colors = {"Subsidiser": "#2E7D32", "Erosive": "#C62828"}
-    fig = px.bar(
-        plot_df,
-        x="rate_contribution",
-        y="department",
-        orientation="h",
-        color="impact_type",
-        color_discrete_map=colors,
-        labels={"rate_contribution": "Rate Contribution ($/hr)", "department": "Department"},
-        hover_data=["classification", "rate_variance", "margin_pct"],
+    colors = df["impact_type"].map(
+        {"Subsidiser": COLORS["accretive"], "Erosive": COLORS["erosive"]}
+    ).tolist()
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Bar(
+            y=df["department"],
+            x=df["rate_contribution"],
+            orientation="h",
+            marker=dict(color=colors, line=dict(width=0)),
+            hovertemplate=(
+                "<b>%{y}</b><br>"
+                "Contribution: %{x:+.1f} $/hr<br>"
+                "<extra></extra>"
+            ),
+        )
     )
-    fig.update_layout(title="Department Contribution to Portfolio Rate", height=420)
+
+    fig.update_layout(
+        title=dict(
+            text="Department Contribution to Portfolio Rate",
+            font=dict(size=16, color=COLORS["text_dark"]),
+            x=0,
+        ),
+        xaxis=dict(
+            title="Rate Contribution ($/hr)",
+            zeroline=True,
+            zerolinecolor=COLORS["text_dark"],
+            zerolinewidth=2,
+            gridcolor="#f0f0f0",
+            showgrid=True,
+        ),
+        yaxis=dict(title="", showgrid=False),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        showlegend=False,
+        height=max(300, len(df) * 50),
+        margin=dict(t=60, b=40, l=150, r=40),
+    )
+
+    fig.add_annotation(
+        x=1, y=1.08, xref="paper", yref="paper",
+        text="🟢 Subsidiser  🔴 Erosive",
+        showarrow=False,
+        font=dict(size=11, color=COLORS["text_medium"]),
+        xanchor="right",
+    )
+
     return fig
 
 
@@ -679,42 +1019,105 @@ def render_dept_efficiency_scatter(dept_df: pd.DataFrame):
             xref="paper",
             yref="paper",
         )
-        fig.update_layout(title="Department Efficiency vs Pricing", height=420)
+        fig.update_layout(title="Department Efficiency vs Pricing", height=450)
         return fig
 
-    plot_df = dept_df.copy()
-    plot_df["hours_variance_pct"] = np.where(
-        plot_df["quoted_hours"] > 0,
-        plot_df["hours_variance"] / plot_df["quoted_hours"] * 100,
-        np.nan,
+    df = dept_df.copy()
+    df["hours_variance_pct"] = np.where(
+        df["quoted_hours"] > 0,
+        (df["actual_hours"] - df["quoted_hours"]) / df["quoted_hours"] * 100,
+        0,
     )
-    plot_df["rate_variance"] = plot_df["rate_variance"].fillna(
-        plot_df["realised_rate"] - plot_df["quote_rate"]
-    )
-    plot_df["size"] = plot_df["revenue"].abs()
 
-    color_map = {"Accretive": "#2E7D32", "Mixed": "#F9A825", "Erosive": "#C62828"}
-    color_col = "classification" if "classification" in plot_df.columns else "impact_type"
+    color_map = {
+        "Accretive": COLORS["accretive"],
+        "Mixed": COLORS["mixed"],
+        "Erosive": COLORS["erosive"],
+    }
 
     fig = px.scatter(
-        plot_df,
+        df,
         x="hours_variance_pct",
         y="rate_variance",
-        size="size",
-        color=color_col,
+        size="revenue",
+        color="classification",
         color_discrete_map=color_map,
-        hover_data=["department", "revenue", "actual_hours"],
+        hover_data={
+            "department": True,
+            "revenue": ":$,.0f",
+            "margin_pct": ":.1f",
+            "hours_variance_pct": ":.1f",
+            "rate_variance": ":+.0f",
+            "classification": False,
+        },
         labels={
             "hours_variance_pct": "Hours Variance %",
             "rate_variance": "Rate Variance ($/hr)",
-            "size": "Revenue",
+            "department": "Department",
         },
     )
 
-    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-    fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.update_traces(
+        marker=dict(line=dict(width=1, color="white"), opacity=0.85)
+    )
 
-    fig.update_layout(title="Department Efficiency vs Pricing", height=420)
+    fig.add_hline(y=0, line_dash="dash", line_color="#ccc", line_width=1)
+    fig.add_vline(x=0, line_dash="dash", line_color="#ccc", line_width=1)
+
+    fig.add_annotation(
+        x=-30, y=50, text="Efficient + Premium",
+        showarrow=False, font=dict(size=10, color=COLORS["accretive"]),
+        bgcolor="rgba(40, 167, 69, 0.1)", borderpad=4
+    )
+    fig.add_annotation(
+        x=30, y=50, text="Overrun but Priced Well",
+        showarrow=False, font=dict(size=10, color=COLORS["mixed"]),
+        bgcolor="rgba(255, 193, 7, 0.1)", borderpad=4
+    )
+    fig.add_annotation(
+        x=-30, y=-50, text="Efficient but Rate Leakage",
+        showarrow=False, font=dict(size=10, color=COLORS["mixed"]),
+        bgcolor="rgba(255, 193, 7, 0.1)", borderpad=4
+    )
+    fig.add_annotation(
+        x=30, y=-50, text="Structural Problem",
+        showarrow=False, font=dict(size=10, color=COLORS["erosive"]),
+        bgcolor="rgba(220, 53, 69, 0.1)", borderpad=4
+    )
+
+    fig.update_layout(
+        title=dict(
+            text="Department Efficiency vs Pricing",
+            font=dict(size=16, color=COLORS["text_dark"]),
+            x=0,
+        ),
+        xaxis=dict(
+            title="← Efficient | Hours Variance % | Inefficient →",
+            zeroline=True,
+            zerolinecolor="#ccc",
+            gridcolor="#f0f0f0",
+            showgrid=True,
+        ),
+        yaxis=dict(
+            title="↓ Rate Leakage | Rate Variance ($/hr) | Premium ↑",
+            zeroline=True,
+            zerolinecolor="#ccc",
+            gridcolor="#f0f0f0",
+            showgrid=True,
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            title="",
+        ),
+        height=450,
+        margin=dict(t=80, b=60, l=60, r=40),
+    )
     return fig
 
 
@@ -809,8 +1212,74 @@ def compute_category_scorecard(job_df: pd.DataFrame, department: str) -> pd.Data
     return cat_df.sort_values("rate_variance", ascending=True)
 
 
+def render_category_card(row: pd.Series, classification: str):
+    """Render a single polished category card."""
+    class_lower = classification.lower()
+    badge_class = f"badge-{class_lower}"
+
+    rate_var = row.get("rate_variance")
+    rate_class = (
+        "negative"
+        if pd.notna(rate_var) and rate_var < 0
+        else "positive"
+        if pd.notna(rate_var) and rate_var > 0
+        else ""
+    )
+    rate_display = f"${rate_var:+.0f}/hr" if pd.notna(rate_var) else "—"
+
+    overrun_pct = row.get("pct_overrun")
+    overrun_display = f"{overrun_pct:.0f}%" if pd.notna(overrun_pct) else "—"
+
+    margin_pct = row.get("margin_pct")
+    margin_display = f"{margin_pct:.0f}%" if pd.notna(margin_pct) else "—"
+
+    reasons_html = ""
+    if row.get("reasons"):
+        reasons_items = "".join([f"<li>{r}</li>" for r in row["reasons"]])
+        reasons_html = f'<ul class="dept-reasons">{reasons_items}</ul>'
+
+    label = row["category"]
+    cat_value = None if label == "(Uncategorised)" else label
+
+    card_html = f"""
+    <div class="dept-card {class_lower}">
+        <div class="dept-header">
+            <h4 class="dept-name">{label}</h4>
+            <span class="dept-badge {badge_class}">{classification}</span>
+        </div>
+        {reasons_html}
+        <div class="dept-metrics">
+            <div class="metric-box">
+                <div class="metric-value {rate_class}">{rate_display}</div>
+                <div class="metric-label">Rate Variance</div>
+            </div>
+            <div class="metric-box">
+                <div class="metric-value">{overrun_display}</div>
+                <div class="metric-label">Jobs Overrun</div>
+            </div>
+            <div class="metric-box">
+                <div class="metric-value">{margin_display}</div>
+                <div class="metric-label">Margin</div>
+            </div>
+        </div>
+    </div>
+    """
+
+    st.markdown(card_html, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([2, 1, 1])
+    with col3:
+        if st.button("Explore →", key=f"cat_{label}", type="secondary"):
+            set_category_with_context(
+                cat_value,
+                classification,
+                row.get("reasons", []),
+            )
+            st.rerun()
+
+
 def render_category_scorecard(cat_df: pd.DataFrame):
-    """Render category scorecard as classified cards."""
+    """Render category scorecard with polished styling."""
     st.subheader("2️⃣ Category Scorecard")
     st.caption("Which categories drive the department outcome?")
 
@@ -819,44 +1288,24 @@ def render_category_scorecard(cat_df: pd.DataFrame):
         return
 
     for classification in ["Erosive", "Mixed", "Accretive"]:
-        emoji = {"Accretive": "🟢", "Mixed": "🟡", "Erosive": "🔴"}[classification]
         subset = cat_df[cat_df["classification"] == classification]
-
         if subset.empty:
             continue
 
-        st.markdown(f"### {emoji} {classification} Categories ({len(subset)})")
+        icon = {"Erosive": "🔴", "Mixed": "🟡", "Accretive": "🟢"}[classification]
+        st.markdown(
+            f"""
+            <div class="section-header">
+                <span class="section-icon">{icon}</span>
+                <h3 class="section-title">{classification} Categories</h3>
+                <span class="section-count">{len(subset)}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         for _, row in subset.iterrows():
-            with st.container():
-                col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 1])
-
-                with col1:
-                    st.markdown(f"**{row['category']}**")
-                    for reason in row["reasons"]:
-                        st.caption(f"• {reason}")
-
-                with col2:
-                    st.metric("Rate Δ", f"${row['rate_variance']:+.0f}/hr")
-
-                with col3:
-                    st.metric("% Overrun", f"{row['pct_overrun']:.0f}%")
-
-                with col4:
-                    st.metric("Margin", f"{row['margin_pct']:.0f}%")
-
-                with col5:
-                    label = row["category"]
-                    cat_value = None if label == "(Uncategorised)" else label
-                    if st.button("Explore →", key=f"cat_{label}"):
-                        set_category_with_context(
-                            cat_value,
-                            row["classification"],
-                            row["reasons"],
-                        )
-                        st.rerun()
-
-                st.divider()
+            render_category_card(row, classification)
 
 
 def render_category_selection_gate(cat_df: pd.DataFrame):
@@ -933,39 +1382,102 @@ def render_category_efficiency_scatter(cat_df: pd.DataFrame):
             xref="paper",
             yref="paper",
         )
-        fig.update_layout(title="Category Efficiency vs Pricing", height=420)
+        fig.update_layout(title="Category Efficiency vs Pricing", height=450)
         return fig
 
-    plot_df = cat_df.copy()
-    plot_df["hours_variance_pct"] = np.where(
-        plot_df["quoted_hours"] > 0,
-        plot_df["hours_variance"] / plot_df["quoted_hours"] * 100,
-        np.nan,
+    df = cat_df.copy()
+    df["hours_variance_pct"] = np.where(
+        df["quoted_hours"] > 0,
+        (df["actual_hours"] - df["quoted_hours"]) / df["quoted_hours"] * 100,
+        0,
     )
-    plot_df["size"] = plot_df["revenue"].abs()
 
-    color_map = {"Accretive": "#2E7D32", "Mixed": "#F9A825", "Erosive": "#C62828"}
-    color_col = "classification" if "classification" in plot_df.columns else "impact_type"
+    color_map = {
+        "Accretive": COLORS["accretive"],
+        "Mixed": COLORS["mixed"],
+        "Erosive": COLORS["erosive"],
+    }
 
     fig = px.scatter(
-        plot_df,
+        df,
         x="hours_variance_pct",
         y="rate_variance",
-        size="size",
-        color=color_col,
+        size="revenue",
+        color="classification",
         color_discrete_map=color_map,
-        hover_data=["category", "revenue", "actual_hours"],
+        hover_data={
+            "category": True,
+            "revenue": ":$,.0f",
+            "margin_pct": ":.1f",
+            "hours_variance_pct": ":.1f",
+            "rate_variance": ":+.0f",
+            "classification": False,
+        },
         labels={
             "hours_variance_pct": "Hours Variance %",
             "rate_variance": "Rate Variance ($/hr)",
-            "size": "Revenue",
+            "category": "Category",
         },
     )
 
-    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-    fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.update_traces(marker=dict(line=dict(width=1, color="white"), opacity=0.85))
+    fig.add_hline(y=0, line_dash="dash", line_color="#ccc", line_width=1)
+    fig.add_vline(x=0, line_dash="dash", line_color="#ccc", line_width=1)
 
-    fig.update_layout(title="Category Efficiency vs Pricing", height=420)
+    fig.add_annotation(
+        x=-30, y=50, text="Efficient + Premium",
+        showarrow=False, font=dict(size=10, color=COLORS["accretive"]),
+        bgcolor="rgba(40, 167, 69, 0.1)", borderpad=4
+    )
+    fig.add_annotation(
+        x=30, y=50, text="Overrun but Priced Well",
+        showarrow=False, font=dict(size=10, color=COLORS["mixed"]),
+        bgcolor="rgba(255, 193, 7, 0.1)", borderpad=4
+    )
+    fig.add_annotation(
+        x=-30, y=-50, text="Efficient but Rate Leakage",
+        showarrow=False, font=dict(size=10, color=COLORS["mixed"]),
+        bgcolor="rgba(255, 193, 7, 0.1)", borderpad=4
+    )
+    fig.add_annotation(
+        x=30, y=-50, text="Structural Problem",
+        showarrow=False, font=dict(size=10, color=COLORS["erosive"]),
+        bgcolor="rgba(220, 53, 69, 0.1)", borderpad=4
+    )
+
+    fig.update_layout(
+        title=dict(
+            text="Category Efficiency vs Pricing",
+            font=dict(size=16, color=COLORS["text_dark"]),
+            x=0,
+        ),
+        xaxis=dict(
+            title="← Efficient | Hours Variance % | Inefficient →",
+            zeroline=True,
+            zerolinecolor="#ccc",
+            gridcolor="#f0f0f0",
+            showgrid=True,
+        ),
+        yaxis=dict(
+            title="↓ Rate Leakage | Rate Variance ($/hr) | Premium ↑",
+            zeroline=True,
+            zerolinecolor="#ccc",
+            gridcolor="#f0f0f0",
+            showgrid=True,
+        ),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.02,
+            xanchor="right",
+            x=1,
+            title="",
+        ),
+        height=450,
+        margin=dict(t=80, b=60, l=60, r=40),
+    )
     return fig
 
 
@@ -994,7 +1506,11 @@ def render_category_selector(cat_df: pd.DataFrame):
 # =============================================================================
 
 
-def render_job_quadrant_scatter(job_df: pd.DataFrame, impact_mode: str):
+def render_job_quadrant_scatter(
+    job_df: pd.DataFrame,
+    impact_mode: str,
+    job_name_lookup: Optional[Dict[str, str]] = None,
+):
     if job_df.empty:
         fig = go.Figure()
         fig.add_annotation(
@@ -1008,26 +1524,38 @@ def render_job_quadrant_scatter(job_df: pd.DataFrame, impact_mode: str):
         fig.update_layout(title="Job Outcome Quadrant", height=500)
         return fig
 
-    total_revenue = job_df["revenue_job"].sum()
-    category_rate = total_revenue / job_df["actual_hours_job"].sum() if job_df["actual_hours_job"].sum() > 0 else 0
-    cost_rate = job_df["cost_job"].sum() / job_df["actual_hours_job"].sum() if job_df["actual_hours_job"].sum() > 0 else 0
-
     job_df = job_df.copy()
-    job_df["revenue_weight"] = job_df["revenue_job"] / total_revenue if total_revenue > 0 else 0
-    job_df["rate_contribution"] = job_df["revenue_weight"] * (job_df["realised_rate_job"] - category_rate)
-    job_df["impact_type"] = np.where(job_df["rate_contribution"] >= 0, "Subsidiser", "Erosive")
+    job_df["job_label"] = job_df["job_no"].apply(
+        lambda x: format_job_label(x, job_name_lookup)
+    )
+    job_df["margin_pct_job"] = job_df["margin_pct_job"].replace([np.inf, -np.inf], np.nan)
+    job_df["revenue_display"] = job_df["revenue_job"].apply(fmt_currency)
+    job_df["margin_pct_display"] = job_df["margin_pct_job"].apply(lambda x: fmt_percent(x, 1))
 
-    job_df["abs_rate_contribution"] = job_df["rate_contribution"].abs()
-    job_df["abs_margin_impact"] = (job_df["hours_variance_job"] * cost_rate).abs()
+    job_df["impact_type"] = np.where(
+        (job_df["rate_variance_job"] >= 0) & (job_df["hours_variance_pct_job"] <= 0),
+        "Subsidiser",
+        np.where(
+            (job_df["rate_variance_job"] < 0) & (job_df["hours_variance_pct_job"] > 20),
+            "Margin Erosive",
+            "Mixed",
+        ),
+    )
 
-    if impact_mode == "Revenue Exposure":
-        size_col = "revenue_job"
-    elif impact_mode == "Rate Impact":
-        size_col = "abs_rate_contribution"
-    else:
-        size_col = "abs_margin_impact"
+    size_col = {
+        "Revenue Exposure": "revenue_job",
+        "Rate Impact": "rate_variance_job",
+        "Margin Impact": "margin_job",
+    }.get(impact_mode, "revenue_job")
 
-    job_df["size"] = job_df[size_col].abs()
+    job_df["size"] = (
+        job_df[size_col].abs().replace([np.inf, -np.inf], np.nan).fillna(0)
+    )
+
+    max_points = 2000
+    if len(job_df) > max_points:
+        job_df = job_df.nlargest(max_points, "size")
+        st.caption(f"Showing top {max_points:,} jobs by impact for chart responsiveness.")
 
     fig = px.scatter(
         job_df,
@@ -1035,8 +1563,13 @@ def render_job_quadrant_scatter(job_df: pd.DataFrame, impact_mode: str):
         y="rate_variance_job",
         size="size",
         color="impact_type",
-        color_discrete_map={"Subsidiser": "#2E7D32", "Erosive": "#C62828"},
-        hover_data=["job_no", "revenue_job", "margin_pct_job"],
+        color_discrete_map={
+            "Subsidiser": COLORS["accretive"],
+            "Margin Erosive": COLORS["erosive"],
+            "Mixed": COLORS["mixed"],
+        },
+        hover_data=None,
+        custom_data=["job_label", "revenue_display", "margin_pct_display"],
         labels={
             "hours_variance_pct_job": "Hours Variance %",
             "rate_variance_job": "Rate Variance ($/hr)",
@@ -1044,14 +1577,61 @@ def render_job_quadrant_scatter(job_df: pd.DataFrame, impact_mode: str):
         },
     )
 
-    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
-    fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
-    fig.update_layout(title="Job Outcome Quadrant", height=500)
+    fig.update_traces(
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Revenue: %{customdata[1]}<br>"
+            "Margin: %{customdata[2]}<br>"
+            "Hours Var: %{x:+.0f}%<br>"
+            "Rate Var: %{y:+.0f} $/hr<br>"
+            "<extra></extra>"
+        )
+    )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="#ccc", line_width=1)
+    fig.add_vline(x=0, line_dash="dash", line_color="#ccc", line_width=1)
+
+    fig.add_annotation(
+        x=-30, y=50, text="Efficient + Premium",
+        showarrow=False, font=dict(size=10, color=COLORS["accretive"]),
+        bgcolor="rgba(40, 167, 69, 0.1)", borderpad=4
+    )
+    fig.add_annotation(
+        x=30, y=50, text="Overrun but Priced Well",
+        showarrow=False, font=dict(size=10, color=COLORS["mixed"]),
+        bgcolor="rgba(255, 193, 7, 0.1)", borderpad=4
+    )
+    fig.add_annotation(
+        x=-30, y=-50, text="Efficient but Rate Leakage",
+        showarrow=False, font=dict(size=10, color=COLORS["mixed"]),
+        bgcolor="rgba(255, 193, 7, 0.1)", borderpad=4
+    )
+    fig.add_annotation(
+        x=30, y=-50, text="Structural Problem",
+        showarrow=False, font=dict(size=10, color=COLORS["erosive"]),
+        bgcolor="rgba(220, 53, 69, 0.1)", borderpad=4
+    )
+
+    fig.update_layout(
+        title=dict(
+            text=f"Job Quadrant — Sized by {impact_mode}",
+            font=dict(size=16, color=COLORS["text_dark"]),
+            x=0,
+        ),
+        xaxis_title="← Under-run | Hours Variance % | Overrun →",
+        yaxis_title="↓ Rate Leakage | Rate Variance | Premium ↑",
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        height=500,
+    )
 
     return fig
 
 
-def render_job_selector(job_df: pd.DataFrame):
+def render_job_selector(
+    job_df: pd.DataFrame,
+    job_name_lookup: Optional[Dict[str, str]] = None,
+):
     st.markdown("**Select job to drill into:**")
     sort_df = job_df.copy()
     total_revenue = sort_df["revenue_job"].sum()
@@ -1061,7 +1641,13 @@ def render_job_selector(job_df: pd.DataFrame):
     sort_df["priority_score"] = sort_df["rate_contribution"].abs()
 
     job_options = sort_df.sort_values("priority_score", ascending=False)["job_no"].tolist()
-    selected = st.selectbox("Choose job:", options=["-- Select --"] + job_options)
+    label_map = {job_no: format_job_label(job_no, job_name_lookup) for job_no in job_options}
+
+    selected = st.selectbox(
+        "Choose job:",
+        options=["-- Select --"] + job_options,
+        format_func=lambda x: "-- Select --" if x == "-- Select --" else label_map.get(x, str(x)),
+    )
 
     if selected != "-- Select --":
         st.session_state.drill_path["job"] = selected
@@ -1073,7 +1659,11 @@ def render_job_selector(job_df: pd.DataFrame):
 # =============================================================================
 
 
-def render_job_diagnostic_card(df: pd.DataFrame, job_no: str):
+def render_job_diagnostic_card(
+    df: pd.DataFrame,
+    job_no: str,
+    job_name_lookup: Optional[Dict[str, str]] = None,
+):
     job_data = df[df["job_no"] == job_no]
 
     actual_hours = job_data["hours_raw"].sum()
@@ -1101,7 +1691,8 @@ def render_job_diagnostic_card(df: pd.DataFrame, job_no: str):
     unquoted_hours = unquoted_tasks["hours_raw"].sum() if not unquoted_tasks.empty else 0
     unquoted_pct = (unquoted_hours / actual_hours * 100) if actual_hours > 0 else 0
 
-    st.subheader(f"📋 Job Diagnostic: {job_no}")
+    job_label = format_job_label(job_no, job_name_lookup)
+    st.subheader(f"📋 Job Diagnostic: {job_label}")
 
     st.markdown("### A. Volume Efficiency (Time)")
     col1, col2, col3, col4 = st.columns(4)
@@ -1267,14 +1858,20 @@ def render_task_table(task_df: pd.DataFrame):
 # =============================================================================
 
 
-def render_fte_attribution(df: pd.DataFrame, job_no: str, task_name: Optional[str] = None):
+def render_fte_attribution(
+    df: pd.DataFrame,
+    job_no: str,
+    task_name: Optional[str] = None,
+    job_name_lookup: Optional[Dict[str, str]] = None,
+):
     job_data = df[df["job_no"] == job_no]
 
+    job_label = format_job_label(job_no, job_name_lookup)
     if task_name:
         job_data = job_data[job_data["task_name"] == task_name]
-        st.subheader(f"👥 Staff Attribution: {task_name}")
+        st.subheader(f"👥 Staff Attribution: {task_name} — {job_label}")
     else:
-        st.subheader("👥 Staff Attribution (All Tasks)")
+        st.subheader(f"👥 Staff Attribution (All Tasks) — {job_label}")
 
     staff_df = job_data.groupby("staff_name").agg(
         hours_raw=("hours_raw", "sum"),
@@ -1387,6 +1984,7 @@ def main():
         st.stop()
 
     job_df = compute_job_metrics(df)
+    job_name_lookup = build_job_name_lookup(df, "job_no", "job_name")
     portfolio_metrics = compute_portfolio_metrics(job_df)
 
     render_breadcrumb()
@@ -1396,7 +1994,12 @@ def main():
     # LEVEL 0: PORTFOLIO (Always visible)
     # ===========================================
     st.header("Level 0: Portfolio Overview")
-    st.caption(f"*{job_state} jobs | {start_date.strftime('%d %b')} → {end_date.strftime('%d %b %Y')}*")
+    st.markdown(
+        f"<span style='color:#6c757d;font-style:italic;'>"
+        f"{job_state} jobs | {start_date.strftime('%d %b')} → {end_date.strftime('%d %b %Y')}"
+        f"</span>",
+        unsafe_allow_html=True,
+    )
 
     render_kpi_strip(portfolio_metrics)
 
@@ -1404,6 +2007,33 @@ def main():
     with col1:
         bridge_df = compute_rate_bridge(job_df, portfolio_metrics)
         st.plotly_chart(render_rate_bridge(bridge_df), use_container_width=True)
+        st.markdown(
+            """
+**How the Quote → Realised Rate bridge is calculated (plain English)**
+
+We start with the **quoted hourly rate** for the portfolio, then explain how actual delivery changes the realised rate.
+
+1. **Quote Rate (starting point)**  
+   This is total quoted value divided by total quoted hours, across all quoted jobs.
+
+2. **Under‑run impact (efficiency wins)**  
+   Jobs that finished **under** their quoted hours create “saved hours.”  
+   We value those saved hours at the **quote rate** and spread the impact across total actual hours.
+
+3. **Overrun impact (execution leakage)**  
+   Jobs that ran **over** their quoted hours consume extra time at the quote rate.  
+   This reduces the realised rate once spread across total actual hours.
+
+4. **Unquoted hours impact (scope creep)**  
+   Hours with no matching quote are also valued at the quote rate and treated as leakage.
+
+5. **Mix/Pricing effect (the residual)**  
+   Whatever difference remains after steps 2–4 is attributed to **mix and pricing**.  
+   In practice, this means some jobs were priced above quote, or the portfolio shifted toward higher‑rate work.
+
+**Bottom line:** Realised rate = Quote rate + (under‑runs) − (overruns) − (unquoted hours) + (mix/pricing).
+"""
+        )
     with col2:
         st.info(
             """
@@ -1500,8 +2130,81 @@ You're here because: {cat_ctx['reasons'][0] if cat_ctx['reasons'] else 'Selected
         horizontal=True,
     )
 
-    st.plotly_chart(render_job_quadrant_scatter(filtered_jobs, impact_mode), use_container_width=True)
-    render_job_selector(filtered_jobs)
+    st.plotly_chart(
+        render_job_quadrant_scatter(filtered_jobs, impact_mode, job_name_lookup),
+        use_container_width=True,
+    )
+
+    st.divider()
+
+    # ===========================================
+    # LEVEL 3b: SEGMENT PROFILING
+    # ===========================================
+    st.header("Level 3b: Segment Analysis — What Differentiates Performance?")
+    st.caption("*Understand the profile before drilling into individual jobs*")
+
+    from src.metrics.segment_profiling import (
+        SEGMENT_CONFIG,
+        compute_job_segments,
+        compute_job_shortlist,
+        compute_segment_profile,
+    )
+    from src.ui.segment_components import (
+        render_segment_selector,
+        render_segment_quadrant_legend,
+        render_composition_panel,
+        render_driver_distributions,
+        render_task_mix_divergence,
+        render_duration_profile,
+        render_overrun_decomposition,
+        render_job_shortlist,
+    )
+
+    job_df_with_segments = compute_job_segments(df, filtered_jobs)
+
+    render_segment_quadrant_legend()
+    selected_segment = render_segment_selector(job_df_with_segments)
+
+    if not selected_segment:
+        st.info(
+            "👆 **Select a segment above** to see its profile and understand what makes these jobs different."
+        )
+        st.stop()
+
+    profile = compute_segment_profile(
+        df,
+        job_df_with_segments,
+        selected_segment,
+        benchmark_dept=dept,
+        benchmark_category=cat,
+    )
+
+    if not profile:
+        st.warning(f"No jobs in the '{selected_segment}' segment for current filters.")
+        st.stop()
+
+    config = SEGMENT_CONFIG.get(selected_segment, {})
+    st.markdown(
+        f"""
+### {config.get('icon', '●')} {selected_segment}: {config.get('short_desc', '')}
+
+> {config.get('explanation', '')}
+"""
+    )
+
+    render_composition_panel(profile["composition"])
+    st.divider()
+    render_driver_distributions(profile["drivers"])
+    st.divider()
+    render_task_mix_divergence(profile["task_mix"], selected_segment)
+    st.divider()
+    render_duration_profile(profile["duration"], selected_segment)
+    st.divider()
+    render_overrun_decomposition(profile["overrun_decomposition"])
+    st.divider()
+
+    shortlist = compute_job_shortlist(job_df_with_segments, selected_segment, n=10)
+    render_job_shortlist(shortlist, job_name_lookup)
 
     if not can_proceed_to_level("task"):
         st.stop()
@@ -1513,8 +2216,9 @@ You're here because: {cat_ctx['reasons'][0] if cat_ctx['reasons'] else 'Selected
     # ===========================================
     job_no = st.session_state.drill_path["job"]
 
-    st.header(f"Level 4: Root Cause — {job_no}")
-    render_job_diagnostic_card(df, job_no)
+    job_label = format_job_label(job_no, job_name_lookup)
+    st.header(f"Level 4: Root Cause — {job_label}")
+    render_job_diagnostic_card(df, job_no, job_name_lookup)
 
     st.divider()
 
@@ -1536,7 +2240,7 @@ You're here because: {cat_ctx['reasons'][0] if cat_ctx['reasons'] else 'Selected
     )
 
     selected_task = None if task_selection == "All Tasks" else task_selection
-    render_fte_attribution(df, job_no, selected_task)
+    render_fte_attribution(df, job_no, selected_task, job_name_lookup)
 
     st.divider()
     render_reconciliation_panel(df, job_df, portfolio_metrics)
