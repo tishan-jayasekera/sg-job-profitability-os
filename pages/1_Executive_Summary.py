@@ -1,5 +1,5 @@
 """
-Executive Summary: Causal Root-Cause Drill Engine (v2)
+Executive Summary: Causal Root-Cause Drill Engine (v3.1)
 """
 import streamlit as st
 import pandas as pd
@@ -8,12 +8,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List, Tuple
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data.loader import load_fact_timesheet
+from src.metrics.profitability import classify_department, compute_department_scorecard
 
 
 # =============================================================================
@@ -43,18 +44,161 @@ def load_data() -> pd.DataFrame:
 
 
 # =============================================================================
+# GLOBAL CONTEXT
+# =============================================================================
+
+
+def render_global_control_bar() -> Tuple[pd.Timestamp, pd.Timestamp, str]:
+    """
+    Render sticky global control bar.
+    Returns (start_date, end_date, job_state).
+    """
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stVerticalBlock"]:has(> div > span.global-controls-anchor) {
+            position: sticky;
+            top: 4rem;
+            z-index: 100;
+            background-color: #f8f9fa;
+            padding: 1rem;
+            border-radius: 8px;
+            border: 1px solid #e9ecef;
+            margin-bottom: 1rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.container():
+        st.markdown('<span class="global-controls-anchor"></span>', unsafe_allow_html=True)
+        col1, col2, col3 = st.columns([2, 2, 2])
+
+        # === A. TIME PERIOD SELECTOR ===
+        with col1:
+            st.markdown("**📅 Time Period**")
+            time_preset = st.radio(
+                "Period:",
+                options=["Last 30 Days", "Last 90 Days", "Last 6 Months", "Custom"],
+                horizontal=True,
+                key="time_preset",
+                label_visibility="collapsed",
+            )
+
+            today = pd.Timestamp.today().normalize()
+
+            if time_preset == "Last 30 Days":
+                start_date, end_date = today - pd.Timedelta(days=30), today
+            elif time_preset == "Last 90 Days":
+                start_date, end_date = today - pd.Timedelta(days=90), today
+            elif time_preset == "Last 6 Months":
+                start_date, end_date = today - pd.Timedelta(days=180), today
+            else:
+                c1, c2 = st.columns(2)
+                with c1:
+                    start_date = pd.Timestamp(
+                        st.date_input("From", value=today - pd.Timedelta(days=90))
+                    )
+                with c2:
+                    end_date = pd.Timestamp(st.date_input("To", value=today))
+
+        # === B. JOB STATE TOGGLE ===
+        with col2:
+            st.markdown("**🏷️ Job State**")
+            job_state = st.radio(
+                "Show:",
+                options=["Active", "Completed", "All"],
+                horizontal=True,
+                key="job_state",
+                help=(
+                    "• **Active**: Jobs with activity in period, not yet completed\n"
+                    "• **Completed**: Jobs completed within the period\n"
+                    "• **All**: Union of Active + Completed"
+                ),
+            )
+
+        # === C. CONTEXT SUMMARY ===
+        with col3:
+            st.markdown("**📊 Current Context**")
+            st.caption(f"Period: {start_date.strftime('%d %b %Y')} → {end_date.strftime('%d %b %Y')}")
+            st.caption(f"Job State: {job_state}")
+            st.caption("_All metrics reflect activity within this context._")
+
+    return start_date, end_date, job_state
+
+
+def apply_global_context(
+    df: pd.DataFrame, start_date: pd.Timestamp, end_date: pd.Timestamp, job_state: str
+) -> pd.DataFrame:
+    """
+    Apply global context (time period + job state) to raw data.
+    """
+    date_col = "work_date" if "work_date" in df.columns else "month_key"
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col])
+
+    mask_period = (df[date_col] >= start_date) & (df[date_col] <= end_date)
+    df_period = df[mask_period].copy()
+
+    if df_period.empty:
+        return df_period
+
+    # Filter by job state
+    if "job_status" in df_period.columns:
+        status_series = df_period["job_status"].astype(str).str.lower()
+        if job_state == "Active":
+            mask = ~status_series.str.contains("completed", na=False)
+        elif job_state == "Completed":
+            mask = status_series.str.contains("completed", na=False)
+        else:
+            mask = pd.Series(True, index=df_period.index)
+    else:
+        last_activity = df_period.groupby("job_no")[date_col].max()
+        cutoff = end_date - pd.Timedelta(days=14)
+
+        active_jobs = last_activity[last_activity >= cutoff].index
+        completed_jobs = last_activity[last_activity < cutoff].index
+
+        if job_state == "Active":
+            mask = df_period["job_no"].isin(active_jobs)
+        elif job_state == "Completed":
+            mask = df_period["job_no"].isin(completed_jobs)
+        else:
+            mask = pd.Series(True, index=df_period.index)
+
+    return df_period[mask].copy()
+
+
+# =============================================================================
 # DRILL STATE
 # =============================================================================
 
 
 def init_drill_state():
-    """Initialize session state for drill tracking."""
+    """Initialize session state for drill tracking with context."""
     if "drill_path" not in st.session_state:
         st.session_state.drill_path = {
             "department": None,
+            "department_context": None,
             "category": None,
+            "category_context": None,
             "job": None,
             "task": None,
+        }
+    else:
+        st.session_state.drill_path.setdefault("department", None)
+        st.session_state.drill_path.setdefault("department_context", None)
+        st.session_state.drill_path.setdefault("category", None)
+        st.session_state.drill_path.setdefault("category_context", None)
+        st.session_state.drill_path.setdefault("job", None)
+        st.session_state.drill_path.setdefault("task", None)
+
+    if "global_context" not in st.session_state:
+        st.session_state.global_context = {
+            "start_date": pd.Timestamp.today() - pd.Timedelta(days=90),
+            "end_date": pd.Timestamp.today(),
+            "job_state": "All",
         }
 
 
@@ -66,6 +210,10 @@ def reset_drill_from(level: str):
     idx = levels.index(level)
     for l in levels[idx:]:
         st.session_state.drill_path[l] = None
+        if l == "department":
+            st.session_state.drill_path["department_context"] = None
+        if l == "category":
+            st.session_state.drill_path["category_context"] = None
 
 
 def get_drill_breadcrumb() -> str:
@@ -75,12 +223,51 @@ def get_drill_breadcrumb() -> str:
     if path["department"]:
         parts.append(path["department"])
     if path["category"] is not None:
-        parts.append(path["category"] if path["category"] is not None else "(Uncategorised)")
+        parts.append(path["category"])
+    elif path.get("category_context") is not None:
+        parts.append("(Uncategorised)")
     if path["job"]:
         parts.append(path["job"])
     if path["task"]:
         parts.append(path["task"])
     return " → ".join(parts)
+
+
+def set_department_with_context(dept: str, classification: str, reasons: List[str]):
+    """Set department selection WITH required context."""
+    st.session_state.drill_path["department"] = dept
+    st.session_state.drill_path["department_context"] = {
+        "classification": classification,
+        "reasons": reasons,
+    }
+    st.session_state.drill_path["category"] = None
+    st.session_state.drill_path["category_context"] = None
+    st.session_state.drill_path["job"] = None
+    st.session_state.drill_path["task"] = None
+
+
+def set_category_with_context(cat: Optional[str], classification: str, reasons: List[str]):
+    """Set category selection WITH required context."""
+    st.session_state.drill_path["category"] = cat
+    st.session_state.drill_path["category_context"] = {
+        "classification": classification,
+        "reasons": reasons,
+    }
+    st.session_state.drill_path["job"] = None
+    st.session_state.drill_path["task"] = None
+
+
+def can_proceed_to_level(level: str) -> bool:
+    """Check if prerequisites are met for a given level."""
+    path = st.session_state.drill_path
+
+    if level == "category":
+        return path["department"] is not None and path["department_context"] is not None
+    if level == "job":
+        return path["category_context"] is not None
+    if level == "task":
+        return path["job"] is not None
+    return True
 
 
 def render_breadcrumb():
@@ -343,6 +530,60 @@ def render_rate_bridge(bridge_df: pd.DataFrame):
 # =============================================================================
 
 
+def render_department_scorecard(dept_df: pd.DataFrame):
+    """Render department scorecard as classified cards."""
+    st.subheader("1️⃣ Department Scorecard")
+    st.caption("Departments ranked by attention priority. Click to explore.")
+
+    if dept_df.empty:
+        st.info("No department data available in this context.")
+        return
+
+    for classification in ["Erosive", "Mixed", "Accretive"]:
+        emoji = {"Accretive": "🟢", "Mixed": "🟡", "Erosive": "🔴"}[classification]
+        subset = dept_df[dept_df["classification"] == classification]
+
+        if subset.empty:
+            continue
+
+        st.markdown(f"### {emoji} {classification} Departments ({len(subset)})")
+
+        for _, row in subset.iterrows():
+            with st.container():
+                col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 1])
+
+                with col1:
+                    st.markdown(f"**{row['department']}**")
+                    for reason in row["reasons"]:
+                        st.caption(f"• {reason}")
+
+                with col2:
+                    st.metric("Rate Δ", f"${row['rate_variance']:+.0f}/hr")
+
+                with col3:
+                    st.metric("% Overrun", f"{row['pct_overrun']:.0f}%")
+
+                with col4:
+                    st.metric("Margin", f"{row['margin_pct']:.0f}%")
+
+                with col5:
+                    if st.button("Explore →", key=f"dept_{row['department']}"):
+                        set_department_with_context(
+                            row["department"],
+                            row["classification"],
+                            row["reasons"],
+                        )
+                        st.rerun()
+
+                st.divider()
+
+
+def render_department_selection_gate(dept_df: pd.DataFrame):
+    st.warning("⬇️ Select a department above to continue the root-cause drill.")
+    if dept_df.empty:
+        st.stop()
+
+
 def compute_department_contribution(job_df: pd.DataFrame, portfolio_metrics: dict) -> pd.DataFrame:
     """Compute each department's contribution to portfolio realised rate."""
     portfolio_rate = portfolio_metrics["realised_rate"]
@@ -380,37 +621,88 @@ def compute_department_contribution(job_df: pd.DataFrame, portfolio_metrics: dic
 
 
 def render_dept_contribution_bars(dept_df: pd.DataFrame):
+    if dept_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No departments available",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_layout(title="Department Contribution to Portfolio Rate", height=420)
+        return fig
+
+    plot_df = dept_df.copy()
+    total_revenue = plot_df["revenue"].sum()
+    total_hours = plot_df["actual_hours"].sum()
+    portfolio_rate = total_revenue / total_hours if total_hours > 0 else 0
+
+    if "realised_rate" not in plot_df.columns:
+        plot_df["realised_rate"] = np.where(
+            plot_df["actual_hours"] > 0,
+            plot_df["revenue"] / plot_df["actual_hours"],
+            np.nan,
+        )
+
+    plot_df["rate_contribution"] = np.where(
+        total_revenue > 0,
+        (plot_df["revenue"] / total_revenue) * (plot_df["realised_rate"] - portfolio_rate),
+        0,
+    )
+    plot_df["impact_type"] = np.where(plot_df["rate_contribution"] >= 0, "Subsidiser", "Erosive")
+
     colors = {"Subsidiser": "#2E7D32", "Erosive": "#C62828"}
     fig = px.bar(
-        dept_df,
+        plot_df,
         x="rate_contribution",
         y="department",
         orientation="h",
         color="impact_type",
         color_discrete_map=colors,
         labels={"rate_contribution": "Rate Contribution ($/hr)", "department": "Department"},
+        hover_data=["classification", "rate_variance", "margin_pct"],
     )
     fig.update_layout(title="Department Contribution to Portfolio Rate", height=420)
     return fig
 
 
 def render_dept_efficiency_scatter(dept_df: pd.DataFrame):
-    dept_df = dept_df.copy()
-    dept_df["hours_variance_pct"] = np.where(
-        dept_df["quoted_hours"] > 0,
-        dept_df["hours_variance"] / dept_df["quoted_hours"] * 100,
+    if dept_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No departments available",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_layout(title="Department Efficiency vs Pricing", height=420)
+        return fig
+
+    plot_df = dept_df.copy()
+    plot_df["hours_variance_pct"] = np.where(
+        plot_df["quoted_hours"] > 0,
+        plot_df["hours_variance"] / plot_df["quoted_hours"] * 100,
         np.nan,
     )
-    dept_df["rate_variance"] = dept_df["realised_rate"] - dept_df["quote_rate"]
-    dept_df["size"] = dept_df["revenue"].abs()
+    plot_df["rate_variance"] = plot_df["rate_variance"].fillna(
+        plot_df["realised_rate"] - plot_df["quote_rate"]
+    )
+    plot_df["size"] = plot_df["revenue"].abs()
+
+    color_map = {"Accretive": "#2E7D32", "Mixed": "#F9A825", "Erosive": "#C62828"}
+    color_col = "classification" if "classification" in plot_df.columns else "impact_type"
 
     fig = px.scatter(
-        dept_df,
+        plot_df,
         x="hours_variance_pct",
         y="rate_variance",
         size="size",
-        color="impact_type",
-        color_discrete_map={"Subsidiser": "#2E7D32", "Erosive": "#C62828"},
+        color=color_col,
+        color_discrete_map=color_map,
         hover_data=["department", "revenue", "actual_hours"],
         labels={
             "hours_variance_pct": "Hours Variance %",
@@ -446,6 +738,131 @@ def render_department_selector(dept_df: pd.DataFrame):
 # =============================================================================
 # ACT 2b: CATEGORY
 # =============================================================================
+
+
+def compute_category_scorecard(job_df: pd.DataFrame, department: str) -> pd.DataFrame:
+    """
+    Compute category scorecard within a department.
+    Uses job_category field from fact_timesheet_day_enriched.
+    """
+    dept_jobs = job_df[job_df["department_final"] == department].copy()
+
+    cat_df = dept_jobs.groupby("job_category").agg(
+        revenue=("revenue_job", "sum"),
+        actual_hours=("actual_hours_job", "sum"),
+        cost=("cost_job", "sum"),
+        quoted_hours=("quoted_hours_job", "sum"),
+        quoted_amount=("quoted_amount_job", "sum"),
+        hours_variance=("hours_variance_job", "sum"),
+        overrun_jobs=("overrun_flag", "sum"),
+        severe_overrun_jobs=("critical_overrun_flag", "sum"),
+        total_jobs=("job_no", "count"),
+    ).reset_index()
+
+    cat_df.columns = [
+        "category",
+        "revenue",
+        "actual_hours",
+        "cost",
+        "quoted_hours",
+        "quoted_amount",
+        "hours_variance",
+        "overrun_jobs",
+        "severe_overrun_jobs",
+        "total_jobs",
+    ]
+
+    cat_df["category"] = cat_df["category"].fillna("(Uncategorised)")
+
+    cat_df["quote_rate"] = np.where(
+        cat_df["quoted_hours"] > 0,
+        cat_df["quoted_amount"] / cat_df["quoted_hours"],
+        np.nan,
+    )
+    cat_df["realised_rate"] = np.where(
+        cat_df["actual_hours"] > 0,
+        cat_df["revenue"] / cat_df["actual_hours"],
+        np.nan,
+    )
+    cat_df["rate_variance"] = cat_df["realised_rate"] - cat_df["quote_rate"]
+    cat_df["margin"] = cat_df["revenue"] - cat_df["cost"]
+    cat_df["margin_pct"] = np.where(
+        cat_df["revenue"] > 0,
+        cat_df["margin"] / cat_df["revenue"] * 100,
+        np.nan,
+    )
+    cat_df["pct_overrun"] = np.where(
+        cat_df["total_jobs"] > 0,
+        cat_df["overrun_jobs"] / cat_df["total_jobs"] * 100,
+        0,
+    )
+    cat_df["pct_severe"] = np.where(
+        cat_df["total_jobs"] > 0,
+        cat_df["severe_overrun_jobs"] / cat_df["total_jobs"] * 100,
+        0,
+    )
+
+    classifications = cat_df.apply(classify_department, axis=1)
+    cat_df["classification"] = [c["classification"] for c in classifications]
+    cat_df["reasons"] = [c["reasons"] for c in classifications]
+
+    return cat_df.sort_values("rate_variance", ascending=True)
+
+
+def render_category_scorecard(cat_df: pd.DataFrame):
+    """Render category scorecard as classified cards."""
+    st.subheader("2️⃣ Category Scorecard")
+    st.caption("Which categories drive the department outcome?")
+
+    if cat_df.empty:
+        st.info("No category data available for this department.")
+        return
+
+    for classification in ["Erosive", "Mixed", "Accretive"]:
+        emoji = {"Accretive": "🟢", "Mixed": "🟡", "Erosive": "🔴"}[classification]
+        subset = cat_df[cat_df["classification"] == classification]
+
+        if subset.empty:
+            continue
+
+        st.markdown(f"### {emoji} {classification} Categories ({len(subset)})")
+
+        for _, row in subset.iterrows():
+            with st.container():
+                col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 1])
+
+                with col1:
+                    st.markdown(f"**{row['category']}**")
+                    for reason in row["reasons"]:
+                        st.caption(f"• {reason}")
+
+                with col2:
+                    st.metric("Rate Δ", f"${row['rate_variance']:+.0f}/hr")
+
+                with col3:
+                    st.metric("% Overrun", f"{row['pct_overrun']:.0f}%")
+
+                with col4:
+                    st.metric("Margin", f"{row['margin_pct']:.0f}%")
+
+                with col5:
+                    label = row["category"]
+                    cat_value = None if label == "(Uncategorised)" else label
+                    if st.button("Explore →", key=f"cat_{label}"):
+                        set_category_with_context(
+                            cat_value,
+                            row["classification"],
+                            row["reasons"],
+                        )
+                        st.rerun()
+
+                st.divider()
+
+
+def render_category_selection_gate(cat_df: pd.DataFrame):
+    st.warning("⬇️ Select a category above to continue to job-level analysis.")
+    if cat_df.empty:
+        st.stop()
 
 
 def compute_category_contribution(job_df: pd.DataFrame, department: str) -> pd.DataFrame:
@@ -506,17 +923,38 @@ def render_category_contribution_bars(cat_df: pd.DataFrame):
 
 
 def render_category_efficiency_scatter(cat_df: pd.DataFrame):
-    cat_df = cat_df.copy()
-    cat_df["size"] = cat_df["revenue"].abs()
+    if cat_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No categories available",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_layout(title="Category Efficiency vs Pricing", height=420)
+        return fig
+
+    plot_df = cat_df.copy()
+    plot_df["hours_variance_pct"] = np.where(
+        plot_df["quoted_hours"] > 0,
+        plot_df["hours_variance"] / plot_df["quoted_hours"] * 100,
+        np.nan,
+    )
+    plot_df["size"] = plot_df["revenue"].abs()
+
+    color_map = {"Accretive": "#2E7D32", "Mixed": "#F9A825", "Erosive": "#C62828"}
+    color_col = "classification" if "classification" in plot_df.columns else "impact_type"
 
     fig = px.scatter(
-        cat_df,
+        plot_df,
         x="hours_variance_pct",
         y="rate_variance",
         size="size",
-        color="impact_type",
-        color_discrete_map={"Subsidiser": "#2E7D32", "Erosive": "#C62828"},
-        hover_data=["job_category", "revenue", "actual_hours"],
+        color=color_col,
+        color_discrete_map=color_map,
+        hover_data=["category", "revenue", "actual_hours"],
         labels={
             "hours_variance_pct": "Hours Variance %",
             "rate_variance": "Rate Variance ($/hr)",
@@ -923,21 +1361,43 @@ def main():
         layout="wide",
     )
 
-    st.title("📊 Executive Summary: Causal Root-Cause Engine")
+    st.title("📊 Executive Summary: Margin & Delivery Diagnosis")
 
     init_drill_state()
 
-    df = load_data()
+    # ===========================================
+    # GLOBAL CONTROL BAR (NEW)
+    # ===========================================
+    start_date, end_date, job_state = render_global_control_bar()
+
+    st.session_state.global_context = {
+        "start_date": start_date,
+        "end_date": end_date,
+        "job_state": job_state,
+    }
+
+    df_raw = load_data()
+    df = apply_global_context(df_raw, start_date, end_date, job_state)
+
+    if df.empty:
+        st.error(
+            f"No data found for: {job_state} jobs from "
+            f"{start_date.strftime('%d %b %Y')} to {end_date.strftime('%d %b %Y')}"
+        )
+        st.stop()
+
     job_df = compute_job_metrics(df)
     portfolio_metrics = compute_portfolio_metrics(job_df)
 
     render_breadcrumb()
     st.divider()
 
-    # ========================================
-    # ACT 1: PORTFOLIO
-    # ========================================
-    st.header("Act 1: Portfolio Headline")
+    # ===========================================
+    # LEVEL 0: PORTFOLIO (Always visible)
+    # ===========================================
+    st.header("Level 0: Portfolio Overview")
+    st.caption(f"*{job_state} jobs | {start_date.strftime('%d %b')} → {end_date.strftime('%d %b %Y')}*")
+
     render_kpi_strip(portfolio_metrics)
 
     col1, col2 = st.columns([2, 1])
@@ -949,84 +1409,111 @@ def main():
             """
 **The Contradiction Explained**
 
-Realised rate exceeds quote rate despite overruns because of **mix effects**.
+Realised rate can exceed quote rate even when most jobs overrun.
+This is due to **mix effects** — some jobs subsidise others.
 
-**Click a department below to trace the root cause.**
+👇 **Scroll to see which departments are responsible.**
 """
         )
 
     st.divider()
 
-    # ========================================
-    # ACT 2a: DEPARTMENT
-    # ========================================
-    if st.session_state.drill_path["department"] is None:
-        st.header("Act 2a: Department Diagnostic")
-        st.caption("Which department is driving the portfolio outcome?")
+    # ===========================================
+    # LEVEL 1: DEPARTMENT DIAGNOSTIC
+    # ===========================================
+    st.header("Level 1: Department Diagnostic")
+    st.caption("*Who is creating vs eroding value — and WHY?*")
 
-        dept_df = compute_department_contribution(job_df, portfolio_metrics)
+    dept_df = compute_department_scorecard(job_df)
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.plotly_chart(render_dept_contribution_bars(dept_df), use_container_width=True)
-        with col2:
-            st.plotly_chart(render_dept_efficiency_scatter(dept_df), use_container_width=True)
+    col1, col2 = st.columns(2)
+    with col1:
+        render_department_scorecard(dept_df)
+    with col2:
+        st.plotly_chart(render_dept_efficiency_scatter(dept_df), use_container_width=True)
+        st.plotly_chart(render_dept_contribution_bars(dept_df), use_container_width=True)
 
-        render_department_selector(dept_df)
-        return
+    if not can_proceed_to_level("category"):
+        render_department_selection_gate(dept_df)
+        st.stop()
 
-    # ========================================
-    # ACT 2b: CATEGORY
-    # ========================================
-    if st.session_state.drill_path["category"] is None:
-        st.header(f"Act 2b: Category Diagnostic — {st.session_state.drill_path['department']}")
-        st.caption("Is this a category problem or a job-level problem?")
+    st.divider()
 
-        cat_df = compute_category_contribution(job_df, st.session_state.drill_path["department"])
+    # ===========================================
+    # LEVEL 2: CATEGORY DIAGNOSTIC
+    # ===========================================
+    dept = st.session_state.drill_path["department"]
+    dept_ctx = st.session_state.drill_path["department_context"]
 
-        if cat_df.empty:
-            st.warning("No category data available for this department")
-        else:
-            col1, col2 = st.columns(2)
-            with col1:
-                st.plotly_chart(render_category_contribution_bars(cat_df), use_container_width=True)
-            with col2:
-                st.plotly_chart(render_category_efficiency_scatter(cat_df), use_container_width=True)
+    st.header(f"Level 2: Category Diagnostic — {dept}")
+    st.caption("*Is this structural or job-specific?*")
 
-            render_category_selector(cat_df)
-        return
+    emoji = {"Accretive": "🟢", "Mixed": "🟡", "Erosive": "🔴"}[dept_ctx["classification"]]
+    st.info(
+        f"""
+**Analysing: {emoji} {dept}** ({dept_ctx['classification']})
 
-    # ========================================
-    # ACT 2c: JOB QUADRANT
-    # ========================================
-    if st.session_state.drill_path["job"] is None:
-        dept = st.session_state.drill_path["department"]
-        cat = st.session_state.drill_path["category"]
+You're here because: {dept_ctx['reasons'][0] if dept_ctx['reasons'] else 'Selected for analysis'}
+"""
+    )
 
-        st.header(f"Act 2c: Job Quadrant — {cat or '(Uncategorised)'}")
-        st.caption("Which jobs are Subsidisers and which are Erosive?")
+    cat_df = compute_category_scorecard(job_df, dept)
 
-        filtered_jobs = job_df[
-            (job_df["department_final"] == dept)
-            & ((job_df["job_category"] == cat) | (job_df["job_category"].isna() & (cat is None)))
-        ].copy()
+    col1, col2 = st.columns(2)
+    with col1:
+        render_category_scorecard(cat_df)
+    with col2:
+        st.plotly_chart(render_category_efficiency_scatter(cat_df), use_container_width=True)
 
-        impact_mode = st.radio(
-            "Size bubbles by:",
-            options=["Revenue Exposure", "Rate Impact", "Margin Impact"],
-            horizontal=True,
-        )
+    if not can_proceed_to_level("job"):
+        render_category_selection_gate(cat_df)
+        st.stop()
 
-        st.plotly_chart(render_job_quadrant_scatter(filtered_jobs, impact_mode), use_container_width=True)
-        render_job_selector(filtered_jobs)
-        return
+    st.divider()
 
-    # ========================================
-    # ACT 3: JOB → TASK → FTE
-    # ========================================
+    # ===========================================
+    # LEVEL 3: JOB QUADRANT
+    # ===========================================
+    cat = st.session_state.drill_path["category"]
+    cat_ctx = st.session_state.drill_path["category_context"]
+
+    st.header(f"Level 3: Job Analysis — {cat or '(Uncategorised)'}")
+    st.caption("*Which jobs subsidise vs destroy margin?*")
+
+    emoji = {"Accretive": "🟢", "Mixed": "🟡", "Erosive": "🔴"}[cat_ctx["classification"]]
+    st.info(
+        f"""
+**Analysing: {emoji} {cat or '(Uncategorised)'}** ({cat_ctx['classification']})
+
+You're here because: {cat_ctx['reasons'][0] if cat_ctx['reasons'] else 'Selected for analysis'}
+"""
+    )
+
+    filtered_jobs = job_df[
+        (job_df["department_final"] == dept)
+        & ((job_df["job_category"] == cat) | (job_df["job_category"].isna() & (cat is None)))
+    ].copy()
+
+    impact_mode = st.radio(
+        "Size bubbles by:",
+        options=["Revenue Exposure", "Rate Impact", "Margin Impact"],
+        horizontal=True,
+    )
+
+    st.plotly_chart(render_job_quadrant_scatter(filtered_jobs, impact_mode), use_container_width=True)
+    render_job_selector(filtered_jobs)
+
+    if not can_proceed_to_level("task"):
+        st.stop()
+
+    st.divider()
+
+    # ===========================================
+    # LEVEL 4: TASK & FTE ROOT CAUSE
+    # ===========================================
     job_no = st.session_state.drill_path["job"]
 
-    st.header(f"Act 3: Root Cause — Job {job_no}")
+    st.header(f"Level 4: Root Cause — {job_no}")
     render_job_diagnostic_card(df, job_no)
 
     st.divider()

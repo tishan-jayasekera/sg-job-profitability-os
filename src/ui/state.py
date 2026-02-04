@@ -2,6 +2,7 @@
 Session state management for Streamlit app.
 """
 import streamlit as st
+import pandas as pd
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 
@@ -98,6 +99,16 @@ def init_state():
     for key, default in DEFAULTS.items():
         if key not in st.session_state:
             st.session_state[key] = default
+
+
+def init_global_context():
+    """Initialize global context state for time period and job state."""
+    if "global_context" not in st.session_state:
+        st.session_state.global_context = {
+            "start_date": pd.Timestamp.today() - pd.Timedelta(days=90),
+            "end_date": pd.Timestamp.today(),
+            "job_state": "All",
+        }
 
 
 def get_state(key: str) -> Any:
