@@ -1,5 +1,5 @@
 """
-Executive Summary: Margin & Delivery Diagnosis
+Executive Summary: Causal Root-Cause Drill Engine (v2)
 """
 import streamlit as st
 import pandas as pd
@@ -8,21 +8,17 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from pathlib import Path
-from typing import Tuple, Dict, Optional
+from typing import Dict, Optional
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data.loader import load_fact_timesheet
-from src.data.semantic import filter_jobs_by_state
 
 
-st.set_page_config(
-    page_title="Executive Summary | Delivery Diagnosis",
-    page_icon="📊",
-    layout="wide",
-)
-
+# =============================================================================
+# DATA LOADING
+# =============================================================================
 
 @st.cache_data
 def load_data() -> pd.DataFrame:
@@ -46,39 +42,107 @@ def load_data() -> pd.DataFrame:
         st.stop()
 
 
-def compute_job_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute job-level metrics with safe quote deduplication.
+# =============================================================================
+# DRILL STATE
+# =============================================================================
 
-    Returns DataFrame with columns:
-    - job_no, department_final, job_category
-    - quoted_hours_job, quoted_amount_job, quote_rate_job
-    - actual_hours_job, revenue_job, cost_job
-    - realised_rate_job, margin_job, margin_pct_job
-    - hours_variance_job, hours_variance_pct_job
-    - rate_variance_job, rate_capture_pct_job
-    - overrun_flag, severe_overrun_flag (>20%)
+
+def init_drill_state():
+    """Initialize session state for drill tracking."""
+    if "drill_path" not in st.session_state:
+        st.session_state.drill_path = {
+            "department": None,
+            "category": None,
+            "job": None,
+            "task": None,
+        }
+
+
+def reset_drill_from(level: str):
+    """Reset drill state from a given level downward."""
+    levels = ["department", "category", "job", "task"]
+    if level not in levels:
+        return
+    idx = levels.index(level)
+    for l in levels[idx:]:
+        st.session_state.drill_path[l] = None
+
+
+def get_drill_breadcrumb() -> str:
+    """Generate breadcrumb string for current drill path."""
+    path = st.session_state.drill_path
+    parts = ["Portfolio"]
+    if path["department"]:
+        parts.append(path["department"])
+    if path["category"] is not None:
+        parts.append(path["category"] if path["category"] is not None else "(Uncategorised)")
+    if path["job"]:
+        parts.append(path["job"])
+    if path["task"]:
+        parts.append(path["task"])
+    return " → ".join(parts)
+
+
+def render_breadcrumb():
+    """Render clickable breadcrumb that allows backtracking."""
+    st.markdown(f"**📍 {get_drill_breadcrumb()}**")
+
+    col1, col2, col3 = st.columns([1, 1, 4])
+    with col1:
+        if st.button("⬅️ Back", disabled=st.session_state.drill_path["department"] is None):
+            for level in reversed(["task", "job", "category", "department"]):
+                if st.session_state.drill_path[level] is not None:
+                    reset_drill_from(level)
+                    st.rerun()
+                    break
+    with col2:
+        if st.button("🏠 Reset to Portfolio"):
+            reset_drill_from("department")
+            st.rerun()
+
+
+# =============================================================================
+# QUOTE DEDUPE
+# =============================================================================
+
+
+def safe_quote_rollup(df: pd.DataFrame, group_cols: list) -> pd.DataFrame:
     """
+    Dedupe quotes to job-task, then aggregate to requested grain.
+    """
+    job_task = df.groupby(["job_no", "task_name"]).agg(
+        quoted_time_total=("quoted_time_total", "first"),
+        quoted_amount_total=("quoted_amount_total", "first"),
+    ).reset_index()
+
+    result = job_task.groupby(group_cols).agg(
+        quoted_time_total=("quoted_time_total", "sum"),
+        quoted_amount_total=("quoted_amount_total", "sum"),
+    ).reset_index()
+
+    return result
+
+
+# =============================================================================
+# METRICS
+# =============================================================================
+
+
+def compute_job_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute job-level metrics with safe quote deduplication."""
     actuals = df.groupby("job_no").agg(
         actual_hours_job=("hours_raw", "sum"),
         revenue_job=("rev_alloc", "sum"),
         cost_job=("base_cost", "sum"),
         department_final=("department_final", "first"),
         job_category=("job_category", "first"),
+        job_status=("job_status", "first"),
     ).reset_index()
 
-    job_task_quotes = df.groupby(["job_no", "task_name"]).agg(
-        quoted_time_total=("quoted_time_total", "first"),
-        quoted_amount_total=("quoted_amount_total", "first"),
-    ).reset_index()
-
-    quotes = job_task_quotes.groupby("job_no").agg(
-        quoted_hours_job=("quoted_time_total", "sum"),
-        quoted_amount_job=("quoted_amount_total", "sum"),
-    ).reset_index()
+    quotes = safe_quote_rollup(df, ["job_no"])
+    quotes.columns = ["job_no", "quoted_hours_job", "quoted_amount_job"]
 
     job_df = actuals.merge(quotes, on="job_no", how="left")
-
     job_df["quoted_hours_job"] = job_df["quoted_hours_job"].fillna(0)
     job_df["quoted_amount_job"] = job_df["quoted_amount_job"].fillna(0)
 
@@ -115,7 +179,7 @@ def compute_job_metrics(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     job_df["overrun_flag"] = job_df["hours_variance_job"] > 0
-    job_df["severe_overrun_flag"] = job_df["hours_variance_pct_job"] > 20
+    job_df["critical_overrun_flag"] = job_df["hours_variance_pct_job"] > 20
     job_df["has_quote"] = job_df["quoted_hours_job"] > 0
 
     if "quote_match_flag" in df.columns:
@@ -135,10 +199,7 @@ def compute_job_metrics(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_portfolio_metrics(job_df: pd.DataFrame) -> Dict:
-    """
-    Compute portfolio-level KPIs.
-    All rates are WEIGHTED (total/total), never mean of rates.
-    """
+    """Compute portfolio-level KPIs with weighted rates."""
     quoted_jobs = job_df[job_df["has_quote"]].copy()
 
     total_quoted_hours = quoted_jobs["quoted_hours_job"].sum()
@@ -153,7 +214,7 @@ def compute_portfolio_metrics(job_df: pd.DataFrame) -> Dict:
     n_jobs = len(job_df)
     n_quoted = len(quoted_jobs)
     n_overrun = int(quoted_jobs["overrun_flag"].sum())
-    n_severe = int(quoted_jobs["severe_overrun_flag"].sum())
+    n_critical = int(quoted_jobs["critical_overrun_flag"].sum())
 
     margin = total_revenue - total_cost
 
@@ -164,43 +225,15 @@ def compute_portfolio_metrics(job_df: pd.DataFrame) -> Dict:
         "margin": margin,
         "margin_pct": (margin / total_revenue * 100) if total_revenue > 0 else 0,
         "pct_jobs_overrun": (n_overrun / n_quoted * 100) if n_quoted > 0 else 0,
-        "pct_jobs_severe_overrun": (n_severe / n_quoted * 100) if n_quoted > 0 else 0,
+        "pct_jobs_critical_overrun": (n_critical / n_quoted * 100) if n_quoted > 0 else 0,
         "total_hours_variance": quoted_jobs["hours_variance_job"].sum(),
         "n_jobs": n_jobs,
         "n_quoted_jobs": n_quoted,
     }
 
 
-def render_kpi_strip(metrics: Dict):
-    cols = st.columns(6)
-
-    with cols[0]:
-        st.metric("Quote Rate", f"${metrics['quote_rate']:,.0f}/hr")
-
-    with cols[1]:
-        st.metric(
-            "Realised Rate",
-            f"${metrics['realised_rate']:,.0f}/hr",
-            delta=f"${metrics['rate_variance']:+,.0f}",
-        )
-
-    with cols[2]:
-        st.metric("Rate Variance", f"${metrics['rate_variance']:+,.0f}/hr")
-
-    with cols[3]:
-        st.metric("Portfolio Margin", f"{metrics['margin_pct']:.1f}%")
-
-    with cols[4]:
-        st.metric("% Jobs Overrun", f"{metrics['pct_jobs_overrun']:.0f}%")
-
-    with cols[5]:
-        st.metric("% 20%+ Overrun", f"{metrics['pct_jobs_severe_overrun']:.0f}%")
-
-
 def compute_rate_bridge(job_df: pd.DataFrame, portfolio_metrics: Dict) -> pd.DataFrame:
-    """
-    Decompose the Quote → Realised rate bridge.
-    """
+    """Decompose the Quote → Realised rate bridge."""
     quoted_jobs = job_df[job_df["has_quote"]].copy()
 
     under_run = quoted_jobs[quoted_jobs["hours_variance_job"] < 0]
@@ -247,8 +280,38 @@ def compute_rate_bridge(job_df: pd.DataFrame, portfolio_metrics: Dict) -> pd.Dat
     })
 
 
+# =============================================================================
+# PORTFOLIO RENDERING
+# =============================================================================
+
+
+def render_kpi_strip(metrics: Dict):
+    cols = st.columns(6)
+
+    with cols[0]:
+        st.metric("Quote Rate", f"${metrics['quote_rate']:,.0f}/hr")
+
+    with cols[1]:
+        st.metric(
+            "Realised Rate",
+            f"${metrics['realised_rate']:,.0f}/hr",
+            delta=f"${metrics['rate_variance']:+,.0f}",
+        )
+
+    with cols[2]:
+        st.metric("Rate Variance", f"${metrics['rate_variance']:+,.0f}/hr")
+
+    with cols[3]:
+        st.metric("Portfolio Margin", f"{metrics['margin_pct']:.1f}%")
+
+    with cols[4]:
+        st.metric("% Jobs Overrun", f"{metrics['pct_jobs_overrun']:.0f}%")
+
+    with cols[5]:
+        st.metric("% Critical Overrun", f"{metrics['pct_jobs_critical_overrun']:.0f}%")
+
+
 def render_rate_bridge(bridge_df: pd.DataFrame):
-    """Render waterfall chart using Plotly."""
     fig = go.Figure(
         go.Waterfall(
             name="Rate Bridge",
@@ -275,410 +338,552 @@ def render_rate_bridge(bridge_df: pd.DataFrame):
     return fig
 
 
-def render_quadrant_scatter(job_df: pd.DataFrame):
-    """Render the Winners vs Losers quadrant scatter."""
-    plot_df = job_df[
-        job_df["has_quote"]
-        & job_df["realised_rate_job"].notna()
-        & job_df["quote_rate_job"].notna()
-    ].copy()
+# =============================================================================
+# ACT 2a: DEPARTMENT
+# =============================================================================
 
-    if plot_df.empty:
-        fig = go.Figure()
-        fig.add_annotation(
-            text="No quoted jobs with valid rates",
-            x=0.5,
-            y=0.5,
-            showarrow=False,
-            xref="paper",
-            yref="paper",
-        )
-        fig.update_layout(title="Job Outcome Quadrants: Winners vs Losers", height=500)
-        return fig
 
-    plot_df["revenue_size"] = plot_df["revenue_job"].abs()
+def compute_department_contribution(job_df: pd.DataFrame, portfolio_metrics: dict) -> pd.DataFrame:
+    """Compute each department's contribution to portfolio realised rate."""
+    portfolio_rate = portfolio_metrics["realised_rate"]
+    portfolio_revenue = job_df["revenue_job"].sum()
+
+    dept_df = job_df.groupby("department_final").agg(
+        revenue=("revenue_job", "sum"),
+        actual_hours=("actual_hours_job", "sum"),
+        cost=("cost_job", "sum"),
+        quoted_hours=("quoted_hours_job", "sum"),
+        quoted_amount=("quoted_amount_job", "sum"),
+        hours_variance=("hours_variance_job", "sum"),
+        overrun_jobs=("overrun_flag", "sum"),
+        total_jobs=("job_no", "count"),
+    ).reset_index()
+
+    dept_df["realised_rate"] = np.where(
+        dept_df["actual_hours"] > 0,
+        dept_df["revenue"] / dept_df["actual_hours"],
+        np.nan,
+    )
+    dept_df["quote_rate"] = np.where(
+        dept_df["quoted_hours"] > 0,
+        dept_df["quoted_amount"] / dept_df["quoted_hours"],
+        np.nan,
+    )
+
+    dept_df["revenue_weight"] = dept_df["revenue"] / portfolio_revenue if portfolio_revenue > 0 else 0
+    dept_df["rate_contribution"] = dept_df["revenue_weight"] * (dept_df["realised_rate"] - portfolio_rate)
+    dept_df["impact_type"] = np.where(dept_df["rate_contribution"] >= 0, "Subsidiser", "Erosive")
+
+    dept_df = dept_df.rename(columns={"department_final": "department"})
+
+    return dept_df.sort_values("rate_contribution", ascending=True)
+
+
+def render_dept_contribution_bars(dept_df: pd.DataFrame):
+    colors = {"Subsidiser": "#2E7D32", "Erosive": "#C62828"}
+    fig = px.bar(
+        dept_df,
+        x="rate_contribution",
+        y="department",
+        orientation="h",
+        color="impact_type",
+        color_discrete_map=colors,
+        labels={"rate_contribution": "Rate Contribution ($/hr)", "department": "Department"},
+    )
+    fig.update_layout(title="Department Contribution to Portfolio Rate", height=420)
+    return fig
+
+
+def render_dept_efficiency_scatter(dept_df: pd.DataFrame):
+    dept_df = dept_df.copy()
+    dept_df["hours_variance_pct"] = np.where(
+        dept_df["quoted_hours"] > 0,
+        dept_df["hours_variance"] / dept_df["quoted_hours"] * 100,
+        np.nan,
+    )
+    dept_df["rate_variance"] = dept_df["realised_rate"] - dept_df["quote_rate"]
+    dept_df["size"] = dept_df["revenue"].abs()
 
     fig = px.scatter(
-        plot_df,
-        x="hours_variance_pct_job",
-        y="rate_variance_job",
-        size="revenue_size",
-        color="department_final",
-        hover_data=["job_no", "margin_pct_job", "actual_hours_job"],
+        dept_df,
+        x="hours_variance_pct",
+        y="rate_variance",
+        size="size",
+        color="impact_type",
+        color_discrete_map={"Subsidiser": "#2E7D32", "Erosive": "#C62828"},
+        hover_data=["department", "revenue", "actual_hours"],
         labels={
-            "hours_variance_pct_job": "Hours Variance %",
-            "rate_variance_job": "Rate Variance ($/hr)",
-            "revenue_size": "Revenue",
-            "department_final": "Department",
+            "hours_variance_pct": "Hours Variance %",
+            "rate_variance": "Rate Variance ($/hr)",
+            "size": "Revenue",
         },
     )
 
     fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
     fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
 
-    y_max = plot_df["rate_variance_job"].max()
-    y_min = plot_df["rate_variance_job"].min()
-    fig.add_annotation(
-        x=-50,
-        y=y_max * 0.8 if pd.notna(y_max) else 0,
-        text="SUBSIDISERS<br>(Under-run + High Rate)",
-        showarrow=False,
-        font=dict(color="green", size=10),
-    )
-    fig.add_annotation(
-        x=50,
-        y=y_min * 0.8 if pd.notna(y_min) else 0,
-        text="EROSIVE<br>(Overrun + Low Rate)",
-        showarrow=False,
-        font=dict(color="red", size=10),
-    )
-
-    fig.update_layout(
-        title="Job Outcome Quadrants: Winners vs Losers",
-        height=500,
-    )
-
+    fig.update_layout(title="Department Efficiency vs Pricing", height=420)
     return fig
 
 
-def render_overrun_distribution(job_df: pd.DataFrame):
-    """Render overrun distribution and contribution charts."""
-    quoted_jobs = job_df[job_df["has_quote"]].copy()
+def render_department_selector(dept_df: pd.DataFrame):
+    st.subheader("Select Department to Drill Into")
 
-    def categorise_overrun(pct):
-        if pct < 0:
-            return "Under-run"
-        if pct <= 20:
-            return "Mild Overrun (0-20%)"
-        return "Severe Overrun (>20%)"
-
-    if quoted_jobs.empty:
-        fig = make_subplots(
-            rows=1,
-            cols=2,
-            subplot_titles=("Job Distribution", "Hours Variance Contribution"),
-            specs=[[{"type": "bar"}, {"type": "bar"}]],
-        )
-        fig.update_layout(height=350, title_text="Overrun Distribution & Impact")
-        return fig, pd.DataFrame()
-
-    quoted_jobs["overrun_category"] = quoted_jobs["hours_variance_pct_job"].apply(categorise_overrun)
-
-    category_stats = quoted_jobs.groupby("overrun_category").agg(
-        job_count=("job_no", "count"),
-        hours_variance=("hours_variance_job", "sum"),
-        margin=("margin_job", "sum"),
-    ).reset_index()
-    category_stats["job_pct"] = category_stats["job_count"] / category_stats["job_count"].sum() * 100
-
-    fig = make_subplots(
-        rows=1,
-        cols=2,
-        subplot_titles=("Job Distribution", "Hours Variance Contribution"),
-        specs=[[{"type": "bar"}, {"type": "bar"}]],
+    dept_options = dept_df["department"].dropna().tolist()
+    selected = st.selectbox(
+        "Choose department:",
+        options=["-- Select --"] + dept_options,
+        format_func=lambda x: x if x == "-- Select --" else f"{x} ({dept_df[dept_df['department'] == x]['impact_type'].values[0]})",
     )
 
-    colors = {
-        "Under-run": "#2E7D32",
-        "Mild Overrun (0-20%)": "#FFA726",
-        "Severe Overrun (>20%)": "#C62828",
-    }
-
-    for cat in ["Under-run", "Mild Overrun (0-20%)", "Severe Overrun (>20%)"]:
-        row = category_stats[category_stats["overrun_category"] == cat]
-        if len(row) > 0:
-            fig.add_trace(
-                go.Bar(
-                    name=cat,
-                    x=[cat],
-                    y=row["job_pct"].values,
-                    marker_color=colors[cat],
-                    showlegend=True,
-                ),
-                row=1,
-                col=1,
-            )
-            fig.add_trace(
-                go.Bar(
-                    name=cat,
-                    x=[cat],
-                    y=row["hours_variance"].values,
-                    marker_color=colors[cat],
-                    showlegend=False,
-                ),
-                row=1,
-                col=2,
-            )
-
-    fig.update_layout(height=350, title_text="Overrun Distribution & Impact")
-    fig.update_yaxes(title_text="% of Jobs", row=1, col=1)
-    fig.update_yaxes(title_text="Hours Variance", row=1, col=2)
-
-    category_stats = category_stats.rename(
-        columns={
-            "overrun_category": "Category",
-            "job_count": "Job Count",
-            "hours_variance": "Hours Variance",
-            "margin": "Margin",
-            "job_pct": "Job %",
-        }
-    )
-
-    return fig, category_stats
+    if selected != "-- Select --":
+        st.session_state.drill_path["department"] = selected
+        st.rerun()
+    else:
+        st.warning("⬇️ Select a department above to continue root-cause analysis")
 
 
-def compute_department_scoreboard(job_df: pd.DataFrame) -> pd.DataFrame:
-    """Compute department-level scoreboard."""
-    if job_df.empty:
+# =============================================================================
+# ACT 2b: CATEGORY
+# =============================================================================
+
+
+def compute_category_contribution(job_df: pd.DataFrame, department: str) -> pd.DataFrame:
+    dept_jobs = job_df[job_df["department_final"] == department].copy()
+    if dept_jobs.empty:
         return pd.DataFrame()
 
-    dept_df = job_df.groupby("department_final").agg(
+    dept_rate = dept_jobs["revenue_job"].sum() / dept_jobs["actual_hours_job"].sum()
+    dept_revenue = dept_jobs["revenue_job"].sum()
+
+    cat_df = dept_jobs.groupby("job_category").agg(
+        revenue=("revenue_job", "sum"),
+        actual_hours=("actual_hours_job", "sum"),
         quoted_hours=("quoted_hours_job", "sum"),
         quoted_amount=("quoted_amount_job", "sum"),
-        actual_hours=("actual_hours_job", "sum"),
-        revenue=("revenue_job", "sum"),
-        cost=("cost_job", "sum"),
         hours_variance=("hours_variance_job", "sum"),
         overrun_jobs=("overrun_flag", "sum"),
         total_jobs=("job_no", "count"),
     ).reset_index()
 
-    dept_df["Quote Rate"] = np.where(
-        dept_df["quoted_hours"] > 0,
-        dept_df["quoted_amount"] / dept_df["quoted_hours"],
+    cat_df["realised_rate"] = np.where(
+        cat_df["actual_hours"] > 0,
+        cat_df["revenue"] / cat_df["actual_hours"],
         np.nan,
     )
-    dept_df["Realised Rate"] = np.where(
-        dept_df["actual_hours"] > 0,
-        dept_df["revenue"] / dept_df["actual_hours"],
+    cat_df["quote_rate"] = np.where(
+        cat_df["quoted_hours"] > 0,
+        cat_df["quoted_amount"] / cat_df["quoted_hours"],
         np.nan,
     )
-    dept_df["Rate Variance"] = dept_df["Realised Rate"] - dept_df["Quote Rate"]
-    dept_df["% Overrun"] = dept_df["overrun_jobs"] / dept_df["total_jobs"] * 100
-
-    total_hours = dept_df["actual_hours"].sum()
-    avg_cost_rate = dept_df["cost"].sum() / total_hours if total_hours > 0 else 50
-    dept_df["Margin Impact Est."] = dept_df["hours_variance"] * avg_cost_rate * -1
-
-    display_cols = [
-        "department_final",
-        "Quote Rate",
-        "Realised Rate",
-        "Rate Variance",
-        "% Overrun",
-        "hours_variance",
-        "Margin Impact Est.",
-    ]
-
-    dept_df = dept_df[display_cols].rename(
-        columns={
-            "department_final": "Department",
-            "hours_variance": "Hours Variance",
-        }
+    cat_df["rate_variance"] = cat_df["realised_rate"] - cat_df["quote_rate"]
+    cat_df["hours_variance_pct"] = np.where(
+        cat_df["quoted_hours"] > 0,
+        cat_df["hours_variance"] / cat_df["quoted_hours"] * 100,
+        np.nan,
     )
 
-    return dept_df.sort_values("Rate Variance", ascending=True)
+    cat_df["revenue_weight"] = cat_df["revenue"] / dept_revenue if dept_revenue > 0 else 0
+    cat_df["rate_contribution"] = cat_df["revenue_weight"] * (cat_df["realised_rate"] - dept_rate)
+    cat_df["impact_type"] = np.where(cat_df["rate_contribution"] >= 0, "Subsidiser", "Erosive")
+
+    return cat_df.sort_values("rate_contribution", ascending=True)
 
 
-def compute_intervention_queue(job_df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
-    """
-    Compute intervention queue with risk scores and reason codes.
-    """
-    queue_df = job_df[job_df["has_quote"]].copy()
+def render_category_contribution_bars(cat_df: pd.DataFrame):
+    colors = {"Subsidiser": "#2E7D32", "Erosive": "#C62828"}
+    fig = px.bar(
+        cat_df,
+        x="rate_contribution",
+        y="job_category",
+        orientation="h",
+        color="impact_type",
+        color_discrete_map=colors,
+        labels={"rate_contribution": "Rate Contribution ($/hr)", "job_category": "Category"},
+    )
+    fig.update_layout(title="Category Contribution to Department Rate", height=420)
+    return fig
 
-    if queue_df.empty:
-        return pd.DataFrame(
-            columns=[
-                "Job",
-                "Department",
-                "Revenue",
-                "Hours Overrun %",
-                "Rate Leakage %",
-                "Risk Score",
-                "Reason Codes",
-                "Action",
-            ]
+
+def render_category_efficiency_scatter(cat_df: pd.DataFrame):
+    cat_df = cat_df.copy()
+    cat_df["size"] = cat_df["revenue"].abs()
+
+    fig = px.scatter(
+        cat_df,
+        x="hours_variance_pct",
+        y="rate_variance",
+        size="size",
+        color="impact_type",
+        color_discrete_map={"Subsidiser": "#2E7D32", "Erosive": "#C62828"},
+        hover_data=["job_category", "revenue", "actual_hours"],
+        labels={
+            "hours_variance_pct": "Hours Variance %",
+            "rate_variance": "Rate Variance ($/hr)",
+            "size": "Revenue",
+        },
+    )
+
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
+
+    fig.update_layout(title="Category Efficiency vs Pricing", height=420)
+    return fig
+
+
+def render_category_selector(cat_df: pd.DataFrame):
+    st.subheader(f"Select Category within {st.session_state.drill_path['department']}")
+
+    cat_df = cat_df.copy()
+    cat_df["category_display"] = cat_df["job_category"].fillna("(Uncategorised)")
+    display_options = cat_df["category_display"].tolist()
+
+    selected = st.selectbox(
+        "Choose category:",
+        options=["-- Select --"] + display_options,
+    )
+
+    if selected != "-- Select --":
+        actual_val = None if selected == "(Uncategorised)" else selected
+        st.session_state.drill_path["category"] = actual_val
+        st.rerun()
+    else:
+        st.warning("⬇️ Select a category above to see job-level breakdown")
+
+
+# =============================================================================
+# ACT 2c: JOB QUADRANT
+# =============================================================================
+
+
+def render_job_quadrant_scatter(job_df: pd.DataFrame, impact_mode: str):
+    if job_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No jobs available",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            xref="paper",
+            yref="paper",
         )
+        fig.update_layout(title="Job Outcome Quadrant", height=500)
+        return fig
 
-    queue_df["norm_overrun"] = queue_df["hours_variance_pct_job"].clip(lower=0) / 100
-    queue_df["norm_overrun"] = queue_df["norm_overrun"].clip(upper=1)
+    total_revenue = job_df["revenue_job"].sum()
+    category_rate = total_revenue / job_df["actual_hours_job"].sum() if job_df["actual_hours_job"].sum() > 0 else 0
+    cost_rate = job_df["cost_job"].sum() / job_df["actual_hours_job"].sum() if job_df["actual_hours_job"].sum() > 0 else 0
 
-    queue_df["norm_revenue"] = queue_df["revenue_job"].rank(pct=True)
+    job_df = job_df.copy()
+    job_df["revenue_weight"] = job_df["revenue_job"] / total_revenue if total_revenue > 0 else 0
+    job_df["rate_contribution"] = job_df["revenue_weight"] * (job_df["realised_rate_job"] - category_rate)
+    job_df["impact_type"] = np.where(job_df["rate_contribution"] >= 0, "Subsidiser", "Erosive")
 
-    queue_df["rate_leakage_pct"] = np.where(
-        queue_df["quote_rate_job"] > 0,
-        (queue_df["quote_rate_job"] - queue_df["realised_rate_job"]) / queue_df["quote_rate_job"],
-        0,
+    job_df["abs_rate_contribution"] = job_df["rate_contribution"].abs()
+    job_df["abs_margin_impact"] = (job_df["hours_variance_job"] * cost_rate).abs()
+
+    if impact_mode == "Revenue Exposure":
+        size_col = "revenue_job"
+    elif impact_mode == "Rate Impact":
+        size_col = "abs_rate_contribution"
+    else:
+        size_col = "abs_margin_impact"
+
+    job_df["size"] = job_df[size_col].abs()
+
+    fig = px.scatter(
+        job_df,
+        x="hours_variance_pct_job",
+        y="rate_variance_job",
+        size="size",
+        color="impact_type",
+        color_discrete_map={"Subsidiser": "#2E7D32", "Erosive": "#C62828"},
+        hover_data=["job_no", "revenue_job", "margin_pct_job"],
+        labels={
+            "hours_variance_pct_job": "Hours Variance %",
+            "rate_variance_job": "Rate Variance ($/hr)",
+            "size": impact_mode,
+        },
     )
-    queue_df["rate_leakage_pct"] = queue_df["rate_leakage_pct"].replace([np.inf, -np.inf], np.nan).fillna(0)
-    queue_df["norm_rate_leakage"] = queue_df["rate_leakage_pct"].clip(lower=0, upper=1)
 
-    queue_df["norm_runtime"] = np.where(queue_df["hours_variance_pct_job"] > 20, 0.5, 0.2)
+    fig.add_hline(y=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.add_vline(x=0, line_dash="dash", line_color="gray", opacity=0.5)
+    fig.update_layout(title="Job Outcome Quadrant", height=500)
 
-    queue_df["risk_score"] = (
-        0.30 * queue_df["norm_overrun"]
-        + 0.25 * queue_df["norm_revenue"]
-        + 0.25 * queue_df["norm_rate_leakage"]
-        + 0.20 * queue_df["norm_runtime"]
-    ) * 100
+    return fig
 
-    def get_reason_codes(row):
-        codes = []
-        if row["hours_variance_pct_job"] > 20:
-            codes.append("SEVERE_OVERRUN")
-        if row["rate_leakage_pct"] > 0.2:
-            codes.append("RATE_LEAKAGE")
-        if row["unquoted_pct_job"] > 10:
-            codes.append("SCOPE_CREEP")
-        if row["margin_job"] < 0:
-            codes.append("MARGIN_NEGATIVE")
-        if row["norm_revenue"] > 0.8:
-            codes.append("HIGH_EXPOSURE")
-        return ", ".join(codes) if codes else "MONITOR"
 
-    queue_df["reason_codes"] = queue_df.apply(get_reason_codes, axis=1)
+def render_job_selector(job_df: pd.DataFrame):
+    st.markdown("**Select job to drill into:**")
+    sort_df = job_df.copy()
+    total_revenue = sort_df["revenue_job"].sum()
+    category_rate = total_revenue / sort_df["actual_hours_job"].sum() if sort_df["actual_hours_job"].sum() > 0 else 0
+    sort_df["revenue_weight"] = sort_df["revenue_job"] / total_revenue if total_revenue > 0 else 0
+    sort_df["rate_contribution"] = sort_df["revenue_weight"] * (sort_df["realised_rate_job"] - category_rate)
+    sort_df["priority_score"] = sort_df["rate_contribution"].abs()
 
-    def get_action(row):
-        if row["margin_job"] < 0:
-            return "🚨 Escalate billing / re-scope"
-        if row["hours_variance_pct_job"] > 50:
-            return "⚠️ Right-size staffing"
-        if row["rate_leakage_pct"] > 0.3:
-            return "💰 Quote adjustment review"
-        return "👀 Monitor closely"
+    job_options = sort_df.sort_values("priority_score", ascending=False)["job_no"].tolist()
+    selected = st.selectbox("Choose job:", options=["-- Select --"] + job_options)
 
-    queue_df["recommended_action"] = queue_df.apply(get_action, axis=1)
+    if selected != "-- Select --":
+        st.session_state.drill_path["job"] = selected
+        st.rerun()
 
-    queue_df = queue_df.nlargest(top_n, "risk_score")
 
-    display_df = queue_df[[
-        "job_no",
-        "department_final",
-        "revenue_job",
-        "hours_variance_pct_job",
-        "rate_leakage_pct",
-        "risk_score",
-        "reason_codes",
-        "recommended_action",
+# =============================================================================
+# ACT 3a: JOB DIAGNOSTIC
+# =============================================================================
+
+
+def render_job_diagnostic_card(df: pd.DataFrame, job_no: str):
+    job_data = df[df["job_no"] == job_no]
+
+    actual_hours = job_data["hours_raw"].sum()
+    revenue = job_data["rev_alloc"].sum()
+    cost = job_data["base_cost"].sum()
+
+    task_quotes = job_data.groupby("task_name").agg(
+        quoted_time_total=("quoted_time_total", "first"),
+        quoted_amount_total=("quoted_amount_total", "first"),
+    )
+    quoted_hours = task_quotes["quoted_time_total"].sum()
+    quoted_amount = task_quotes["quoted_amount_total"].sum()
+
+    quote_rate = quoted_amount / quoted_hours if quoted_hours > 0 else 0
+    realised_rate = revenue / actual_hours if actual_hours > 0 else 0
+
+    hours_variance = actual_hours - quoted_hours
+    hours_variance_pct = (hours_variance / quoted_hours * 100) if quoted_hours > 0 else 0
+    rate_variance = realised_rate - quote_rate
+
+    margin = revenue - cost
+    margin_pct = (margin / revenue * 100) if revenue > 0 else 0
+
+    unquoted_tasks = job_data[job_data["quote_match_flag"] != "matched"] if "quote_match_flag" in job_data.columns else pd.DataFrame()
+    unquoted_hours = unquoted_tasks["hours_raw"].sum() if not unquoted_tasks.empty else 0
+    unquoted_pct = (unquoted_hours / actual_hours * 100) if actual_hours > 0 else 0
+
+    st.subheader(f"📋 Job Diagnostic: {job_no}")
+
+    st.markdown("### A. Volume Efficiency (Time)")
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Quoted Hours", f"{quoted_hours:,.0f}")
+    col2.metric("Actual Hours", f"{actual_hours:,.0f}", delta=f"{hours_variance:+,.0f}")
+    col3.metric("Hours Variance", f"{hours_variance_pct:+.0f}%")
+    col4.metric("Scope Creep", f"{unquoted_pct:.0f}%", help="Unquoted hours as % of actual hours")
+
+    st.markdown("### B. Rate Integrity (Commercial)")
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Quote Rate", f"${quote_rate:,.0f}/hr")
+    col2.metric("Realised Rate", f"${realised_rate:,.0f}/hr", delta=f"${rate_variance:+,.0f}")
+    col3.metric("Rate Capture", f"{(realised_rate / quote_rate * 100) if quote_rate > 0 else 0:.0f}%")
+
+    st.markdown("### C. Margin Outcome")
+    cost_rate = cost / actual_hours if actual_hours > 0 else 0
+    cost_delta_from_hours = (actual_hours - quoted_hours) * cost_rate
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Revenue", f"${revenue:,.0f}")
+    col2.metric("Cost", f"${cost:,.0f}")
+    col3.metric("Margin", f"${margin:,.0f}", delta=f"{margin_pct:.1f}%")
+
+    st.caption(f"**Margin delta from hours overrun:** ${cost_delta_from_hours:,.0f}")
+
+
+# =============================================================================
+# ACT 3b: TASK WATERFALL
+# =============================================================================
+
+
+def compute_task_waterfall(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
+    job_data = df[df["job_no"] == job_no]
+
+    task_df = job_data.groupby("task_name").agg(
+        hours_raw=("hours_raw", "sum"),
+        quoted_time_total=("quoted_time_total", "first"),
+        quote_match_flag=("quote_match_flag", "first"),
+        base_cost=("base_cost", "sum"),
+    ).reset_index()
+
+    task_df["quoted_hours"] = task_df["quoted_time_total"].fillna(0)
+    task_df["actual_hours"] = task_df["hours_raw"]
+    task_df["hours_variance"] = task_df["actual_hours"] - task_df["quoted_hours"]
+
+    task_df["variance_type"] = np.where(
+        task_df["quote_match_flag"] != "matched",
+        "Scope Creep (Unquoted)",
+        np.where(
+            task_df["hours_variance"] > 0,
+            "Overrun (Inefficiency)",
+            np.where(
+                task_df["hours_variance"] < 0,
+                "Under-run (Efficiency)",
+                "On Target",
+            ),
+        ),
+    )
+
+    total_abs_variance = task_df["hours_variance"].abs().sum()
+    task_df["contribution_pct"] = (
+        task_df["hours_variance"].abs() / total_abs_variance * 100 if total_abs_variance > 0 else 0
+    )
+
+    return task_df.sort_values("hours_variance", ascending=False)
+
+
+def render_task_waterfall(task_df: pd.DataFrame, quoted_hours_total: float):
+    waterfall_data = [{"task": "Quoted Hours", "value": quoted_hours_total, "type": "absolute"}]
+
+    for _, row in task_df.iterrows():
+        if row["hours_variance"] != 0:
+            waterfall_data.append({
+                "task": row["task_name"][:25],
+                "value": row["hours_variance"],
+                "type": "relative",
+            })
+
+    waterfall_data.append({
+        "task": "Actual Hours",
+        "value": quoted_hours_total + task_df["hours_variance"].sum(),
+        "type": "total",
+    })
+
+    wf_df = pd.DataFrame(waterfall_data)
+
+    fig = go.Figure(
+        go.Waterfall(
+            name="Hours",
+            orientation="v",
+            measure=wf_df["type"].tolist(),
+            x=wf_df["task"].tolist(),
+            y=wf_df["value"].tolist(),
+            textposition="outside",
+            text=[
+                f"{v:+,.0f}" if t == "relative" else f"{v:,.0f}"
+                for v, t in zip(wf_df["value"], wf_df["type"])
+            ],
+            connector={"line": {"color": "rgb(63, 63, 63)"}},
+            increasing={"marker": {"color": "#C62828"}},
+            decreasing={"marker": {"color": "#2E7D32"}},
+            totals={"marker": {"color": "#1565C0"}},
+        )
+    )
+
+    fig.update_layout(
+        title="Task Contribution to Hours Variance",
+        yaxis_title="Hours",
+        showlegend=False,
+        height=400,
+    )
+
+    return fig
+
+
+def render_task_table(task_df: pd.DataFrame):
+    display_df = task_df[[
+        "task_name",
+        "quoted_hours",
+        "actual_hours",
+        "hours_variance",
+        "variance_type",
+        "contribution_pct",
+        "base_cost",
     ]].copy()
 
     display_df.columns = [
-        "Job",
-        "Department",
-        "Revenue",
-        "Hours Overrun %",
-        "Rate Leakage %",
-        "Risk Score",
-        "Reason Codes",
-        "Action",
+        "Task",
+        "Quoted Hrs",
+        "Actual Hrs",
+        "Variance",
+        "Type",
+        "Contribution %",
+        "Cost",
     ]
 
-    return display_df
+    def highlight_type(row):
+        if "Scope Creep" in row["Type"]:
+            return ["background-color: #FFCDD2"] * len(row)
+        if "Overrun" in row["Type"]:
+            return ["background-color: #FFE0B2"] * len(row)
+        if "Under-run" in row["Type"]:
+            return ["background-color: #C8E6C9"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(
+        display_df.style
+            .apply(highlight_type, axis=1)
+            .format({
+                "Quoted Hrs": "{:,.0f}",
+                "Actual Hrs": "{:,.0f}",
+                "Variance": "{:+,.0f}",
+                "Contribution %": "{:.0f}%",
+                "Cost": "${:,.0f}",
+            }),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
-def render_drill_down_panel(df: pd.DataFrame, selected_job: str):
-    """Render drill-down panel for selected job."""
-    job_data = df[df["job_no"] == selected_job].copy()
+# =============================================================================
+# ACT 3c: FTE ATTRIBUTION
+# =============================================================================
 
-    if job_data.empty:
-        st.warning(f"No data found for job {selected_job}")
-        return
 
-    st.subheader(f"📋 Job Details: {selected_job}")
+def render_fte_attribution(df: pd.DataFrame, job_no: str, task_name: Optional[str] = None):
+    job_data = df[df["job_no"] == job_no]
 
-    with st.expander("Job Brief", expanded=True):
-        actual_hours = job_data["hours_raw"].sum()
-        revenue = job_data["rev_alloc"].sum()
-        cost = job_data["base_cost"].sum()
+    if task_name:
+        job_data = job_data[job_data["task_name"] == task_name]
+        st.subheader(f"👥 Staff Attribution: {task_name}")
+    else:
+        st.subheader("👥 Staff Attribution (All Tasks)")
 
-        task_quotes = job_data.groupby("task_name").agg(
-            quoted_time_total=("quoted_time_total", "first"),
-            quoted_amount_total=("quoted_amount_total", "first"),
-        )
-        quoted_hours = task_quotes["quoted_time_total"].sum()
-        quoted_amount = task_quotes["quoted_amount_total"].sum()
+    staff_df = job_data.groupby("staff_name").agg(
+        hours_raw=("hours_raw", "sum"),
+        base_cost=("base_cost", "sum"),
+    ).reset_index()
 
-        quote_rate = quoted_amount / quoted_hours if quoted_hours > 0 else 0
-        realised_rate = revenue / actual_hours if actual_hours > 0 else 0
-        margin = revenue - cost
-        margin_pct = margin / revenue * 100 if revenue > 0 else 0
+    staff_df.columns = ["Staff", "Hours", "Cost"]
 
-        job_status = job_data["job_status"].dropna().iloc[0] if "job_status" in job_data.columns and job_data["job_status"].notna().any() else "Unknown"
-        department = job_data["department_final"].dropna().iloc[0] if job_data["department_final"].notna().any() else "Unknown"
-        category = job_data["job_category"].dropna().iloc[0] if "job_category" in job_data.columns and job_data["job_category"].notna().any() else "Unknown"
+    total_hours = staff_df["Hours"].sum()
+    total_cost = staff_df["Cost"].sum()
 
-        st.markdown(
-            f"**Department:** {department}  |  **Category:** {category}  |  **Status:** {job_status}"
-        )
+    staff_df["Hours %"] = staff_df["Hours"] / total_hours * 100 if total_hours > 0 else 0
+    staff_df["Cost %"] = staff_df["Cost"] / total_cost * 100 if total_cost > 0 else 0
+    staff_df["Effective Rate"] = np.where(
+        staff_df["Hours"] > 0,
+        staff_df["Cost"] / staff_df["Hours"],
+        np.nan,
+    )
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Quoted Hours", f"{quoted_hours:,.0f}")
-            st.metric("Quote Rate", f"${quote_rate:,.0f}/hr")
-        with col2:
-            st.metric("Actual Hours", f"{actual_hours:,.0f}", delta=f"{actual_hours - quoted_hours:+,.0f}")
-            st.metric("Realised Rate", f"${realised_rate:,.0f}/hr", delta=f"${realised_rate - quote_rate:+,.0f}")
-        with col3:
-            st.metric("Margin", f"${margin:,.0f}")
-            st.metric("Margin %", f"{margin_pct:.1f}%")
+    staff_df = staff_df.sort_values("Hours", ascending=False)
 
-    with st.expander("Task Drivers", expanded=True):
-        task_df = job_data.groupby("task_name").agg(
-            hours_raw=("hours_raw", "sum"),
-            quoted_time_total=("quoted_time_total", "first"),
-            quote_match_flag=("quote_match_flag", "first"),
-        ).reset_index()
+    st.dataframe(
+        staff_df.style.format({
+            "Hours": "{:,.1f}",
+            "Cost": "${:,.0f}",
+            "Hours %": "{:.0f}%",
+            "Cost %": "{:.0f}%",
+            "Effective Rate": "${:,.0f}/hr",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
 
-        task_df["hours_variance"] = task_df["hours_raw"] - task_df["quoted_time_total"].fillna(0)
-        task_df["is_unquoted"] = task_df["quote_match_flag"] != "matched"
-
-        total_variance = task_df["hours_variance"].abs().sum()
-        if total_variance > 0:
-            task_df["contribution_pct"] = task_df["hours_variance"].abs() / total_variance * 100
-        else:
-            task_df["contribution_pct"] = 0
-
-        display_task = task_df[[
-            "task_name",
-            "quoted_time_total",
-            "hours_raw",
-            "hours_variance",
-            "is_unquoted",
-            "contribution_pct",
-        ]].copy()
-        display_task.columns = [
-            "Task",
-            "Quoted Hrs",
-            "Actual Hrs",
-            "Variance",
-            "Unquoted?",
-            "Contribution %",
-        ]
-
-        st.dataframe(
-            display_task.sort_values("Variance", ascending=False),
-            use_container_width=True,
-            hide_index=True,
+    if not staff_df.empty:
+        top_staff = staff_df.iloc[0]
+        st.info(
+            f"**{top_staff['Staff']}** contributed {top_staff['Hours %']:.0f}% of hours "
+            f"at ${top_staff['Effective Rate']:,.0f}/hr effective rate"
         )
 
-    with st.expander("Staff Drivers", expanded=False):
-        staff_df = job_data.groupby("staff_name").agg(
-            hours_raw=("hours_raw", "sum"),
-            base_cost=("base_cost", "sum"),
-        ).reset_index()
 
-        staff_df["pct_of_hours"] = staff_df["hours_raw"] / staff_df["hours_raw"].sum() * 100
-        staff_df.columns = ["Staff", "Hours", "Cost", "% of Job Hours"]
-
-        st.dataframe(
-            staff_df.sort_values("Hours", ascending=False),
-            use_container_width=True,
-            hide_index=True,
-        )
+# =============================================================================
+# RECONCILIATION
+# =============================================================================
 
 
 def render_reconciliation_panel(df: pd.DataFrame, job_df: pd.DataFrame, portfolio_metrics: Dict):
-    """Render collapsible reconciliation panel."""
     with st.expander("🔍 Data Reconciliation (QA)", expanded=False):
         col1, col2 = st.columns(2)
 
@@ -706,240 +911,147 @@ def render_reconciliation_panel(df: pd.DataFrame, job_df: pd.DataFrame, portfoli
             )
 
 
-def plotly_chart_with_select(fig):
-    try:
-        return st.plotly_chart(fig, use_container_width=True, on_select="rerun")
-    except TypeError:
-        return st.plotly_chart(fig, use_container_width=True)
-
-
-def apply_sidebar_filters(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply sidebar filters for period under review and job state."""
-    st.sidebar.header("Filters")
-
-    df_filtered = df.copy()
-
-    if "work_date" in df_filtered.columns and df_filtered["work_date"].notna().any():
-        work_dates = pd.to_datetime(df_filtered["work_date"], errors="coerce")
-        min_date = work_dates.min().date()
-        max_date = work_dates.max().date()
-
-        start_date, end_date = st.sidebar.date_input(
-            "Period under review",
-            value=(min_date, max_date),
-            min_value=min_date,
-            max_value=max_date,
-            key="exec_period_review",
-        )
-
-        df_filtered = df_filtered[
-            (work_dates.dt.date >= start_date) & (work_dates.dt.date <= end_date)
-        ].copy()
-    else:
-        st.sidebar.caption("No work_date column available for period filtering.")
-
-    st.sidebar.divider()
-
-    if "department_final" in df_filtered.columns:
-        departments = ["All"] + sorted(df_filtered["department_final"].dropna().unique().tolist())
-        selected_dept = st.sidebar.selectbox(
-            "Department",
-            options=departments,
-            index=0,
-            key="exec_department",
-        )
-        if selected_dept != "All":
-            df_filtered = df_filtered[df_filtered["department_final"] == selected_dept].copy()
-    else:
-        st.sidebar.caption("No department column available for filtering.")
-
-    st.sidebar.divider()
-
-    job_state = st.sidebar.selectbox(
-        "Job status",
-        options=["All", "Active", "Completed"],
-        index=0,
-        key="exec_job_state",
-    )
-
-    if job_state != "All":
-        df_filtered = filter_jobs_by_state(df_filtered, job_state)
-
-    return df_filtered
+# =============================================================================
+# MAIN
+# =============================================================================
 
 
 def main():
-    st.title("📊 Executive Summary: Margin & Delivery Diagnosis")
+    st.set_page_config(
+        page_title="Executive Summary | Root Cause Engine",
+        page_icon="📊",
+        layout="wide",
+    )
+
+    st.title("📊 Executive Summary: Causal Root-Cause Engine")
+
+    init_drill_state()
 
     df = load_data()
-    df = apply_sidebar_filters(df)
-
     job_df = compute_job_metrics(df)
     portfolio_metrics = compute_portfolio_metrics(job_df)
 
-    render_kpi_strip(portfolio_metrics)
-
+    render_breadcrumb()
     st.divider()
 
-    st.header("Act 1: The Headline & The Contradiction")
-    st.markdown(
-        """
-**What this does**
-- Reconciles how portfolio **Realised Rate** can exceed **Quote Rate** even when many jobs overrun.
-- Decomposes the gap into under-run savings, overrun dilution, unquoted hours, and residual mix/pricing effects.
-
-**How each metric is calculated**
-- **Quote Rate (Base)** = Σ quoted amount ÷ Σ quoted hours (after job-task dedupe). This is the contracted $/hr.
-- **Realised Rate** = Σ revenue ÷ Σ actual hours. This is the earned $/hr after delivery.
-- **Under-run Jobs ↑** = hours saved on quoted jobs where actual < quoted.  
-  - **Hours saved** = Σ(quoted hours − actual hours) for under-run jobs  
-  - **Rate impact** = hours saved × quote rate ÷ total actual hours
-- **Overrun Jobs ↓** = hours added on quoted jobs where actual > quoted.  
-  - **Excess hours** = Σ(actual hours − quoted hours) for overrun jobs  
-  - **Rate impact** = −excess hours × quote rate ÷ total actual hours
-- **Unquoted Hours ↓** = hours logged on unquoted or unmatched tasks.  
-  - **Unquoted hours** = Σ actual hours where `quote_match_flag` ≠ `matched`  
-  - **Rate impact** = −unquoted hours × quote rate ÷ total actual hours
-- **Mix/Pricing Effect** = residual difference after the above components.  
-  - Captures pricing uplift, client mix, task mix, or allocation effects not explained by hours.
-
-**Interpretation tips**
-- If **Realised Rate > Quote Rate** but **Overrun Jobs ↓** is large, the portfolio is being “saved” by under-runs or mix/pricing effects.
-- A large **Unquoted Hours ↓** suggests scope creep or quoting gaps.
-"""
-    )
+    # ========================================
+    # ACT 1: PORTFOLIO
+    # ========================================
+    st.header("Act 1: Portfolio Headline")
+    render_kpi_strip(portfolio_metrics)
 
     col1, col2 = st.columns([2, 1])
     with col1:
         bridge_df = compute_rate_bridge(job_df, portfolio_metrics)
         st.plotly_chart(render_rate_bridge(bridge_df), use_container_width=True)
-
     with col2:
         st.info(
             """
-        **Why does Realised Rate exceed Quote Rate despite overruns?**
+**The Contradiction Explained**
 
-        This is explained by **mix effects**:
-        - Under-run jobs "save" hours, boosting effective rate
-        - High-value jobs contribute disproportionately to revenue
-        - Revenue-weighted rate ≠ job-count weighted average
-        """
+Realised rate exceeds quote rate despite overruns because of **mix effects**.
+
+**Click a department below to trace the root cause.**
+"""
         )
 
     st.divider()
 
-    st.header("Act 2: Winners vs Losers Decomposition")
-    st.markdown(
-        """
-**What this does**
-- Classifies each job into a quadrant based on delivery (hours variance %) and pricing (rate variance).
-- Highlights “subsidisers” that lift the portfolio and “erosive” jobs that drag it down.
+    # ========================================
+    # ACT 2a: DEPARTMENT
+    # ========================================
+    if st.session_state.drill_path["department"] is None:
+        st.header("Act 2a: Department Diagnostic")
+        st.caption("Which department is driving the portfolio outcome?")
 
-**How each metric is calculated**
-- **Hours Variance %** = (actual hours − quoted hours) ÷ quoted hours × 100  
-  - Under-run = negative %, Overrun = positive %
-- **Rate Variance ($/hr)** = realised rate − quote rate  
-  - Positive = pricing captured above quote, Negative = leakage vs quote
-- **Bubble size** = absolute revenue for the job (bigger = higher stakes)
+        dept_df = compute_department_contribution(job_df, portfolio_metrics)
 
-**Quadrant meaning**
-- **Accretive / Subsidisers**: under-run + rate above quote → lifts portfolio
-- **Protected Overruns**: overrun + rate above quote → delivery slipped but pricing protected
-- **Under-run Leakage**: under-run + rate below quote → efficient delivery but pricing loss
-- **Margin Erosive**: overrun + rate below quote → compounding negative impact
+        col1, col2 = st.columns(2)
+        with col1:
+            st.plotly_chart(render_dept_contribution_bars(dept_df), use_container_width=True)
+        with col2:
+            st.plotly_chart(render_dept_efficiency_scatter(dept_df), use_container_width=True)
 
-**Interpretation tips**
-- Use bubble size to prioritize: a large bubble in the erosive quadrant is an immediate risk.
-- Jobs near zero on both axes are stable and low variance.
-"""
-    )
+        render_department_selector(dept_df)
+        return
 
-    col1, col2 = st.columns(2)
+    # ========================================
+    # ACT 2b: CATEGORY
+    # ========================================
+    if st.session_state.drill_path["category"] is None:
+        st.header(f"Act 2b: Category Diagnostic — {st.session_state.drill_path['department']}")
+        st.caption("Is this a category problem or a job-level problem?")
+
+        cat_df = compute_category_contribution(job_df, st.session_state.drill_path["department"])
+
+        if cat_df.empty:
+            st.warning("No category data available for this department")
+        else:
+            col1, col2 = st.columns(2)
+            with col1:
+                st.plotly_chart(render_category_contribution_bars(cat_df), use_container_width=True)
+            with col2:
+                st.plotly_chart(render_category_efficiency_scatter(cat_df), use_container_width=True)
+
+            render_category_selector(cat_df)
+        return
+
+    # ========================================
+    # ACT 2c: JOB QUADRANT
+    # ========================================
+    if st.session_state.drill_path["job"] is None:
+        dept = st.session_state.drill_path["department"]
+        cat = st.session_state.drill_path["category"]
+
+        st.header(f"Act 2c: Job Quadrant — {cat or '(Uncategorised)'}")
+        st.caption("Which jobs are Subsidisers and which are Erosive?")
+
+        filtered_jobs = job_df[
+            (job_df["department_final"] == dept)
+            & ((job_df["job_category"] == cat) | (job_df["job_category"].isna() & (cat is None)))
+        ].copy()
+
+        impact_mode = st.radio(
+            "Size bubbles by:",
+            options=["Revenue Exposure", "Rate Impact", "Margin Impact"],
+            horizontal=True,
+        )
+
+        st.plotly_chart(render_job_quadrant_scatter(filtered_jobs, impact_mode), use_container_width=True)
+        render_job_selector(filtered_jobs)
+        return
+
+    # ========================================
+    # ACT 3: JOB → TASK → FTE
+    # ========================================
+    job_no = st.session_state.drill_path["job"]
+
+    st.header(f"Act 3: Root Cause — Job {job_no}")
+    render_job_diagnostic_card(df, job_no)
+
+    st.divider()
+
+    st.subheader("Task Contribution Waterfall")
+    task_df = compute_task_waterfall(df, job_no)
+    quoted_hours = task_df["quoted_hours"].sum()
+
+    col1, col2 = st.columns([3, 2])
     with col1:
-        fig_scatter = render_quadrant_scatter(job_df)
-        plotly_chart_with_select(fig_scatter)
-
+        st.plotly_chart(render_task_waterfall(task_df, quoted_hours), use_container_width=True)
     with col2:
-        fig_dist, _ = render_overrun_distribution(job_df)
-        st.plotly_chart(fig_dist, use_container_width=True)
+        render_task_table(task_df)
 
     st.divider()
 
-    st.header("Act 3: Operational Intelligence")
-    st.markdown(
-        """
-**What this does**
-- Ranks departments on rate capture and overrun impact.
-- Surfaces an intervention queue of the riskiest jobs with reason codes and recommended actions.
-
-**Department scoreboard calculations**
-- **Department Quote Rate** = Σ quoted amount ÷ Σ quoted hours (weighted)
-- **Department Realised Rate** = Σ revenue ÷ Σ actual hours (weighted)
-- **Rate Variance** = realised rate − quote rate
-- **% Overrun Jobs** = count of jobs with actual > quoted ÷ total jobs
-- **Hours Variance** = Σ(actual hours − quoted hours)
-- **Margin Impact Est.** = hours variance × blended cost rate (overrun → negative impact)
-
-**Intervention queue calculations**
-- **Hours Overrun %** = job-level hours variance ÷ quoted hours
-- **Rate Leakage %** = (quote rate − realised rate) ÷ quote rate
-- **Risk Score** = 0.30×overrun + 0.25×revenue exposure + 0.25×rate leakage + 0.20×runtime risk
-- **Reason Codes** flag why the job is risky (severe overrun, rate leakage, scope creep, negative margin, high exposure)
-
-**Interpretation tips**
-- Sort by **Risk Score** to prioritize the next intervention call.
-- A high **Rate Leakage %** with low overrun suggests pricing/discounting issues, not delivery.
-"""
+    task_selection = st.selectbox(
+        "View staff for:",
+        options=["All Tasks"] + task_df["task_name"].tolist(),
     )
 
-    tab1, tab2 = st.tabs(["Department Scoreboard", "Intervention Queue"])
-
-    with tab1:
-        dept_df = compute_department_scoreboard(job_df)
-        if dept_df.empty:
-            st.info("No department data available.")
-        else:
-            st.dataframe(
-                dept_df.style.format({
-                    "Quote Rate": "${:,.0f}",
-                    "Realised Rate": "${:,.0f}",
-                    "Rate Variance": "${:+,.0f}",
-                    "% Overrun": "{:.0f}%",
-                    "Hours Variance": "{:,.0f}",
-                    "Margin Impact Est.": "${:,.0f}",
-                }).background_gradient(subset=["Rate Variance"], cmap="RdYlGn"),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-    with tab2:
-        queue_df = compute_intervention_queue(job_df, top_n=15)
-        if queue_df.empty:
-            st.info("No quoted jobs available for intervention queue.")
-        else:
-            st.dataframe(
-                queue_df.style.format({
-                    "Revenue": "${:,.0f}",
-                    "Hours Overrun %": "{:.0f}%",
-                    "Rate Leakage %": "{:.1%}",
-                    "Risk Score": "{:.0f}",
-                }).background_gradient(subset=["Risk Score"], cmap="Reds"),
-                use_container_width=True,
-                hide_index=True,
-            )
+    selected_task = None if task_selection == "All Tasks" else task_selection
+    render_fte_attribution(df, job_no, selected_task)
 
     st.divider()
-
-    st.header("🔎 Job Drill-Down")
-
-    job_options = job_df["job_no"].dropna().tolist()
-    selected_job = st.selectbox("Select a job to drill into:", options=[""] + job_options)
-
-    if selected_job:
-        render_drill_down_panel(df, selected_job)
-
-    st.divider()
-
     render_reconciliation_panel(df, job_df, portfolio_metrics)
 
 
