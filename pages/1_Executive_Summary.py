@@ -1765,21 +1765,71 @@ def compute_task_waterfall(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
 
 
 def render_task_waterfall(task_df: pd.DataFrame, quoted_hours_total: float):
+    """
+    Render task waterfall with top contributors and an 'Other tasks' bucket.
+    This avoids visually confusing jumps when many small tasks are included.
+    """
+    if task_df.empty:
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No task variance available",
+            x=0.5,
+            y=0.5,
+            showarrow=False,
+            xref="paper",
+            yref="paper",
+        )
+        fig.update_layout(title="Task Contribution to Hours Variance", height=400)
+        return fig
+
+    task_df = task_df.copy()
+    task_df = task_df[task_df["hours_variance"].notna()]
+    task_df["abs_variance"] = task_df["hours_variance"].abs()
+
+    max_tasks = 12
+    if len(task_df) > max_tasks:
+        display_df = task_df.nlargest(max_tasks, "abs_variance").copy()
+        other_variance = task_df["hours_variance"].sum() - display_df["hours_variance"].sum()
+        if abs(other_variance) > 0.01:
+            display_df = pd.concat(
+                [
+                    display_df,
+                    pd.DataFrame(
+                        [{
+                            "task_name": "Other tasks",
+                            "hours_variance": other_variance,
+                            "abs_variance": abs(other_variance),
+                        }]
+                    ),
+                ],
+                ignore_index=True,
+            )
+    else:
+        display_df = task_df.copy()
+
+    display_df = display_df.sort_values("hours_variance", ascending=False)
+
     waterfall_data = [{"task": "Quoted Hours", "value": quoted_hours_total, "type": "absolute"}]
 
-    for _, row in task_df.iterrows():
+    for _, row in display_df.iterrows():
         if row["hours_variance"] != 0:
-            waterfall_data.append({
-                "task": row["task_name"][:25],
-                "value": row["hours_variance"],
-                "type": "relative",
-            })
+            task_label = row["task_name"] if row["task_name"] == "Other tasks" else row["task_name"][:25]
+            waterfall_data.append(
+                {
+                    "task": task_label,
+                    "value": row["hours_variance"],
+                    "type": "relative",
+                }
+            )
 
-    waterfall_data.append({
-        "task": "Actual Hours",
-        "value": quoted_hours_total + task_df["hours_variance"].sum(),
-        "type": "total",
-    })
+    total_variance = task_df["hours_variance"].sum()
+    waterfall_data.append(
+        {
+            "task": "Actual Hours",
+            "value": quoted_hours_total + total_variance,
+            "type": "total",
+        }
+    )
 
     wf_df = pd.DataFrame(waterfall_data)
 
@@ -1807,6 +1857,7 @@ def render_task_waterfall(task_df: pd.DataFrame, quoted_hours_total: float):
         yaxis_title="Hours",
         showlegend=False,
         height=400,
+        xaxis_tickangle=-30,
     )
 
     return fig

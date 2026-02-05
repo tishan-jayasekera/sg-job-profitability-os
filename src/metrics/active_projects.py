@@ -212,3 +212,20 @@ def compute_active_jobs_trend(df: pd.DataFrame,
         })
     
     return pd.DataFrame(trend_data)
+
+
+def get_delivery_control_view(df: pd.DataFrame,
+                              recency_days: Optional[int] = None,
+                              department: Optional[str] = None,
+                              category: Optional[str] = None) -> pd.DataFrame:
+    """
+    Get delivery control view with centralized risk metrics and forecasts.
+    """
+    from src.metrics.delivery_control import compute_delivery_control_view
+
+    return compute_delivery_control_view(
+        df,
+        recency_days=recency_days or config.active_job_recency_days,
+        department=department,
+        category=category,
+    )

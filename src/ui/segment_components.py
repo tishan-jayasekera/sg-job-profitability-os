@@ -174,6 +174,18 @@ def render_task_mix_divergence(task_mix: pd.DataFrame, segment: str):
     Render task mix divergence chart.
     """
     st.subheader("📋 Task Mix vs Benchmark — What's Different?")
+    benchmark_dept = st.session_state.get("drill_path", {}).get("department")
+    benchmark_cat = st.session_state.get("drill_path", {}).get("category")
+    if benchmark_dept or benchmark_cat:
+        scope_parts = []
+        if benchmark_dept:
+            scope_parts.append(f"Dept: {benchmark_dept}")
+        if benchmark_cat:
+            scope_parts.append(f"Category: {benchmark_cat}")
+        scope_str = " • ".join(scope_parts)
+        st.caption(f"Benchmark = all other jobs in the current scope ({scope_str}), excluding this segment.")
+    else:
+        st.caption("Benchmark = all other jobs in the portfolio, excluding this segment.")
 
     if len(task_mix) == 0:
         st.info("No task data available")

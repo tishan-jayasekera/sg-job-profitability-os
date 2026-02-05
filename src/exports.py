@@ -162,6 +162,76 @@ def export_at_risk_jobs_csv(jobs_df: pd.DataFrame) -> tuple:
     return csv_bytes, filename
 
 
+def export_risk_queue_csv(risk_df: pd.DataFrame,
+                          filename: Optional[str] = None) -> tuple:
+    """
+    Export delivery control risk queue to CSV.
+    """
+    if filename is None:
+        filename = f"risk_queue_{datetime.now().strftime('%Y%m%d')}.csv"
+
+    csv_bytes = risk_df.to_csv(index=False).encode("utf-8")
+
+    return csv_bytes, filename
+
+
+def export_interventions_csv(interventions: list,
+                             job_no: Optional[str] = None,
+                             filename: Optional[str] = None) -> tuple:
+    """
+    Export interventions list to CSV.
+    """
+    df = pd.DataFrame(interventions)
+
+    if filename is None:
+        suffix = f"_{job_no}" if job_no else ""
+        filename = f"interventions{suffix}_{datetime.now().strftime('%Y%m%d')}.csv"
+
+    csv_bytes = df.to_csv(index=False).encode("utf-8")
+
+    return csv_bytes, filename
+
+
+def export_job_pack_excel(job_summary: pd.DataFrame,
+                          tasks: pd.DataFrame,
+                          staff: pd.DataFrame,
+                          job_no: Optional[str] = None,
+                          filename: Optional[str] = None) -> tuple:
+    """
+    Export job pack (summary, tasks, staff) to Excel.
+    """
+    if filename is None:
+        suffix = f"_{job_no}" if job_no else ""
+        filename = f"job_pack{suffix}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+
+    if isinstance(job_summary, pd.Series):
+        job_summary = pd.DataFrame([job_summary])
+
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        if job_summary is not None and len(job_summary) > 0:
+            job_summary.to_excel(writer, sheet_name="job_summary", index=False)
+        if tasks is not None and len(tasks) > 0:
+            tasks.to_excel(writer, sheet_name="tasks", index=False)
+        if staff is not None and len(staff) > 0:
+            staff.to_excel(writer, sheet_name="staff", index=False)
+
+    return buffer.getvalue(), filename
+
+
+def export_plan_markdown(plan_md: str,
+                         job_no: Optional[str] = None,
+                         filename: Optional[str] = None) -> tuple:
+    """
+    Export next-7-days plan markdown.
+    """
+    if filename is None:
+        suffix = f"_{job_no}" if job_no else ""
+        filename = f"plan{suffix}_{datetime.now().strftime('%Y%m%d')}.md"
+
+    return plan_md.encode("utf-8"), filename
+
+
 def format_export_filename(base_name: str, extension: str = "csv",
                            include_timestamp: bool = True) -> str:
     """Generate formatted export filename."""
