@@ -232,6 +232,62 @@ def export_plan_markdown(plan_md: str,
     return plan_md.encode("utf-8"), filename
 
 
+def export_action_brief(job_no: str,
+                        row: Dict[str, Any] | pd.Series,
+                        drivers: list,
+                        filename: Optional[str] = None) -> tuple:
+    """
+    Generate and export a simple action brief (markdown format).
+    """
+    job_name = row.get("job_name", job_no)
+    risk_band = row.get("risk_band", "Unknown")
+
+    lines = [
+        f"# Action Brief: {job_no}",
+        f"**{job_name}**",
+        f"Status: {risk_band}",
+        "",
+        "## Key Metrics",
+        (
+            f"- Hours: {row.get('actual_hours', 0):.0f} / {row.get('quoted_hours', 0):.0f} quoted "
+            f"({row.get('hours_variance_pct', 0):+.0f}%)"
+        ),
+        (
+            f"- Margin: {row.get('forecast_margin_pct', 0):.0f}% "
+            f"(benchmark: {row.get('median_margin_pct', 0):.0f}%)"
+        ),
+        "",
+        "## Risk Drivers",
+    ]
+
+    if drivers:
+        for i, driver in enumerate(drivers[:3], 1):
+            lines.append(f"{i}. **{driver['driver_name']}**: {driver['evidence_value']}")
+    else:
+        lines.append("1. Monitor")
+
+    lines.extend([
+        "",
+        "## Recommended Actions",
+    ])
+
+    if drivers:
+        for driver in drivers[:3]:
+            lines.append(f"- [ ] {driver['recommendation']}")
+    else:
+        lines.append("- [ ] Review job status with PM")
+
+    lines.extend([
+        "",
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+    ])
+
+    if filename is None:
+        filename = f"action_brief_{job_no}_{datetime.now().strftime('%Y%m%d')}.md"
+
+    return "\n".join(lines).encode("utf-8"), filename
+
+
 def format_export_filename(base_name: str, extension: str = "csv",
                            include_timestamp: bool = True) -> str:
     """Generate formatted export filename."""

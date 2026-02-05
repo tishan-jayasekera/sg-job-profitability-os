@@ -78,7 +78,10 @@ def compute_scope_creep(df: pd.DataFrame,
     - total_hours, unquoted_hours
     - unquoted_share (%)
     """
-    if "quote_match_flag" not in df.columns:
+    has_quote_flag = "quote_match_flag" in df.columns
+    has_quote_hours = "quoted_time_total" in df.columns or "quoted_amount_total" in df.columns
+
+    if not has_quote_flag and not has_quote_hours:
         if group_keys:
             result = df.groupby(group_keys).agg(
                 total_hours=("hours_raw", "sum")
@@ -88,9 +91,17 @@ def compute_scope_creep(df: pd.DataFrame,
         result["unquoted_hours"] = 0
         result["unquoted_share"] = 0
         return result
-    
+
     df = df.copy()
-    df["is_unquoted"] = df["quote_match_flag"] != "matched"
+    unquoted = pd.Series(False, index=df.index)
+    if has_quote_flag:
+        unquoted |= df["quote_match_flag"].astype(str).str.lower().ne("matched")
+    if "quoted_time_total" in df.columns:
+        unquoted |= df["quoted_time_total"].fillna(0) <= 0
+    if "quoted_amount_total" in df.columns:
+        unquoted |= df["quoted_amount_total"].fillna(0) <= 0
+
+    df["is_unquoted"] = unquoted
     df["unquoted_hours"] = np.where(df["is_unquoted"], df["hours_raw"], 0)
     
     if group_keys:

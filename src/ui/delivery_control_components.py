@@ -1,792 +1,566 @@
 """
-UI Components for the Delivery Control Tower.
+UI Components for the Active Delivery Command Center.
 """
 from __future__ import annotations
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional
 from datetime import datetime
+from typing import Dict, List, Optional
 
-import plotly.express as px
+import numpy as np
+import pandas as pd
+import streamlit as st
 import plotly.graph_objects as go
 
-from src.ui.formatting import format_job_label
-from src.data.job_lifecycle import get_job_task_attribution, get_job_staff_attribution
-from src.exports import (
-    export_job_pack_excel,
-    export_interventions_csv,
-    export_plan_markdown,
-    export_risk_queue_csv,
-)
+from src.config import config
+from src.data.job_lifecycle import get_job_task_attribution
+from src.data.semantic import get_category_col, safe_quote_job_task
+from src.exports import export_action_brief
+from src.metrics.delivery_control import compute_root_cause_drivers
 
 
-def render_portfolio_kpi_strip(jobs_df: pd.DataFrame) -> None:
+RISK_COLORS = {
+    "Red": ("#dc3545", "#fff5f5"),
+    "Amber": ("#ffc107", "#fffbf0"),
+    "Green": ("#28a745", "#f0fff0"),
+}
+RISK_ICONS = {"Red": "🔴", "Amber": "🟡", "Green": "🟢"}
+
+
+def render_alert_strip(jobs_df: pd.DataFrame) -> None:
     """
-    Render 5-tile KPI strip for portfolio triage.
+    Render compact alert banner showing portfolio status.
+
+    Design: Two-cell layout
+    - Left cell: 🔴 CRITICAL count + $ at risk
+    - Right cell: 🟡 WATCH count
     """
-    st.subheader("Portfolio Health")
+    red_jobs = jobs_df[jobs_df["risk_band"] == "Red"]
+    amber_jobs = jobs_df[jobs_df["risk_band"] == "Amber"]
 
-    cols = st.columns(5)
+    margin_at_risk = _compute_margin_at_risk(red_jobs)
 
-    total_jobs = len(jobs_df)
-    red_jobs = len(jobs_df[jobs_df["risk_band"] == "Red"])
-    amber_jobs = len(jobs_df[jobs_df["risk_band"] == "Amber"])
-    green_jobs = len(jobs_df[jobs_df["risk_band"] == "Green"])
+    col1, col2 = st.columns(2)
 
-    at_risk = jobs_df[jobs_df["risk_band"].isin(["Red", "Amber"])].copy()
-    margin_shortfall = (
-        (at_risk["median_margin_pct"].fillna(0) - at_risk["forecast_margin_pct"].fillna(0))
-        / 100
-        * at_risk["forecast_revenue"].fillna(0)
-    ).clip(lower=0).sum()
+    with col1:
+        if len(red_jobs) > 0:
+            st.error(
+                f"🔴 **CRITICAL:** {len(red_jobs)} jobs, ${margin_at_risk:,.0f} margin at risk"
+            )
+        else:
+            st.success("🟢 No critical jobs")
 
-    eac_hours = jobs_df["actual_hours"] + jobs_df["remaining_hours"].fillna(0)
-    hours_overrun = (eac_hours - jobs_df["quoted_hours"]).clip(lower=0).sum()
-
-    with cols[0]:
-        st.metric(
-            "Active Jobs",
-            f"{total_jobs}",
-            help="Jobs with activity in last 28 days, not completed",
-        )
-
-    with cols[1]:
-        st.metric(
-            "Risk Distribution",
-            f"🔴{red_jobs} 🟡{amber_jobs} 🟢{green_jobs}",
-            help="Red: score≥70, Amber: 50-70, Green: <50",
-        )
-
-    with cols[2]:
-        st.metric(
-            "Margin at Risk",
-            f"${margin_shortfall:,.0f}",
-            help="Shortfall vs benchmark margin (Red+Amber jobs)",
-        )
-
-    with cols[3]:
-        st.metric(
-            "Forecast Overrun",
-            f"{hours_overrun:,.0f} hrs",
-            help="EAC hours - Quoted hours (positive = overrun)",
-        )
-
-    with cols[4]:
-        avg_risk = jobs_df["risk_score"].mean()
-        st.metric(
-            "Avg Risk Score",
-            f"{avg_risk:.0f}/100",
-            help="Portfolio average risk score",
-        )
+    with col2:
+        if len(amber_jobs) > 0:
+            st.warning(f"🟡 **WATCH:** {len(amber_jobs)} jobs need attention")
+        else:
+            st.info("No jobs on watch list")
 
 
-def render_portfolio_risk_table(
+def render_job_queue(
     jobs_df: pd.DataFrame,
     job_name_lookup: Dict[str, str],
+    include_green: bool = False,
 ) -> Optional[str]:
     """
-    Render sortable/filterable risk table with row selection.
+    Render compact job queue as selectable cards.
+
     Returns selected job_no.
     """
-    st.subheader("Risk Queue")
-
-    filter_cols = st.columns([1, 1, 1, 1, 2])
-
-    with filter_cols[0]:
-        band_filter = st.multiselect(
-            "Risk Band",
-            ["Red", "Amber", "Green"],
-            default=["Red", "Amber"],
-            key="triage_band_filter",
-        )
-
-    with filter_cols[1]:
-        dept_options = ["All"] + sorted(jobs_df["department_final"].dropna().unique().tolist())
-        dept_filter = st.selectbox("Department", dept_options, key="triage_dept_filter")
-
-    with filter_cols[2]:
-        cat_options = ["All"] + sorted(jobs_df["job_category"].dropna().unique().tolist())
-        cat_filter = st.selectbox("Category", cat_options, key="triage_cat_filter")
-
-    with filter_cols[3]:
-        driver_options = ["All"] + sorted(jobs_df["primary_driver"].dropna().unique().tolist())
-        driver_filter = st.selectbox("Primary Driver", driver_options, key="triage_driver_filter")
-
-    with filter_cols[4]:
-        sort_by = st.selectbox(
-            "Sort By",
-            ["Risk Score ↓", "Margin Shortfall ↓", "Hours Overrun ↓", "Quote Consumed ↓"],
-            key="triage_sort",
-        )
-
-    display_df = jobs_df.copy()
-    if band_filter:
-        display_df = display_df[display_df["risk_band"].isin(band_filter)]
-    if dept_filter != "All":
-        display_df = display_df[display_df["department_final"] == dept_filter]
-    if cat_filter != "All":
-        display_df = display_df[display_df["job_category"] == cat_filter]
-    if driver_filter != "All":
-        display_df = display_df[display_df["primary_driver"] == driver_filter]
-
-    display_df["pct_consumed"] = display_df.get(
-        "pct_consumed", display_df.get("pct_quote_consumed")
-    )
-
-    display_df["margin_shortfall"] = (
-        (display_df["median_margin_pct"].fillna(0) - display_df["forecast_margin_pct"].fillna(0))
-        / 100
-        * display_df["forecast_revenue"].fillna(0)
-    ).clip(lower=0)
-
-    display_df["hours_overrun"] = (
-        display_df["actual_hours"] + display_df["remaining_hours"].fillna(0) - display_df["quoted_hours"]
-    ).clip(lower=0)
-
-    sort_map = {
-        "Risk Score ↓": ("risk_score", False),
-        "Margin Shortfall ↓": ("margin_shortfall", False),
-        "Hours Overrun ↓": ("hours_overrun", False),
-        "Quote Consumed ↓": ("pct_consumed", False),
-    }
-    sort_col, sort_asc = sort_map.get(sort_by, ("risk_score", False))
-    if sort_col in display_df.columns:
-        display_df = display_df.sort_values(sort_col, ascending=sort_asc)
-
-    display_df["job_label"] = display_df["job_no"].apply(
-        lambda value: format_job_label(value, job_name_lookup)
-    )
-
-    table_cols = [
-        "job_label",
-        "risk_band",
-        "risk_score",
-        "pct_consumed",
-        "quoted_hours",
-        "actual_hours",
-        "remaining_hours",
-        "hours_overrun",
-        "forecast_margin_pct",
-        "median_margin_pct",
-        "margin_shortfall",
-        "primary_driver",
-        "recommended_action",
-    ]
-    table_cols = [col for col in table_cols if col in display_df.columns]
-
-    selection = st.dataframe(
-        display_df[table_cols],
-        use_container_width=True,
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
-        column_config={
-            "job_label": st.column_config.TextColumn("Job", width="large"),
-            "risk_band": st.column_config.TextColumn("Band"),
-            "risk_score": st.column_config.NumberColumn("Risk", format="%.0f"),
-            "pct_consumed": st.column_config.NumberColumn("% Consumed", format="%.0f%%"),
-            "quoted_hours": st.column_config.NumberColumn("Quoted", format="%.0f"),
-            "actual_hours": st.column_config.NumberColumn("Actual", format="%.0f"),
-            "remaining_hours": st.column_config.NumberColumn("Remaining", format="%.0f"),
-            "hours_overrun": st.column_config.NumberColumn("Overrun", format="%.0f"),
-            "forecast_margin_pct": st.column_config.NumberColumn("Fcst Margin", format="%.1f%%"),
-            "median_margin_pct": st.column_config.NumberColumn("Bench Margin", format="%.1f%%"),
-            "margin_shortfall": st.column_config.NumberColumn("$ at Risk", format="$%.0f"),
-        },
-        key="risk_queue_table",
-    )
-
-    if selection and selection.selection and selection.selection.rows:
-        selected_idx = selection.selection.rows[0]
-        selected_job = display_df.iloc[selected_idx]["job_no"]
-        st.session_state.selected_job = selected_job
-        return selected_job
-
-    csv_bytes, filename = export_risk_queue_csv(display_df[table_cols])
-    st.download_button(
-        "📥 Export Risk Queue (CSV)",
-        data=csv_bytes,
-        file_name=filename,
-        mime="text/csv",
-    )
-
-    return None
-
-
-def render_risk_map(jobs_df: pd.DataFrame, job_name_lookup: Dict[str, str]) -> Optional[str]:
-    """
-    Render scatter plot for visual triage.
-    X: % quote consumed, Y: margin shortfall, Color: risk band
-    """
-    st.subheader("Risk Map")
-
-    plot_df = jobs_df.copy()
-    plot_df["pct_consumed"] = plot_df.get("pct_consumed", plot_df.get("pct_quote_consumed"))
-    plot_df["margin_shortfall"] = (
-        (plot_df["median_margin_pct"].fillna(0) - plot_df["forecast_margin_pct"].fillna(0))
-        / 100
-        * plot_df["forecast_revenue"].fillna(0)
-    ).clip(lower=0)
-    plot_df["job_label"] = plot_df["job_no"].apply(
-        lambda value: format_job_label(value, job_name_lookup)
-    )
-
-    color_map = {"Red": "#dc3545", "Amber": "#ffc107", "Green": "#28a745"}
-
-    fig = px.scatter(
-        plot_df,
-        x="pct_consumed",
-        y="margin_shortfall",
-        color="risk_band",
-        color_discrete_map=color_map,
-        size="actual_hours",
-        hover_name="job_label",
-        hover_data={
-            "risk_score": ":.0f",
-            "primary_driver": True,
-            "pct_consumed": ":.0f%%",
-            "margin_shortfall": ":$,.0f",
-        },
-        title="Jobs by Quote Consumption vs Margin Shortfall",
-    )
-
-    fig.add_vline(x=100, line_dash="dash", line_color="#999", annotation_text="100% consumed")
-    fig.add_hline(
-        y=plot_df["margin_shortfall"].median(),
-        line_dash="dot",
-        line_color="#999",
-    )
-
-    fig.update_layout(
-        xaxis_title="% Quote Consumed",
-        yaxis_title="Margin Shortfall ($)",
-        height=400,
-    )
-
-    st.plotly_chart(fig, use_container_width=True, key="risk_map")
-
-    return None
-
-
-def render_weekly_focus(jobs_df: pd.DataFrame, job_name_lookup: Dict[str, str]) -> None:
-    """
-    Auto-generate "This Week's Focus" with top priorities.
-    """
-    st.subheader("📌 This Week's Focus")
-
-    at_risk = jobs_df[jobs_df["risk_band"].isin(["Red", "Amber"])].copy()
-
-    if len(at_risk) == 0:
-        st.success("✅ No high-risk jobs requiring immediate attention")
-        return
-
-    at_risk["margin_shortfall"] = (
-        (at_risk["median_margin_pct"].fillna(0) - at_risk["forecast_margin_pct"].fillna(0))
-        / 100
-        * at_risk["forecast_revenue"].fillna(0)
-    ).clip(lower=0)
-    at_risk["hours_overrun"] = (
-        at_risk["actual_hours"] + at_risk["remaining_hours"].fillna(0) - at_risk["quoted_hours"]
-    ).clip(lower=0)
-    at_risk["quick_win_score"] = at_risk["risk_score"] / at_risk["remaining_hours"].clip(lower=1)
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.markdown("**🔴 Top by Margin at Risk**")
-        top_margin = at_risk.nlargest(3, "margin_shortfall")
-        for _, row in top_margin.iterrows():
-            job_label = format_job_label(row["job_no"], job_name_lookup)
-            st.markdown(f"- **{job_label}** — ${row['margin_shortfall']:,.0f} at risk")
-            st.caption(f"  → {row.get('recommended_action', 'Review')}")
-
-    with col2:
-        st.markdown("**⏱️ Top by Hours Overrun**")
-        top_hours = at_risk.nlargest(3, "hours_overrun")
-        for _, row in top_hours.iterrows():
-            job_label = format_job_label(row["job_no"], job_name_lookup)
-            st.markdown(f"- **{job_label}** — {row['hours_overrun']:.0f} hrs over")
-            st.caption(f"  → {row.get('primary_driver', 'Review')}")
-
-    with col3:
-        st.markdown("**⚡ Quick Wins** (high risk, low remaining)")
-        quick_wins = at_risk[at_risk["remaining_hours"] < 20].nlargest(3, "quick_win_score")
-        for _, row in quick_wins.iterrows():
-            job_label = format_job_label(row["job_no"], job_name_lookup)
-            st.markdown(f"- **{job_label}** — {row['remaining_hours']:.0f} hrs left")
-            st.caption("  → Urgent close-out review")
-
-
-def render_job_health_card(job_row: pd.Series, job_name_lookup: Dict[str, str]) -> None:
-    """
-    Render single job health card with status summary.
-    """
-    job_label = format_job_label(job_row["job_no"], job_name_lookup)
-    risk_band = job_row.get("risk_band", "Unknown")
-    risk_score = job_row.get("risk_score", 0)
-
-    status_map = {"Red": "🔴 At Risk", "Amber": "🟡 Watch", "Green": "🟢 On Track"}
-    status = status_map.get(risk_band, "⚪ Unknown")
-
-    st.subheader(f"Job Health: {job_label}")
-    st.markdown(f"**Status:** {status} | **Risk Score:** {risk_score:.0f}/100")
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        pct_consumed = job_row.get("pct_consumed", 0)
-        st.metric("Quote Consumed", f"{pct_consumed:.0f}%")
-
-    with col2:
-        hours_var = job_row.get("actual_hours", 0) - job_row.get("quoted_hours", 0)
-        st.metric("Hours Variance", f"{hours_var:+,.0f}")
-
-    with col3:
-        scope_creep = job_row.get("scope_creep_pct", 0)
-        st.metric("Scope Creep", f"{scope_creep:.0f}%")
-
-    with col4:
-        rate_var = job_row.get("rate_variance", 0)
-        st.metric("Rate Variance", f"${rate_var:+.0f}/hr")
-
-    st.markdown("**Margin Forecast vs Benchmark**")
-    fcst = job_row.get("forecast_margin_pct", 0)
-    bench = job_row.get("median_margin_pct", 0)
-    delta = fcst - bench
-    progress = min(max(fcst / 100, 0), 1) if pd.notna(fcst) else 0
-    st.progress(progress)
-    st.caption(f"Forecast: {fcst:.1f}% | Benchmark: {bench:.1f}% | Delta: {delta:+.1f}pp")
-
-
-def render_root_cause_drivers(drivers: List[Dict]) -> None:
-    """
-    Render ranked root cause drivers.
-    """
-    st.subheader("🔍 Root Cause Drivers")
-
-    if not drivers:
-        st.success("✅ No significant risk drivers identified")
-        return
-
-    for i, driver in enumerate(drivers, 1):
-        with st.expander(f"#{i} {driver['driver_name']} — Score: {driver['score']:.0f}", expanded=(i == 1)):
-            col1, col2 = st.columns([1, 2])
-
-            with col1:
-                st.markdown(f"**Metric:** {driver['evidence_metric']}")
-                st.markdown(f"**Value:** {driver['evidence_value']}")
-                st.markdown(f"**Benchmark:** {driver['benchmark_value']}")
-
-            with col2:
-                st.markdown(f"**Evidence:** {driver['evidence_detail']}")
-                st.markdown(f"**Recommendation:** {driver['recommendation']}")
-
-
-def render_task_breakdown(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
-    """
-    Render task-level breakdown with chart.
-    Returns task DataFrame used for display.
-    """
-    st.subheader("📋 Task Breakdown")
-
-    task_df = get_job_task_attribution(df, job_no)
-
-    if len(task_df) == 0:
-        st.info("No task data available")
-        return task_df
-
-    task_df = task_df.sort_values("variance", ascending=False)
-    task_df["variance_pct"] = np.where(
-        task_df["quoted_hours"] > 0,
-        task_df["variance"] / task_df["quoted_hours"] * 100,
-        np.nan,
-    )
-
-    fig = go.Figure()
-
-    fig.add_trace(go.Bar(
-        name="Quoted",
-        y=task_df["task_name"],
-        x=task_df["quoted_hours"],
-        orientation="h",
-        marker_color="#6c757d",
-    ))
-
-    fig.add_trace(go.Bar(
-        name="Actual",
-        y=task_df["task_name"],
-        x=task_df["actual_hours"],
-        orientation="h",
-        marker_color=["#dc3545" if value > 0 else "#28a745" for value in task_df["variance"]],
-    ))
-
-    fig.update_layout(
-        barmode="group",
-        title="Quoted vs Actual Hours by Task",
-        xaxis_title="Hours",
-        yaxis_title="",
-        height=max(300, len(task_df) * 35),
-        legend=dict(orientation="h", y=1.1),
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.dataframe(
-        task_df[["task_name", "quoted_hours", "actual_hours", "variance", "variance_pct"]].rename(
-            columns={
-                "task_name": "Task",
-                "quoted_hours": "Quoted",
-                "actual_hours": "Actual",
-                "variance": "Variance",
-                "variance_pct": "Var %",
-            }
-        ),
-        column_config={
-            "Quoted": st.column_config.NumberColumn(format="%.0f"),
-            "Actual": st.column_config.NumberColumn(format="%.0f"),
-            "Variance": st.column_config.NumberColumn(format="%+.0f"),
-            "Var %": st.column_config.NumberColumn(format="%+.0f%%"),
-        },
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    return task_df
-
-
-def build_staff_attribution_df(
-    df: pd.DataFrame,
-    job_no: str,
-    all_jobs_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Build staff attribution with cross-job risk signals.
-    """
-    staff_df = get_job_staff_attribution(df, job_no)
-    if len(staff_df) == 0:
-        return staff_df
-
-    job_df = df[df["job_no"] == job_no].copy()
-    if "work_date" in job_df.columns:
-        cutoff = job_df["work_date"].max() - pd.Timedelta(days=28)
-        recent = job_df[job_df["work_date"] >= cutoff]
-        recent_staff = recent.groupby("staff_name")["hours_raw"].sum().reset_index()
-        recent_staff.columns = ["staff_name", "hours_last_28d"]
-        staff_df = staff_df.merge(recent_staff, on="staff_name", how="left")
+    if include_green:
+        display_df = jobs_df
     else:
-        staff_df["hours_last_28d"] = staff_df["hours"]
+        display_df = jobs_df[jobs_df["risk_band"].isin(["Red", "Amber"])]
 
-    total_hours = staff_df["hours"].sum()
-    staff_df["share_pct"] = staff_df["hours"] / total_hours * 100 if total_hours > 0 else 0
-
-    if "risk_band" in all_jobs_df.columns:
-        red_jobs = all_jobs_df[all_jobs_df["risk_band"] == "Red"]["job_no"].tolist()
-        red_jobs = [job for job in red_jobs if job != job_no]
-
-        if red_jobs:
-            red_df = df[df["job_no"].isin(red_jobs)]
-            red_staff = red_df.groupby("staff_name")["hours_raw"].sum().reset_index()
-            red_staff.columns = ["staff_name", "hours_on_other_red"]
-            staff_df = staff_df.merge(red_staff, on="staff_name", how="left")
-            staff_df["hours_on_other_red"] = staff_df["hours_on_other_red"].fillna(0)
-        else:
-            staff_df["hours_on_other_red"] = 0
-    else:
-        staff_df["hours_on_other_red"] = 0
-
-    return staff_df
-
-
-def render_staff_attribution(
-    df: pd.DataFrame,
-    job_no: str,
-    all_jobs_df: pd.DataFrame,
-) -> pd.DataFrame:
-    """
-    Render staff attribution with cross-job risk check.
-    Returns staff DataFrame used for display.
-    """
-    st.subheader("👥 Staff Attribution")
-
-    staff_df = build_staff_attribution_df(df, job_no, all_jobs_df)
-
-    if len(staff_df) == 0:
-        st.info("No staff data available")
-        return staff_df
-
-    st.dataframe(
-        staff_df[["staff_name", "hours", "hours_last_28d", "share_pct", "hours_on_other_red"]].rename(
-            columns={
-                "staff_name": "Staff",
-                "hours": "Total Hours",
-                "hours_last_28d": "Last 28d",
-                "share_pct": "Share %",
-                "hours_on_other_red": "Hrs on Other Red Jobs",
-            }
-        ),
-        column_config={
-            "Total Hours": st.column_config.NumberColumn(format="%.0f"),
-            "Last 28d": st.column_config.NumberColumn(format="%.0f"),
-            "Share %": st.column_config.NumberColumn(format="%.0f%%"),
-            "Hrs on Other Red Jobs": st.column_config.NumberColumn(format="%.0f"),
-        },
-        use_container_width=True,
-        hide_index=True,
+    sort_option = st.selectbox(
+        "Sort by",
+        ["Risk Score", "Margin at Risk", "Hours Overrun", "Recent Activity"],
+        key="job_queue_sort",
+        label_visibility="collapsed",
     )
+    display_df = _apply_sort(display_df, sort_option)
 
-    overloaded = staff_df[staff_df["hours_on_other_red"] > 20]
-    if len(overloaded) > 0:
-        st.warning(
-            f"⚠️ {len(overloaded)} staff members are also on other Red jobs — potential resource contention"
+    if "job_queue_limit" not in st.session_state:
+        st.session_state.job_queue_limit = 10
+
+    display_df = display_df.head(st.session_state.job_queue_limit)
+
+    selected_job = None
+
+    for _, row in display_df.iterrows():
+        job_no = row["job_no"]
+        job_name = job_name_lookup.get(job_no, job_no)
+        risk_band = row.get("risk_band", "Green")
+        icon = RISK_ICONS.get(risk_band, "⚪")
+
+        issue = _format_primary_issue(row)
+        action = row.get("recommended_action", "Review job status")
+
+        label = (
+            f"{icon} {job_no}\n"
+            f"{job_name[:35]}\n\n"
+            f"{issue}\n"
+            f"→ {action[:45]}"
         )
 
-    return staff_df
+        if st.button(label, key=f"job_card_{job_no}", use_container_width=True):
+            selected_job = job_no
+            st.session_state.selected_job = job_no
+
+    remaining = len(jobs_df) - st.session_state.job_queue_limit
+    if remaining > 0:
+        if st.button(f"Show {min(10, remaining)} more", key="job_queue_more"):
+            st.session_state.job_queue_limit += 10
+
+    st.checkbox("Include Green jobs", key="include_green_jobs")
+
+    return selected_job or st.session_state.get("selected_job")
 
 
-def render_intervention_builder(job_no: str, drivers: List[Dict]) -> List[Dict]:
-    """
-    Render intervention builder form.
-    Returns list of intervention dicts.
-    """
-    st.subheader("🛠️ Intervention Builder")
-
-    if "interventions" not in st.session_state:
-        st.session_state.interventions = {}
-    if job_no not in st.session_state.interventions:
-        st.session_state.interventions[job_no] = []
-
-    if st.button("🔄 Auto-Generate from Drivers", key="auto_gen_interventions"):
-        auto_interventions = []
-        for driver in drivers:
-            auto_interventions.append({
-                "job_no": job_no,
-                "intervention_type": _map_driver_to_type(driver["driver_name"]),
-                "target": driver["driver_name"],
-                "description": driver["recommendation"],
-                "expected_impact": f"Address {driver['evidence_metric']}",
-                "owner": "",
-                "due_date": None,
-                "status": "Proposed",
-            })
-        st.session_state.interventions[job_no] = auto_interventions
-        st.rerun()
-
-    with st.expander("➕ Add Intervention Manually", expanded=False):
-        col1, col2 = st.columns(2)
-
-        with col1:
-            int_type = st.selectbox(
-                "Type",
-                ["Re-scope", "Re-assign", "Rate Correction", "Timeline", "Other"],
-                key="new_int_type",
-            )
-            target = st.text_input("Target (task/staff/scope)", key="new_int_target")
-            description = st.text_area("Description", key="new_int_desc")
-
-        with col2:
-            expected_impact = st.text_input("Expected Impact", key="new_int_impact")
-            owner = st.text_input("Owner", key="new_int_owner")
-            due_date = st.date_input("Due Date", key="new_int_due")
-
-        if st.button("Add Intervention", key="add_int_btn"):
-            new_int = {
-                "job_no": job_no,
-                "intervention_type": int_type,
-                "target": target,
-                "description": description,
-                "expected_impact": expected_impact,
-                "owner": owner,
-                "due_date": due_date,
-                "status": "Proposed",
-            }
-            st.session_state.interventions[job_no].append(new_int)
-            st.rerun()
-
-    interventions = st.session_state.interventions.get(job_no, [])
-
-    if interventions:
-        st.markdown(f"**{len(interventions)} Interventions Defined**")
-
-        for i, intv in enumerate(interventions):
-            with st.container():
-                col1, col2, col3, col4 = st.columns([2, 2, 1, 1])
-
-                with col1:
-                    st.markdown(f"**{intv['intervention_type']}:** {intv['target']}")
-                    st.caption(intv["description"])
-
-                with col2:
-                    st.markdown(f"**Impact:** {intv['expected_impact']}")
-                    st.caption(f"Owner: {intv['owner'] or 'TBD'}")
-
-                with col3:
-                    new_status = st.selectbox(
-                        "Status",
-                        ["Proposed", "Approved", "In Progress", "Done"],
-                        index=["Proposed", "Approved", "In Progress", "Done"].index(intv["status"]),
-                        key=f"int_status_{i}",
-                    )
-                    interventions[i]["status"] = new_status
-
-                with col4:
-                    if st.button("🗑️", key=f"del_int_{i}"):
-                        interventions.pop(i)
-                        st.session_state.interventions[job_no] = interventions
-                        st.rerun()
-
-    return interventions
-
-
-def _map_driver_to_type(driver_name: str) -> str:
-    """Map driver name to intervention type."""
-    mapping = {
-        "Scope Creep": "Re-scope",
-        "Under-Quoting": "Re-scope",
-        "Rate Leakage": "Rate Correction",
-        "Runtime Drift": "Timeline",
-    }
-    return mapping.get(driver_name, "Other")
-
-
-def render_next_7_days_plan(
+def render_selected_job_panel(
+    df: pd.DataFrame,
+    jobs_df: pd.DataFrame,
     job_no: str,
-    job_row: pd.Series,
-    drivers: List[Dict],
-    interventions: List[Dict],
-) -> str:
-    """
-    Generate and render "Next 7 Days Plan".
-    Returns markdown text for export.
-    """
-    st.subheader("📅 Next 7 Days Plan")
-
-    plan_items = []
-    plan_items.append({
-        "day": "Day 1",
-        "action": "Status review with PM",
-        "tied_to": "Standard",
-        "owner": "Delivery Lead",
-    })
-
-    for i, driver in enumerate(drivers[:3]):
-        plan_items.append({
-            "day": f"Day {2 + i}",
-            "action": driver["recommendation"],
-            "tied_to": driver["driver_name"],
-            "owner": "TBD",
-        })
-
-    proposed = [item for item in interventions if item["status"] == "Proposed"]
-    if proposed:
-        plan_items.append({
-            "day": "Day 5",
-            "action": f"Review {len(proposed)} proposed interventions with stakeholders",
-            "tied_to": "Intervention Review",
-            "owner": "Delivery Lead",
-        })
-
-    plan_items.append({
-        "day": "Day 6",
-        "action": "Update EAC forecast and margin projection",
-        "tied_to": "Forecasting",
-        "owner": "Finance",
-    })
-
-    plan_items.append({
-        "day": "Day 7",
-        "action": "Communicate status to client if needed",
-        "tied_to": "Client Management",
-        "owner": "Account Lead",
-    })
-
-    for item in plan_items:
-        st.checkbox(
-            f"**{item['day']}:** {item['action']} *(Owner: {item['owner']})*",
-            key=f"plan_{job_no}_{item['day']}",
-        )
-
-    md_lines = [
-        f"# Next 7 Days Plan: {job_no}",
-        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        "",
-        "## Checklist",
-    ]
-    for item in plan_items:
-        md_lines.append(
-            f"- [ ] **{item['day']}:** {item['action']} — Owner: {item['owner']}"
-        )
-
-    return "\n".join(md_lines)
-
-
-def render_export_section(
-    job_no: str,
-    job_row: pd.Series,
-    task_df: pd.DataFrame,
-    staff_df: pd.DataFrame,
-    drivers: List[Dict],
-    interventions: List[Dict],
-    plan_md: str,
+    job_name_lookup: Dict[str, str],
 ) -> None:
     """
-    Render export buttons and Slack-ready summary.
+    Render the selected job detail panel.
     """
-    st.subheader("📤 Export & Handoff")
+    job_row = jobs_df[jobs_df["job_no"] == job_no].iloc[0]
+    job_name = job_row.get("job_name") or job_name_lookup.get(job_no, job_no)
 
+    st.markdown(f"### {job_no} — {job_name}")
+
+    dept = job_row.get("department_final", "")
+    cat = job_row.get("job_category", "")
+    band = job_row.get("risk_band", "Green")
+    icon = {"Red": "🔴 Critical", "Amber": "🟡 Watch", "Green": "🟢 On Track"}.get(band, "⚪")
+    st.caption(f"{dept} • {cat} • {icon}")
+
+    _render_job_snapshot(job_row)
+
+    drivers = compute_root_cause_drivers(df, job_row)
+    _render_why_at_risk(drivers)
+    _render_recommended_actions(job_row, drivers)
+
+    with st.expander("▼ Expand Full Diagnosis", expanded=False):
+        _render_full_diagnosis(df, job_no, job_row)
+
+    with st.expander("Definitions", expanded=False):
+        _render_definitions()
+
+    brief_bytes, brief_name = export_action_brief(job_no, job_row, drivers)
+    st.download_button(
+        "📤 Export Action Brief",
+        data=brief_bytes,
+        file_name=brief_name,
+        mime="text/markdown",
+    )
+
+
+def _render_job_snapshot(row: pd.Series) -> None:
+    """Render compact snapshot box."""
+    quoted = row.get("quoted_hours", 0) or 0
+    actual = row.get("actual_hours", 0) or 0
+    variance_pct = (actual - quoted) / quoted * 100 if quoted > 0 else 0
+
+    margin = row.get("forecast_margin_pct", 0)
+    bench = row.get("median_margin_pct", 0)
+    delta = margin - bench if pd.notna(margin) and pd.notna(bench) else None
+
+    burn_current = row.get("burn_rate_per_day", np.nan)
+    burn_prev = row.get("burn_rate_prev_per_day", np.nan)
+    burn_weekly = burn_current * 7 if pd.notna(burn_current) else np.nan
+    burn_delta = None
+    if pd.notna(burn_current) and pd.notna(burn_prev):
+        burn_delta = (burn_current - burn_prev) * 7
+
+    st.markdown("**SNAPSHOT**")
     col1, col2, col3 = st.columns(3)
 
     with col1:
-        job_pack_bytes, job_pack_name = export_job_pack_excel(
-            pd.DataFrame([job_row]),
-            task_df if task_df is not None else pd.DataFrame(),
-            staff_df if staff_df is not None else pd.DataFrame(),
-            job_no=job_no,
-        )
-        st.download_button(
-            "📦 Export Job Pack (Excel)",
-            data=job_pack_bytes,
-            file_name=job_pack_name,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        st.metric(
+            "Hours",
+            f"{actual:.0f} / {quoted:.0f}",
+            f"{variance_pct:+.0f}%",
+            delta_color="inverse",
         )
 
     with col2:
-        if interventions:
-            int_bytes, int_name = export_interventions_csv(interventions, job_no=job_no)
-            st.download_button(
-                "📋 Export Interventions (CSV)",
-                data=int_bytes,
-                file_name=int_name,
-                mime="text/csv",
-            )
-        else:
-            st.button("📋 Export Interventions", disabled=True, help="No interventions defined")
-
-    with col3:
-        plan_bytes, plan_name = export_plan_markdown(plan_md, job_no=job_no)
-        st.download_button(
-            "📅 Export 7-Day Plan (MD)",
-            data=plan_bytes,
-            file_name=plan_name,
-            mime="text/markdown",
+        delta_label = f"{delta:+.0f}pp vs bench" if delta is not None else None
+        st.metric(
+            "Margin",
+            f"{margin:.0f}%",
+            delta_label,
+            delta_color="normal" if delta is not None and delta >= 0 else "inverse",
         )
 
-    st.markdown("**Slack-Ready Summary**")
+    with col3:
+        burn_label = f"{burn_weekly:.0f} hrs/wk" if pd.notna(burn_weekly) else "—"
+        burn_delta_label = f"{burn_delta:+.0f} hrs/wk" if burn_delta is not None else None
+        st.metric("Burn Rate", burn_label, burn_delta_label)
 
-    margin_shortfall = (
-        (job_row.get("median_margin_pct", 0) - job_row.get("forecast_margin_pct", 0))
-        / 100
-        * job_row.get("forecast_revenue", 0)
+    st.caption(
+        "Burn rate = average hours/day over the last 28 days, scaled to a weekly rate. "
+        "Delta compares the prior 28-day window."
     )
 
-    slack_summary = (
-        f"🚨 *Job Alert: {job_no}*\n"
-        f"• Risk Score: {job_row.get('risk_score', 0):.0f}/100 ({job_row.get('risk_band', 'Unknown')})\n"
-        f"• Quote Consumed: {job_row.get('pct_consumed', 0):.0f}%\n"
-        f"• Margin Shortfall: ${margin_shortfall:,.0f}\n"
-        f"• Top Driver: {drivers[0]['driver_name'] if drivers else 'None'}\n"
-        f"• Recommended: {drivers[0]['recommendation'] if drivers else 'Monitor'}"
+
+def _render_why_at_risk(drivers: List[Dict]) -> None:
+    """Render ranked risk drivers."""
+    st.markdown("**WHY AT RISK**")
+
+    if not drivers:
+        st.success("No significant risk drivers")
+        return
+
+    for i, driver in enumerate(drivers[:3], 1):
+        name = driver["driver_name"]
+        evidence = driver.get("evidence_detail", driver.get("evidence_value", ""))
+        st.markdown(
+            f"**{i}. {name}** — {driver['evidence_value']}  \n"
+            f"<span style='color: #666; font-size: 0.9em;'>{evidence}</span>",
+            unsafe_allow_html=True,
+        )
+
+
+def _render_recommended_actions(row: pd.Series, drivers: List[Dict]) -> None:
+    """Render checkable action items."""
+    st.markdown("**RECOMMENDED ACTIONS**")
+
+    actions = []
+    for driver in drivers[:3]:
+        action = driver.get("recommendation", "")
+        if action:
+            actions.append(action)
+
+    if not actions:
+        actions.append("Review job status with PM")
+
+    for i, action in enumerate(actions):
+        st.checkbox(action, key=f"action_{row['job_no']}_{i}")
+
+
+def _render_full_diagnosis(df: pd.DataFrame, job_no: str, job_row: pd.Series) -> None:
+    """
+    Render full diagnosis panel (expandable).
+
+    Includes:
+    - Task consumption vs quote with benchmark overlay
+    - Staff contribution by task with margin-erosion context
+    """
+    st.markdown("**Task Consumption vs Quote**")
+    task_df = get_job_task_attribution(df, job_no)
+    if len(task_df) > 0:
+        task_df = task_df.sort_values("variance", ascending=False)
+        task_plot = task_df.head(10).copy()
+
+        bench = _compute_task_benchmarks(df, job_row)
+        task_plot = task_plot.merge(bench, on="task_name", how="left")
+        fte = _compute_task_fte_equiv(df, job_no)
+        task_plot = task_plot.merge(fte, on="task_name", how="left")
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            name="Quoted",
+            y=task_plot["task_name"],
+            x=task_plot["quoted_hours"],
+            orientation="h",
+            marker_color="#6c757d",
+        ))
+        fte_labels = [
+            f"{value:.1f} FTE" if pd.notna(value) and value > 0 else ""
+            for value in task_plot.get("fte_equiv", pd.Series(dtype=float))
+        ]
+        fig.add_trace(go.Bar(
+            name="Actual",
+            y=task_plot["task_name"],
+            x=task_plot["actual_hours"],
+            orientation="h",
+            marker_color=[
+                "#dc3545" if a > q else "#28a745"
+                for a, q in zip(task_plot["actual_hours"], task_plot["quoted_hours"])
+            ],
+            text=fte_labels,
+            textposition="inside",
+            textfont=dict(color="white"),
+        ))
+
+        bench_points = pd.DataFrame()
+        if "bench_actual_hours" in task_plot.columns:
+            bench_points = task_plot[task_plot["bench_actual_hours"].notna()]
+        if len(bench_points) > 0:
+            fig.add_trace(go.Scatter(
+                name="Benchmark (median completed)",
+                y=bench_points["task_name"],
+                x=bench_points["bench_actual_hours"],
+                mode="markers",
+                marker=dict(color="#111827", size=8),
+            ))
+
+        fig.update_layout(
+            barmode="group",
+            height=max(260, len(task_plot) * 30),
+            xaxis_title="Hours",
+            yaxis_title="",
+            legend=dict(orientation="h", y=1.05),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption(
+            "Red bars indicate tasks running over quoted hours. Benchmarks reflect median actual hours on completed "
+            "jobs in the same department/category. Labels on actual bars show FTE-equivalent effort."
+        )
+    else:
+        st.caption("No task data available.")
+
+    st.markdown("**Task Contribution by Staff (Overrun Focus)**")
+    staff_task_df = _compute_task_staff_contribution(df, job_no)
+    if len(staff_task_df) > 0:
+        total_erosion = staff_task_df["erosion_value"].sum()
+        staff_task_df["erosion_pct_total"] = (
+            staff_task_df["erosion_value"] / total_erosion * 100 if total_erosion > 0 else 0
+        )
+
+        def _top_contributors(group: pd.DataFrame) -> pd.DataFrame:
+            group = group.sort_values("actual_hours", ascending=False).copy()
+            group["cum_share"] = group["task_share"].cumsum()
+            keep = group["cum_share"] <= 0.8
+            if len(group) > 0 and not keep.any():
+                keep.iloc[0] = True
+            if len(group) > 0 and keep.any():
+                first_over = group.index[group["cum_share"] > 0.8]
+                if len(first_over) > 0:
+                    keep.loc[first_over[0]] = True
+            return group[keep]
+
+        focused = staff_task_df.groupby("task_name", group_keys=False).apply(_top_contributors)
+
+        task_meta = staff_task_df.groupby("task_name").agg(
+            task_cost=("task_cost", "sum"),
+            quoted_hours=("task_quoted_hours", "first"),
+        ).reset_index()
+        task_meta = task_meta.set_index("task_name")
+
+        task_labels = {
+            task: (
+                f"{task} • ${task_meta.loc[task, 'task_cost']:,.0f}"
+                if task in task_meta.index and pd.notna(task_meta.loc[task, "task_cost"])
+                else task
+            )
+            for task in focused["task_name"].unique()
+        }
+        focused["task_label"] = focused["task_name"].map(task_labels)
+
+        fig_task = go.Figure()
+        for staff_name in focused["staff_name"].unique():
+            subset = focused[focused["staff_name"] == staff_name]
+            text_labels = [
+                f"{staff_name} ({share:.0f}%)" if share >= 10 else ""
+                for share in subset["task_share"] * 100
+            ]
+            fig_task.add_trace(go.Bar(
+                name=staff_name,
+                y=subset["task_label"],
+                x=subset["actual_hours"],
+                orientation="h",
+                text=text_labels,
+                textposition="inside",
+                textfont=dict(color="white"),
+                customdata=subset["erosion_pct_total"],
+                hovertemplate=(
+                    "%{y}<br>%{fullData.name}<br>"
+                    "Hours: %{x:.0f}<br>"
+                    "Task Share: %{customdata:.1f}% of total erosion"
+                    "<extra></extra>"
+                ),
+            ))
+
+        quoted_points = task_meta.reset_index()
+        if "quoted_hours" in quoted_points.columns:
+            quoted_points["task_label"] = quoted_points["task_name"].map(task_labels)
+            fig_task.add_trace(go.Scatter(
+                name="Quoted Hours (target)",
+                y=quoted_points["task_label"],
+                x=quoted_points["quoted_hours"],
+                mode="markers+text",
+                marker=dict(color="#111827", size=11, symbol="diamond", line=dict(color="white", width=1)),
+                text=[f"{val:.0f}h" if pd.notna(val) else "" for val in quoted_points["quoted_hours"]],
+                textposition="middle right",
+                textfont=dict(color="#111827", size=10),
+            ))
+
+        fig_task.update_layout(
+            barmode="stack",
+            height=max(260, len(task_meta) * 30),
+            xaxis_title="Hours",
+            yaxis_title="",
+            legend=dict(orientation="h", y=1.05),
+        )
+        st.plotly_chart(fig_task, use_container_width=True)
+        st.caption(
+            "Each task shows the staff who contribute to at least ~80% of its hours. "
+            "Quoted hours are marked with an X, and task labels include total cost."
+        )
+    else:
+        st.caption("No staff-task contribution data available.")
+
+
+
+def _compute_margin_at_risk(df: pd.DataFrame) -> float:
+    if len(df) == 0:
+        return 0.0
+    return df.get("margin_at_risk", pd.Series(dtype=float)).fillna(0).sum()
+
+
+def _apply_sort(df: pd.DataFrame, sort_option: str) -> pd.DataFrame:
+    if len(df) == 0:
+        return df
+
+    if sort_option == "Margin at Risk":
+        return df.sort_values("margin_at_risk", ascending=False)
+    if sort_option == "Hours Overrun":
+        return df.sort_values("hours_overrun", ascending=False)
+    if sort_option == "Recent Activity":
+        if "last_activity" in df.columns:
+            return df.sort_values("last_activity", ascending=False)
+        return df
+
+    return df.sort_values("risk_score", ascending=False)
+
+
+def _format_primary_issue(row: pd.Series) -> str:
+    """Format primary issue with specific numbers."""
+    driver = row.get("primary_driver", "")
+
+    if "scope" in driver.lower() or "hours overrun" in driver.lower():
+        pct = row.get("scope_creep_pct")
+        if pd.isna(pct):
+            pct = row.get("hours_variance_pct", 0)
+        return f"Scope/hours +{pct:.0f}% over quote"
+
+    if "rate" in driver.lower():
+        rate_var = row.get("rate_variance", 0)
+        return f"Rate leakage ${rate_var:.0f}/hr"
+
+    if "margin" in driver.lower():
+        margin = row.get("forecast_margin_pct", 0)
+        bench = row.get("median_margin_pct", 0)
+        return f"Margin {margin:.0f}% (bench: {bench:.0f}%)"
+
+    if "running" in driver.lower() or "runtime" in driver.lower():
+        delta = row.get("runtime_delta_days", 0)
+        return f"Running {delta:.0f} days over benchmark"
+
+    return driver or "Monitor"
+
+
+def _compute_task_benchmarks(df: pd.DataFrame, job_row: pd.Series) -> pd.DataFrame:
+    category_col = get_category_col(df)
+    dept = job_row.get("department_final")
+    cat = job_row.get("job_category")
+
+    df_completed = df.copy()
+    if "job_completed_date" in df_completed.columns:
+        df_completed = df_completed[df_completed["job_completed_date"].notna()]
+    elif "job_status" in df_completed.columns:
+        df_completed = df_completed[df_completed["job_status"].str.lower().str.contains("completed", na=False)]
+    else:
+        df_completed = df_completed.iloc[0:0]
+
+    if dept:
+        df_completed = df_completed[df_completed["department_final"] == dept]
+    if cat and category_col in df_completed.columns:
+        df_completed = df_completed[df_completed[category_col] == cat]
+
+    if len(df_completed) == 0:
+        return pd.DataFrame(columns=["task_name", "bench_actual_hours"])
+
+    actuals = df_completed.groupby(["job_no", "task_name"])["hours_raw"].sum().reset_index()
+    bench_actual = actuals.groupby("task_name")["hours_raw"].median().reset_index()
+    bench_actual = bench_actual.rename(columns={"hours_raw": "bench_actual_hours"})
+
+    return bench_actual
+
+
+def _compute_task_fte_equiv(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
+    job_df = df[df["job_no"] == job_no].copy()
+    if len(job_df) == 0:
+        return pd.DataFrame(columns=["task_name", "fte_equiv"])
+
+    if "fte_hours_scaling" in job_df.columns:
+        scaling = job_df["fte_hours_scaling"].fillna(config.DEFAULT_FTE_SCALING)
+    else:
+        scaling = config.DEFAULT_FTE_SCALING
+
+    denom = config.CAPACITY_HOURS_PER_WEEK * scaling
+    denom = denom.replace(0, np.nan) if isinstance(denom, pd.Series) else denom
+    job_df["fte_equiv"] = job_df["hours_raw"] / denom
+    job_df["fte_equiv"] = job_df["fte_equiv"].replace([np.inf, -np.inf], np.nan)
+
+    fte_by_task = job_df.groupby("task_name")["fte_equiv"].sum().reset_index()
+    return fte_by_task
+
+
+def _compute_task_staff_contribution(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
+    job_df = df[df["job_no"] == job_no].copy()
+    if len(job_df) == 0:
+        return pd.DataFrame()
+
+    staff_task = job_df.groupby(["task_name", "staff_name"]).agg(
+        actual_hours=("hours_raw", "sum"),
+        task_cost=("base_cost", "sum") if "base_cost" in job_df.columns else ("hours_raw", "sum"),
+    ).reset_index()
+    staff_task["task_total_hours"] = staff_task.groupby("task_name")["actual_hours"].transform("sum")
+    staff_task["task_share"] = np.where(
+        staff_task["task_total_hours"] > 0,
+        staff_task["actual_hours"] / staff_task["task_total_hours"],
+        0,
     )
 
-    st.text_area("Copy/Paste for Slack:", slack_summary, height=150, key="slack_summary")
+    job_task_quote = safe_quote_job_task(job_df)
+    if len(job_task_quote) == 0 or "quoted_time_total" not in job_task_quote.columns:
+        staff_task["task_quoted_hours"] = 0.0
+        staff_task["quoted_alloc"] = 0.0
+        staff_task["overrun_hours"] = staff_task["actual_hours"]
+        staff_task["quote_rate"] = 0.0
+    else:
+        task_totals = job_df.groupby("task_name")["hours_raw"].sum().reset_index()
+        task_totals = task_totals.rename(columns={"hours_raw": "task_actual_hours"})
+        staff_task = staff_task.merge(task_totals, on="task_name", how="left")
+        quote_cols = ["task_name", "quoted_time_total"]
+        if "quoted_amount_total" in job_task_quote.columns:
+            quote_cols.append("quoted_amount_total")
+        staff_task = staff_task.merge(
+            job_task_quote[quote_cols],
+            on="task_name",
+            how="left",
+        )
+        staff_task["quoted_time_total"] = staff_task["quoted_time_total"].fillna(0)
+        if "quoted_amount_total" not in staff_task.columns:
+            staff_task["quoted_amount_total"] = 0
+        staff_task["quoted_amount_total"] = staff_task["quoted_amount_total"].fillna(0)
+        staff_task["task_actual_hours"] = staff_task["task_actual_hours"].replace(0, np.nan)
+        staff_task["quoted_alloc"] = (
+            staff_task["actual_hours"] / staff_task["task_actual_hours"]
+        ) * staff_task["quoted_time_total"]
+        staff_task["quoted_alloc"] = staff_task["quoted_alloc"].fillna(0)
+        staff_task["overrun_hours"] = staff_task["actual_hours"] - staff_task["quoted_alloc"]
+        staff_task["task_quoted_hours"] = staff_task["quoted_time_total"]
+        staff_task["quote_rate"] = np.where(
+            staff_task["quoted_time_total"] > 0,
+            staff_task["quoted_amount_total"] / staff_task["quoted_time_total"],
+            0,
+        )
+
+    staff_task["erosion_value"] = (
+        staff_task["overrun_hours"].clip(lower=0) * staff_task["quote_rate"]
+    )
+
+    return staff_task
+
+
+def _render_definitions() -> None:
+    st.markdown("**Burn Rate:** Average hours per day over the last 28 days, shown as hours per week.")
+    st.markdown("**Margin at Risk:** Benchmark margin minus forecast margin, applied to forecast revenue.")
+    st.markdown("**Scope Creep:** Share of hours on tasks not matched to a quote.")
+    st.markdown("**Hours Overrun:** EAC hours minus quoted hours (positive indicates overrun).")
+    st.markdown("**Risk Score:** Composite score (0–100) from margin, revenue lag, hours overrun, rate leakage, and runtime.")

@@ -1,61 +1,45 @@
 """
-Delivery Control Tower metrics pack.
+Delivery Control Tower metrics pack (Command Center).
 
-Centralizes risk computation, driver analysis, and forecasting logic
-for the Active Delivery page.
+Keeps calculations minimal and focused on the command-center UI.
 """
 from __future__ import annotations
 
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional
-from dataclasses import dataclass
 from datetime import timedelta
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
 
 from src.data.job_lifecycle import get_active_jobs_with_metrics
-from src.data.semantic import safe_quote_job_task, get_category_col
+from src.data.semantic import get_category_col, safe_quote_job_task
 from src.modeling.intervention import compute_intervention_risk_score
 
 
-@dataclass
-class JobRiskProfile:
-    """Complete risk profile for a job."""
-    job_no: str
-    risk_score: float
-    risk_band: str
-    primary_driver: str
-    recommended_action: str
-    drivers: List[Dict]
-    margin_shortfall: float
-    hours_overrun: float
-
-
-def compute_delivery_control_view(
-    df: pd.DataFrame,
-    recency_days: int = 28,
-    department: Optional[str] = None,
-    category: Optional[str] = None,
-) -> pd.DataFrame:
+def compute_delivery_control_view(df: pd.DataFrame, recency_days: int = 28) -> pd.DataFrame:
     """
-    Build the complete delivery control view with all metrics.
+    Build the delivery control view.
 
-    This is the single source of truth for the Active Delivery page.
+    Returns DataFrame with columns needed for command center:
+    - job_no, job_name (if available)
+    - department_final, job_category
+    - quoted_hours, actual_hours
+    - pct_consumed, scope_creep_pct
+    - forecast_margin_pct, median_margin_pct
+    - risk_score, risk_band
+    - primary_driver, recommended_action
+    - margin_at_risk
     """
     if len(df) == 0:
         return pd.DataFrame()
 
-    df_filtered = df.copy()
-    if department:
-        df_filtered = df_filtered[df_filtered["department_final"] == department]
-    if category:
-        category_col = get_category_col(df_filtered)
-        df_filtered = df_filtered[df_filtered[category_col] == category]
-
-    jobs_df = get_active_jobs_with_metrics(df_filtered, recency_days)
+    jobs_df = get_active_jobs_with_metrics(df, recency_days)
     if len(jobs_df) == 0:
         return pd.DataFrame()
 
-    benchmarks = _compute_benchmarks(df_filtered)
+    jobs_df = _add_job_name(df, jobs_df)
+
+    benchmarks = compute_benchmarks(df)
     if len(benchmarks) > 0:
         jobs_df = jobs_df.merge(
             benchmarks[[
@@ -63,7 +47,6 @@ def compute_delivery_control_view(
                 "job_category",
                 "median_runtime_days",
                 "median_margin_pct",
-                "median_billable_share",
                 "median_quoted_hours",
             ]],
             on=["department_final", "job_category"],
@@ -72,19 +55,54 @@ def compute_delivery_control_view(
     else:
         jobs_df["median_runtime_days"] = np.nan
         jobs_df["median_margin_pct"] = np.nan
-        jobs_df["median_billable_share"] = np.nan
         jobs_df["median_quoted_hours"] = np.nan
 
-    jobs_df = _add_runtime_metrics(df_filtered, jobs_df)
-    jobs_df = _add_operational_metrics(jobs_df)
-    jobs_df = _add_forecasts(df_filtered, jobs_df)
+    jobs_df = _add_runtime_metrics(df, jobs_df)
+    jobs_df = _add_forecasts(df, jobs_df)
+    jobs_df = _add_burn_rates(df, jobs_df)
 
-    if "median_runtime_days" in jobs_df.columns:
-        jobs_df["peer_median_runtime_days"] = jobs_df["median_runtime_days"]
+    jobs_df["margin_pct_to_date"] = np.where(
+        jobs_df["actual_revenue"] > 0,
+        (jobs_df["actual_revenue"] - jobs_df["actual_cost"]) / jobs_df["actual_revenue"] * 100,
+        np.nan,
+    )
 
-    jobs_df = _add_risk_metrics(jobs_df)
+    jobs_df["quote_to_revenue"] = np.where(
+        jobs_df["quoted_amount"] > 0,
+        jobs_df["actual_revenue"] / jobs_df["quoted_amount"],
+        np.nan,
+    )
 
-    jobs_df["margin_shortfall"] = (
+    jobs_df["hours_overrun_pct"] = np.where(
+        jobs_df["quoted_hours"] > 0,
+        (jobs_df["actual_hours"] - jobs_df["quoted_hours"]) / jobs_df["quoted_hours"] * 100,
+        np.nan,
+    )
+
+    jobs_df["hours_variance_pct"] = jobs_df["hours_overrun_pct"].fillna(0)
+    jobs_df["pct_consumed"] = jobs_df.get("pct_quote_consumed", jobs_df.get("pct_consumed"))
+
+    jobs_df["peer_median_runtime_days"] = jobs_df.get("median_runtime_days")
+
+    risk_result = jobs_df.apply(
+        lambda row: compute_intervention_risk_score(row),
+        axis=1,
+        result_type="expand",
+    )
+    risk_result.columns = ["risk_score", "reason_codes"]
+    jobs_df["risk_score"] = risk_result["risk_score"]
+    jobs_df["risk_band"] = jobs_df["risk_score"].apply(_compute_risk_band)
+
+    driver_action = jobs_df.apply(
+        lambda row: _compute_primary_driver(row),
+        axis=1,
+        result_type="expand",
+    )
+    driver_action.columns = ["primary_driver", "recommended_action"]
+    jobs_df["primary_driver"] = driver_action["primary_driver"]
+    jobs_df["recommended_action"] = driver_action["recommended_action"]
+
+    jobs_df["margin_at_risk"] = (
         (jobs_df["median_margin_pct"].fillna(0) - jobs_df["forecast_margin_pct"].fillna(0))
         / 100
         * jobs_df["forecast_revenue"].fillna(0)
@@ -96,20 +114,113 @@ def compute_delivery_control_view(
         - jobs_df["quoted_hours"]
     ).clip(lower=0)
 
-    jobs_df["hours_variance_pct"] = np.where(
-        jobs_df["quoted_hours"] > 0,
-        (jobs_df["actual_hours"] - jobs_df["quoted_hours"]) / jobs_df["quoted_hours"] * 100,
-        0,
-    )
+    jobs_df = _add_recent_activity(df, jobs_df)
 
-    jobs_df["pct_consumed"] = jobs_df.get("pct_quote_consumed", jobs_df.get("pct_consumed"))
+    keep_cols = [
+        "job_no",
+        "job_name",
+        "department_final",
+        "job_category",
+        "quoted_hours",
+        "actual_hours",
+        "pct_consumed",
+        "scope_creep_pct",
+        "forecast_margin_pct",
+        "median_margin_pct",
+        "risk_score",
+        "risk_band",
+        "primary_driver",
+        "recommended_action",
+        "margin_at_risk",
+        "hours_overrun",
+        "hours_variance_pct",
+        "rate_variance",
+        "forecast_revenue",
+        "remaining_hours",
+        "runtime_days",
+        "runtime_delta_days",
+        "burn_rate_per_day",
+        "burn_rate_prev_per_day",
+        "last_activity",
+    ]
 
-    return jobs_df.sort_values("risk_score", ascending=False)
+    existing_cols = [col for col in keep_cols if col in jobs_df.columns]
+
+    return jobs_df[existing_cols].sort_values("risk_score", ascending=False)
 
 
 def compute_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
-    """Public wrapper to compute dept+category benchmarks."""
-    return _compute_benchmarks(df)
+    """Compute dept+category benchmarks from completed jobs."""
+    if "job_no" not in df.columns:
+        return pd.DataFrame()
+
+    category_col = get_category_col(df)
+    job_completion = df.groupby("job_no").agg(
+        completed_date=("job_completed_date", "first") if "job_completed_date" in df.columns else ("job_no", "first"),
+        job_status=("job_status", "first") if "job_status" in df.columns else ("job_no", "first"),
+        department_final=("department_final", "first"),
+        job_category=(category_col, "first"),
+    ).reset_index()
+
+    if "job_completed_date" in job_completion.columns:
+        job_completion["is_completed"] = job_completion["completed_date"].notna()
+    elif "job_status" in job_completion.columns:
+        job_completion["is_completed"] = job_completion["job_status"].str.lower().str.contains("completed", na=False)
+    else:
+        job_completion["is_completed"] = False
+
+    completed_jobs = set(job_completion[job_completion["is_completed"] == True]["job_no"].tolist())
+    df_completed = df[df["job_no"].isin(completed_jobs)].copy()
+    if len(df_completed) == 0:
+        return pd.DataFrame()
+
+    date_col = _get_date_col(df_completed)
+    df_completed[date_col] = pd.to_datetime(df_completed[date_col], errors="coerce")
+
+    runtime = df_completed.groupby("job_no").agg(
+        start_date=(date_col, "min"),
+        end_date=(date_col, "max"),
+    ).reset_index()
+    runtime["runtime_days"] = (runtime["end_date"] - runtime["start_date"]).dt.days + 1
+    runtime = runtime.merge(
+        job_completion[["job_no", "department_final", "job_category"]],
+        on="job_no",
+        how="left",
+    )
+
+    profit = df_completed.groupby("job_no").agg(
+        revenue=("rev_alloc", "sum") if "rev_alloc" in df_completed.columns else ("job_no", "count"),
+        cost=("base_cost", "sum") if "base_cost" in df_completed.columns else ("job_no", "count"),
+        hours=("hours_raw", "sum"),
+    ).reset_index()
+    profit["margin_pct"] = np.where(
+        profit["revenue"] > 0,
+        (profit["revenue"] - profit["cost"]) / profit["revenue"] * 100,
+        np.nan,
+    )
+    profit = profit.merge(
+        job_completion[["job_no", "department_final", "job_category"]],
+        on="job_no",
+        how="left",
+    )
+
+    job_task = safe_quote_job_task(df_completed)
+    if len(job_task) > 0 and "quoted_time_total" in job_task.columns:
+        job_quotes = job_task.groupby("job_no")["quoted_time_total"].sum().reset_index()
+        job_quotes = job_quotes.rename(columns={"quoted_time_total": "quoted_hours"})
+    else:
+        job_quotes = pd.DataFrame(columns=["job_no", "quoted_hours"])
+
+    profit = profit.merge(job_quotes, on="job_no", how="left")
+
+    bench = profit.merge(runtime[["job_no", "runtime_days"]], on="job_no", how="left")
+    bench = bench.groupby(["department_final", "job_category"]).agg(
+        median_runtime_days=("runtime_days", "median"),
+        median_margin_pct=("margin_pct", "median"),
+        median_quoted_hours=("quoted_hours", "median"),
+    ).reset_index()
+
+    return bench
 
 
 def compute_root_cause_drivers(
@@ -132,7 +243,7 @@ def compute_root_cause_drivers(
         return []
 
     if benchmarks is None:
-        benchmarks = _compute_benchmarks(df)
+        benchmarks = compute_benchmarks(df)
 
     drivers: List[Dict] = []
     job_no = job_row["job_no"]
@@ -239,92 +350,14 @@ def _get_date_col(df: pd.DataFrame) -> str:
     return "work_date" if "work_date" in df.columns else "month_key"
 
 
-def _compute_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute dept+category benchmarks from completed jobs."""
-    if "job_no" not in df.columns:
-        return pd.DataFrame()
-
-    category_col = get_category_col(df)
-    job_completion = df.groupby("job_no").agg(
-        completed_date=("job_completed_date", "first") if "job_completed_date" in df.columns else ("job_no", "first"),
-        job_status=("job_status", "first") if "job_status" in df.columns else ("job_no", "first"),
-        department_final=("department_final", "first"),
-        job_category=(category_col, "first"),
-    ).reset_index()
-
-    if "job_completed_date" in job_completion.columns:
-        job_completion["is_completed"] = job_completion["completed_date"].notna()
-    elif "job_status" in job_completion.columns:
-        job_completion["is_completed"] = job_completion["job_status"].str.lower().str.contains("completed", na=False)
-    else:
-        job_completion["is_completed"] = False
-
-    completed_jobs = set(job_completion[job_completion["is_completed"] == True]["job_no"].tolist())
-    df_completed = df[df["job_no"].isin(completed_jobs)].copy()
-    if len(df_completed) == 0:
-        return pd.DataFrame()
-
-    date_col = _get_date_col(df_completed)
-    df_completed[date_col] = pd.to_datetime(df_completed[date_col], errors="coerce")
-
-    runtime = df_completed.groupby("job_no").agg(
-        start_date=(date_col, "min"),
-        end_date=(date_col, "max"),
-    ).reset_index()
-    runtime["runtime_days"] = (runtime["end_date"] - runtime["start_date"]).dt.days + 1
-    runtime = runtime.merge(
-        job_completion[["job_no", "department_final", "job_category"]],
-        on="job_no",
-        how="left",
-    )
-
-    profit = df_completed.groupby("job_no").agg(
-        revenue=("rev_alloc", "sum") if "rev_alloc" in df_completed.columns else ("job_no", "count"),
-        cost=("base_cost", "sum") if "base_cost" in df_completed.columns else ("job_no", "count"),
-        hours=("hours_raw", "sum"),
-    ).reset_index()
-
-    if "is_billable" in df_completed.columns:
-        billable = df_completed[df_completed["is_billable"] == True].groupby("job_no")["hours_raw"].sum()
-        profit = profit.merge(billable.rename("billable_hours"), on="job_no", how="left")
-        profit["billable_hours"] = profit["billable_hours"].fillna(0)
-    else:
-        profit["billable_hours"] = 0.0
-
-    profit["margin_pct"] = np.where(
-        profit["revenue"] > 0,
-        (profit["revenue"] - profit["cost"]) / profit["revenue"] * 100,
-        np.nan,
-    )
-    profit["billable_share"] = np.where(
-        profit["hours"] > 0,
-        profit["billable_hours"] / profit["hours"],
-        np.nan,
-    )
-    profit = profit.merge(
-        job_completion[["job_no", "department_final", "job_category"]],
-        on="job_no",
-        how="left",
-    )
-
-    job_task = safe_quote_job_task(df_completed)
-    if len(job_task) > 0 and "quoted_time_total" in job_task.columns:
-        job_quotes = job_task.groupby("job_no")["quoted_time_total"].sum().reset_index()
-        job_quotes = job_quotes.rename(columns={"quoted_time_total": "quoted_hours"})
-    else:
-        job_quotes = pd.DataFrame(columns=["job_no", "quoted_hours"])
-
-    profit = profit.merge(job_quotes, on="job_no", how="left")
-
-    bench = profit.merge(runtime[["job_no", "runtime_days"]], on="job_no", how="left")
-    bench = bench.groupby(["department_final", "job_category"]).agg(
-        median_runtime_days=("runtime_days", "median"),
-        median_margin_pct=("margin_pct", "median"),
-        median_billable_share=("billable_share", "median"),
-        median_quoted_hours=("quoted_hours", "median"),
-    ).reset_index()
-
-    return bench
+def _add_job_name(df: pd.DataFrame, jobs_df: pd.DataFrame) -> pd.DataFrame:
+    for col in ["job_name", "job_title", "job_description"]:
+        if col in df.columns and df[col].notna().any():
+            job_names = df.groupby("job_no")[col].first().reset_index()
+            job_names = job_names.rename(columns={col: "job_name"})
+            return jobs_df.merge(job_names, on="job_no", how="left")
+    jobs_df["job_name"] = jobs_df["job_no"]
+    return jobs_df
 
 
 def _add_runtime_metrics(df: pd.DataFrame, jobs_df: pd.DataFrame) -> pd.DataFrame:
@@ -341,34 +374,8 @@ def _add_runtime_metrics(df: pd.DataFrame, jobs_df: pd.DataFrame) -> pd.DataFram
     ).reset_index()
     runtime["runtime_days"] = (runtime["end_date"] - runtime["start_date"]).dt.days + 1
 
-    jobs_df = jobs_df.merge(runtime[["job_no", "runtime_days"]], on="job_no", how="left")
+    jobs_df = jobs_df.merge(runtime[["job_no", "runtime_days", "end_date"]], on="job_no", how="left")
     jobs_df["runtime_delta_days"] = jobs_df["runtime_days"] - jobs_df.get("median_runtime_days")
-
-    return jobs_df
-
-
-def _add_operational_metrics(jobs_df: pd.DataFrame) -> pd.DataFrame:
-    jobs_df = jobs_df.copy()
-
-    jobs_df["margin_pct_to_date"] = np.where(
-        jobs_df["actual_revenue"] > 0,
-        (jobs_df["actual_revenue"] - jobs_df["actual_cost"]) / jobs_df["actual_revenue"] * 100,
-        np.nan,
-    )
-
-    jobs_df["quote_to_revenue"] = np.where(
-        jobs_df["quoted_amount"] > 0,
-        jobs_df["actual_revenue"] / jobs_df["quoted_amount"],
-        np.nan,
-    )
-
-    jobs_df["hours_overrun_pct"] = np.where(
-        jobs_df["quoted_hours"] > 0,
-        (jobs_df["actual_hours"] - jobs_df["quoted_hours"]) / jobs_df["quoted_hours"] * 100,
-        np.nan,
-    )
-
-    jobs_df["pct_consumed"] = jobs_df.get("pct_quote_consumed", jobs_df.get("pct_consumed"))
 
     return jobs_df
 
@@ -444,38 +451,103 @@ def _add_forecasts(df: pd.DataFrame, jobs_df: pd.DataFrame) -> pd.DataFrame:
     return jobs_df.merge(forecast_df, on="job_no", how="left")
 
 
-def _add_risk_metrics(jobs_df: pd.DataFrame) -> pd.DataFrame:
-    def _risk_row(row: pd.Series) -> pd.Series:
-        score, reasons = compute_intervention_risk_score(row)
+def _add_burn_rates(df: pd.DataFrame, jobs_df: pd.DataFrame, window_days: int = 28) -> pd.DataFrame:
+    if len(jobs_df) == 0:
+        return jobs_df
 
-        if score >= 70:
-            band = "Red"
-        elif score >= 50:
-            band = "Amber"
-        else:
-            band = "Green"
+    if "work_date" not in df.columns:
+        jobs_df["burn_rate_per_day"] = np.nan
+        jobs_df["burn_rate_prev_per_day"] = np.nan
+        return jobs_df
 
-        primary = reasons[0] if reasons else "Monitor"
-        action = _map_driver_to_action(primary)
+    df_dates = df[df["job_no"].isin(jobs_df["job_no"])].copy()
+    df_dates["work_date"] = pd.to_datetime(df_dates["work_date"], errors="coerce")
 
-        return pd.Series({
-            "risk_score": score,
-            "risk_band": band,
-            "primary_driver": primary,
-            "recommended_action": action,
+    burn_rows = []
+    for job_no, df_job in df_dates.groupby("job_no"):
+        last_date = df_job["work_date"].max()
+        if pd.isna(last_date):
+            burn_rows.append({
+                "job_no": job_no,
+                "burn_rate_per_day": np.nan,
+                "burn_rate_prev_per_day": np.nan,
+            })
+            continue
+
+        current_start = last_date - timedelta(days=window_days)
+        current = df_job[df_job["work_date"] >= current_start]
+        current_days = max((current["work_date"].max() - current["work_date"].min()).days, 1)
+        current_burn = current["hours_raw"].sum() / current_days if len(current) > 0 else np.nan
+
+        prev_end = current_start - timedelta(days=1)
+        prev_start = prev_end - timedelta(days=window_days)
+        prev = df_job[(df_job["work_date"] >= prev_start) & (df_job["work_date"] <= prev_end)]
+        prev_days = max((prev["work_date"].max() - prev["work_date"].min()).days, 1) if len(prev) > 0 else 0
+        prev_burn = prev["hours_raw"].sum() / prev_days if prev_days > 0 else np.nan
+
+        burn_rows.append({
+            "job_no": job_no,
+            "burn_rate_per_day": current_burn,
+            "burn_rate_prev_per_day": prev_burn,
         })
 
-    risk_metrics = jobs_df.apply(_risk_row, axis=1)
-    return pd.concat([jobs_df, risk_metrics], axis=1)
+    burn_df = pd.DataFrame(burn_rows)
+    return jobs_df.merge(burn_df, on="job_no", how="left")
 
 
-def _map_driver_to_action(driver: str) -> str:
-    actions = {
-        "Low margin %": "Review cost allocation; consider scope reduction",
-        "Revenue lagging quote": "Accelerate invoicing; verify revenue recognition",
-        "Hours overrun vs quote": "Scope review with PM; consider change order",
-        "Realized rate below quote": "Audit rate capture; check write-offs",
-        "Runtime exceeds peers": "Escalate timeline; identify blockers",
-        "Monitor": "Continue standard monitoring",
-    }
-    return actions.get(driver, "Review job status")
+def _add_recent_activity(df: pd.DataFrame, jobs_df: pd.DataFrame) -> pd.DataFrame:
+    date_col = _get_date_col(df)
+    if date_col not in df.columns:
+        jobs_df["last_activity"] = pd.NaT
+        return jobs_df
+
+    df_dates = df[df["job_no"].isin(jobs_df["job_no"])].copy()
+    df_dates[date_col] = pd.to_datetime(df_dates[date_col], errors="coerce")
+    last_activity = df_dates.groupby("job_no")[date_col].max().reset_index()
+    last_activity = last_activity.rename(columns={date_col: "last_activity"})
+    return jobs_df.merge(last_activity, on="job_no", how="left")
+
+
+def _compute_risk_band(score: float) -> str:
+    """
+    Simple risk banding.
+
+    Red: ≥70 (critical, needs action this week)
+    Amber: 50-70 (watch, review this week)
+    Green: <50 (on track)
+    """
+    if score >= 70:
+        return "Red"
+    if score >= 50:
+        return "Amber"
+    return "Green"
+
+
+def _compute_primary_driver(row: pd.Series) -> Tuple[str, str]:
+    """
+    Compute primary driver and recommended action.
+
+    Returns (driver_text, action_text)
+    """
+    scope_pct = row.get("scope_creep_pct", 0)
+    if pd.notna(scope_pct) and scope_pct > 20:
+        return f"Scope creep +{scope_pct:.0f}%", "Initiate change order"
+
+    hours_var = row.get("hours_variance_pct", 0)
+    if pd.notna(hours_var) and hours_var > 30:
+        return f"Hours overrun +{hours_var:.0f}%", "PM scope review"
+
+    rate_var = row.get("rate_variance", 0)
+    if pd.notna(rate_var) and rate_var < -15:
+        return f"Rate leakage ${rate_var:.0f}/hr", "Rate audit needed"
+
+    margin = row.get("forecast_margin_pct", 0)
+    bench = row.get("median_margin_pct", 0)
+    if pd.notna(margin) and pd.notna(bench) and margin < bench - 10:
+        return f"Margin {margin:.0f}% (bench {bench:.0f}%)", "Cost review"
+
+    runtime_delta = row.get("runtime_delta_days", 0)
+    if pd.notna(runtime_delta) and runtime_delta > 14:
+        return f"Running +{runtime_delta:.0f}d over", "Escalate timeline"
+
+    return "Monitor", "Continue standard review"

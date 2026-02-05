@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data.loader import load_fact_timesheet
 from src.metrics.profitability import classify_department, compute_department_scorecard
+from src.metrics.quote_delivery import compute_scope_creep
 from src.ui.formatting import build_job_name_lookup, format_job_label, fmt_percent, fmt_currency
 
 
@@ -440,18 +441,24 @@ def compute_job_metrics(df: pd.DataFrame) -> pd.DataFrame:
     job_df["critical_overrun_flag"] = job_df["hours_variance_pct_job"] > 20
     job_df["has_quote"] = job_df["quoted_hours_job"] > 0
 
-    if "quote_match_flag" in df.columns:
-        unquoted_hours = df[df["quote_match_flag"] != "matched"].groupby("job_no")["hours_raw"].sum()
-        job_df = job_df.merge(unquoted_hours.rename("unquoted_hours_job"), on="job_no", how="left")
+    scope = compute_scope_creep(df, ["job_no"])
+    if len(scope) > 0:
+        scope = scope.rename(
+            columns={
+                "unquoted_hours": "unquoted_hours_job",
+                "unquoted_share": "unquoted_pct_job",
+            }
+        )
+        job_df = job_df.merge(
+            scope[["job_no", "unquoted_hours_job", "unquoted_pct_job"]],
+            on="job_no",
+            how="left",
+        )
         job_df["unquoted_hours_job"] = job_df["unquoted_hours_job"].fillna(0)
+        job_df["unquoted_pct_job"] = job_df["unquoted_pct_job"].fillna(0)
     else:
         job_df["unquoted_hours_job"] = 0
-
-    job_df["unquoted_pct_job"] = np.where(
-        job_df["actual_hours_job"] > 0,
-        (job_df["unquoted_hours_job"] / job_df["actual_hours_job"]) * 100,
-        0,
-    )
+        job_df["unquoted_pct_job"] = 0
 
     return job_df
 
@@ -1669,6 +1676,16 @@ def render_job_diagnostic_card(
     job_name_lookup: Optional[Dict[str, str]] = None,
 ):
     job_data = df[df["job_no"] == job_no]
+    job_data = job_data.copy()
+
+    unquoted_flag = pd.Series(False, index=job_data.index)
+    if "quote_match_flag" in job_data.columns:
+        unquoted_flag |= job_data["quote_match_flag"].astype(str).str.lower().ne("matched")
+    if "quoted_time_total" in job_data.columns:
+        unquoted_flag |= job_data["quoted_time_total"].fillna(0) <= 0
+    if "quoted_amount_total" in job_data.columns:
+        unquoted_flag |= job_data["quoted_amount_total"].fillna(0) <= 0
+    job_data["is_unquoted"] = unquoted_flag
 
     actual_hours = job_data["hours_raw"].sum()
     revenue = job_data["rev_alloc"].sum()
@@ -1691,7 +1708,7 @@ def render_job_diagnostic_card(
     margin = revenue - cost
     margin_pct = (margin / revenue * 100) if revenue > 0 else 0
 
-    unquoted_tasks = job_data[job_data["quote_match_flag"] != "matched"] if "quote_match_flag" in job_data.columns else pd.DataFrame()
+    unquoted_tasks = job_data[job_data["is_unquoted"]]
     unquoted_hours = unquoted_tasks["hours_raw"].sum() if not unquoted_tasks.empty else 0
     unquoted_pct = (unquoted_hours / actual_hours * 100) if actual_hours > 0 else 0
 
@@ -1729,12 +1746,21 @@ def render_job_diagnostic_card(
 
 
 def compute_task_waterfall(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
-    job_data = df[df["job_no"] == job_no]
+    job_data = df[df["job_no"] == job_no].copy()
+
+    unquoted_flag = pd.Series(False, index=job_data.index)
+    if "quote_match_flag" in job_data.columns:
+        unquoted_flag |= job_data["quote_match_flag"].astype(str).str.lower().ne("matched")
+    if "quoted_time_total" in job_data.columns:
+        unquoted_flag |= job_data["quoted_time_total"].fillna(0) <= 0
+    if "quoted_amount_total" in job_data.columns:
+        unquoted_flag |= job_data["quoted_amount_total"].fillna(0) <= 0
+    job_data["is_unquoted"] = unquoted_flag
 
     task_df = job_data.groupby("task_name").agg(
         hours_raw=("hours_raw", "sum"),
         quoted_time_total=("quoted_time_total", "first"),
-        quote_match_flag=("quote_match_flag", "first"),
+        is_unquoted=("is_unquoted", "max"),
         base_cost=("base_cost", "sum"),
     ).reset_index()
 
@@ -1743,7 +1769,7 @@ def compute_task_waterfall(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
     task_df["hours_variance"] = task_df["actual_hours"] - task_df["quoted_hours"]
 
     task_df["variance_type"] = np.where(
-        task_df["quote_match_flag"] != "matched",
+        task_df["is_unquoted"],
         "Scope Creep (Unquoted)",
         np.where(
             task_df["hours_variance"] > 0,
