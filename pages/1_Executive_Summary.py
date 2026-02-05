@@ -1149,7 +1149,11 @@ def compute_category_scorecard(job_df: pd.DataFrame, department: str) -> pd.Data
     Uses job_category field from fact_timesheet_day_enriched.
     """
     dept_jobs = job_df[job_df["department_final"] == department].copy()
+    if "job_category" not in dept_jobs.columns:
+        # Enforce canonical source field; fall back to uncategorised if missing.
+        dept_jobs["job_category"] = np.nan
 
+    # Group by canonical job_category column only
     cat_df = dept_jobs.groupby("job_category").agg(
         revenue=("revenue_job", "sum"),
         actual_hours=("actual_hours_job", "sum"),
@@ -2003,18 +2007,74 @@ def main():
 
     render_kpi_strip(portfolio_metrics)
 
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        bridge_df = compute_rate_bridge(job_df, portfolio_metrics)
-        st.plotly_chart(render_rate_bridge(bridge_df), use_container_width=True)
-        st.markdown(
-            """
+    st.divider()
+
+    # ===========================================
+    # RATE BRIDGE SECTION (Toggle)
+    # ===========================================
+    st.header("Quote → Realised Rate Bridge")
+    st.caption("*Choose a view: mechanical decomposition or three‑forces ownership*")
+
+    scope_view = st.radio(
+        "Scope",
+        options=["Company (All)", "Department"],
+        index=0,
+        horizontal=True,
+        label_visibility="collapsed",
+        key="rate_bridge_scope",
+    )
+
+    df_bridge = df
+    job_df_bridge = job_df
+    selected_dept = None
+
+    if scope_view == "Department":
+        if "department_final" in job_df.columns:
+            dept_options = (
+                job_df["department_final"].dropna().sort_values().unique().tolist()
+            )
+        else:
+            dept_options = []
+
+        selected_dept = st.selectbox(
+            "Select department",
+            options=["-- Select --"] + dept_options,
+            key="rate_bridge_department",
+        )
+
+        if selected_dept == "-- Select --":
+            st.info("Select a department to view its rate bridge.")
+            st.stop()
+
+        df_bridge = df[df["department_final"] == selected_dept].copy()
+        job_df_bridge = job_df[job_df["department_final"] == selected_dept].copy()
+
+        if df_bridge.empty or job_df_bridge.empty:
+            st.warning("No data available for the selected department in this context.")
+            st.stop()
+
+    bridge_view = st.radio(
+        "Bridge view",
+        options=["Mechanical (Quote → Realised)", "Three‑Forces (Owners)"],
+        index=0,
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+
+    if bridge_view.startswith("Mechanical"):
+        portfolio_metrics_bridge = compute_portfolio_metrics(job_df_bridge)
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            bridge_df = compute_rate_bridge(job_df_bridge, portfolio_metrics_bridge)
+            st.plotly_chart(render_rate_bridge(bridge_df), use_container_width=True)
+            st.markdown(
+                """
 **How the Quote → Realised Rate bridge is calculated (plain English)**
 
 We start with the **quoted hourly rate** for the portfolio, then explain how actual delivery changes the realised rate.
 
 1. **Quote Rate (starting point)**  
-   This is total quoted value divided by total quoted hours, across all quoted jobs.
+   Total quoted value divided by total quoted hours, across all quoted jobs.
 
 2. **Under‑run impact (efficiency wins)**  
    Jobs that finished **under** their quoted hours create “saved hours.”  
@@ -2028,22 +2088,29 @@ We start with the **quoted hourly rate** for the portfolio, then explain how act
    Hours with no matching quote are also valued at the quote rate and treated as leakage.
 
 5. **Mix/Pricing effect (the residual)**  
-   Whatever difference remains after steps 2–4 is attributed to **mix and pricing**.  
-   In practice, this means some jobs were priced above quote, or the portfolio shifted toward higher‑rate work.
+   Whatever difference remains after steps 2–4 is attributed to **mix and pricing**.
 
 **Bottom line:** Realised rate = Quote rate + (under‑runs) − (overruns) − (unquoted hours) + (mix/pricing).
 """
-        )
-    with col2:
-        st.info(
-            """
+            )
+        with col2:
+            st.info(
+                """
 **The Contradiction Explained**
 
 Realised rate can exceed quote rate even when most jobs overrun.
 This is due to **mix effects** — some jobs subsidise others.
 
-👇 **Scroll to see which departments are responsible.**
+👇 **Switch to Three‑Forces view** to see owner‑level drivers.
 """
+            )
+    else:
+        from src.ui.rate_bridge_components import render_full_rate_bridge
+
+        render_full_rate_bridge(
+            df_bridge,
+            job_df_bridge,
+            show_department_comparison=(scope_view != "Department"),
         )
 
     st.divider()
