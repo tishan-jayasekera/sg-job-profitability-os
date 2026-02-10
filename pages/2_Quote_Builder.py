@@ -256,10 +256,31 @@ def main():
                (df_filtered[category_col] == selected_cat)
         df_slice = df_filtered[mask]
 
+        def _reset_task_state():
+            st.session_state["quote_task_locked"] = False
+            st.session_state["quote_task_locked_table"] = None
+            st.session_state["quote_econ_ready"] = False
+            st.session_state["quote_task_table_key"] = None
+            st.session_state["quote_bench_key"] = None
+
+        compare_lock_key = (
+            selected_dept,
+            selected_cat,
+            benchmark_window,
+            bool(active_staff_only),
+        )
+        if st.session_state.get("quote_compare_lock_key") != compare_lock_key:
+            st.session_state["quote_compare_lock_key"] = compare_lock_key
+            st.session_state["quote_compare_locked"] = False
+            st.session_state["quote_compare_locked_jobs"] = None
+            st.session_state["quote_compare_pool_jobs"] = None
+            _reset_task_state()
+
         # =====================================================================
         # COMPARABLE JOB FILTERS
         # =====================================================================
         section_header("Comparable Jobs", "Narrow benchmarks to specific clients or jobs")
+        compare_locked = st.session_state.get("quote_compare_locked", False)
 
         if "client" in df_slice.columns:
             client_options = sorted(df_slice["client"].dropna().unique().tolist())
@@ -270,6 +291,7 @@ def main():
             "Client(s) to compare",
             options=client_options,
             default=client_options,
+            disabled=compare_locked,
             key="quote_compare_clients",
         )
 
@@ -296,10 +318,30 @@ def main():
             parts = [p.strip() for p in raw.replace("\n", ",").split(",")]
             return [p for p in parts if p]
 
+        def _normalize_job_ids(values) -> list[str]:
+            if values is None:
+                return []
+            normalized = []
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, float) and pd.isna(value):
+                    continue
+                normalized.append(str(value))
+            return sorted(set(normalized))
+
+        def _filter_jobs(df_in: pd.DataFrame, job_ids) -> pd.DataFrame:
+            if "job_no" not in df_in.columns:
+                return df_in.iloc[0:0]
+            job_set = set(_normalize_job_ids(job_ids))
+            if not job_set:
+                return df_in.iloc[0:0]
+            return df_in[df_in["job_no"].astype(str).isin(job_set)]
+
         use_all_jobs = st.checkbox(
             "Use all jobs from selected clients",
             value=True,
-            disabled=len(selected_clients) == 0,
+            disabled=compare_locked or len(selected_clients) == 0,
             help="Uncheck to pick a subset of jobs.",
             key="quote_use_all_jobs",
         )
@@ -307,7 +349,7 @@ def main():
         selected_jobs = []
         if "quote_compare_jobs_override" in st.session_state:
             st.session_state["quote_compare_jobs"] = st.session_state.pop("quote_compare_jobs_override")
-        if selected_clients and not use_all_jobs and job_options:
+        if selected_clients and not use_all_jobs and job_options and not compare_locked:
             keyword_matches = []
             if "job_description" in df_client_slice.columns:
                 st.markdown("**Keyword Search (Job Description)**")
@@ -466,37 +508,304 @@ def main():
                 ),
                 key="quote_compare_jobs",
             )
+        elif selected_clients and not use_all_jobs and job_options and compare_locked:
+            selected_jobs = st.multiselect(
+                "Select specific jobs",
+                options=job_options,
+                format_func=lambda j: (
+                    f"{format_job_label(j, job_name_lookup)} — {job_category_lookup.get(str(j), 'Unknown')}"
+                    if job_category_lookup
+                    else format_job_label(j, job_name_lookup)
+                ),
+                key="quote_compare_jobs",
+                disabled=True,
+            )
 
         if selected_jobs:
-            df_compare = df_client_slice[df_client_slice["job_no"].isin(selected_jobs)]
+            df_compare_draft = _filter_jobs(df_client_slice, selected_jobs)
         else:
-            df_compare = df_client_slice
+            df_compare_draft = df_client_slice
 
-        if len(df_compare) == 0:
+        if len(df_compare_draft) == 0:
             st.warning("No jobs found for the selected comparable filters.")
             return
 
+        lock_cols = st.columns([1.2, 1.2, 2])
+        with lock_cols[0]:
+            if st.button("Lock comparable set", disabled=compare_locked):
+                lock_jobs = _normalize_job_ids(df_compare_draft["job_no"].unique().tolist())
+                st.session_state["quote_compare_locked"] = True
+                st.session_state["quote_compare_locked_jobs"] = lock_jobs
+                st.session_state["quote_compare_pool_jobs"] = lock_jobs.copy()
+                _reset_task_state()
+                st.rerun()
+        with lock_cols[1]:
+            if st.button("Unlock comparable set", disabled=not compare_locked):
+                st.session_state["quote_compare_locked"] = False
+                st.session_state["quote_compare_locked_jobs"] = None
+                st.session_state["quote_compare_pool_jobs"] = None
+                _reset_task_state()
+                st.rerun()
+        with lock_cols[2]:
+            if compare_locked:
+                st.caption("Comparable set locked. Review dispersion/similarity below to refine the pool.")
+            else:
+                st.caption("Lock the comparable set to review dispersion and build the quote.")
+
+        if not compare_locked:
+            st.caption(
+                f"Draft set: {df_compare_draft['job_no'].nunique()} jobs"
+                + (f", {df_compare_draft['client'].nunique()} clients" if "client" in df_compare_draft.columns else "")
+            )
+            st.info("Lock the comparable set to continue.")
+            return
+
+        compare_locked_jobs = _normalize_job_ids(st.session_state.get("quote_compare_locked_jobs") or [])
+        compare_pool_jobs = _normalize_job_ids(st.session_state.get("quote_compare_pool_jobs") or compare_locked_jobs)
+        if compare_locked_jobs and not compare_pool_jobs:
+            compare_pool_jobs = compare_locked_jobs.copy()
+            st.session_state["quote_compare_pool_jobs"] = compare_pool_jobs
+
+        df_compare = _filter_jobs(df_slice, compare_pool_jobs) if compare_pool_jobs else df_slice.iloc[0:0]
+
+        if len(df_compare) == 0:
+            st.warning("No jobs found in the current comparable pool.")
+            if st.button("Reset pool to locked set", key="quote_pool_reset_empty"):
+                st.session_state["quote_compare_pool_jobs"] = compare_locked_jobs
+                _reset_task_state()
+                st.rerun()
+            return
+
+        pool_job_count = df_compare["job_no"].nunique() if "job_no" in df_compare.columns else 0
+        pool_client_count = df_compare["client"].nunique() if "client" in df_compare.columns else 0
         st.caption(
-            f"Comparable set: {df_compare['job_no'].nunique()} jobs"
-            + (f", {df_compare['client'].nunique()} clients" if "client" in df_compare.columns else "")
+            f"Comparable pool: {pool_job_count} jobs"
+            + (f", {pool_client_count} clients" if "client" in df_compare.columns else "")
         )
-        
+        if compare_locked_jobs and len(compare_pool_jobs) != len(compare_locked_jobs):
+            st.caption(
+                f"Locked set: {len(compare_locked_jobs)} jobs · Pool: {len(compare_pool_jobs)} jobs"
+            )
+
         meta = get_benchmark_metadata(df_compare, recency_weighted=recency_weighted)
-        
+
         # Display metadata
         st.markdown(f"**Benchmark:** {meta['n_jobs']} jobs, {meta['n_staff']} staff")
         if meta["date_min"] and meta["date_max"]:
             st.caption(f"Date range: {meta['date_min'].strftime('%b %Y')} - {meta['date_max'].strftime('%b %Y')}")
-        
+
+        st.markdown("---")
+
+        # =====================================================================
+        # DISPERSION & SIMILARITY REVIEW
+        # =====================================================================
+        section_header("Dispersion & Similarity", "Cherry-pick jobs before building the task template")
+        st.caption("Tick jobs in the tables below to update the comparable pool used for benchmarks.")
+
+        reset_cols = st.columns([1.3, 2.7])
+        with reset_cols[0]:
+            if st.button("Reset pool to locked set", key="quote_pool_reset"):
+                st.session_state["quote_compare_pool_jobs"] = compare_locked_jobs.copy()
+                _reset_task_state()
+                st.rerun()
+        with reset_cols[1]:
+            st.caption(f"Current pool: {pool_job_count} jobs")
+
+        st.markdown(
+            """
+            <style>
+            .dispersion-highlight {
+                background: #fff7cc;
+                border: 1px solid #f2d675;
+                border-radius: 12px;
+                padding: 12px 14px;
+                margin: 6px 0 12px 0;
+            }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown('<div class="dispersion-highlight">', unsafe_allow_html=True)
+        st.markdown("#### Job Dispersion (Quoted vs Actual)")
+        if "job_no" in df_compare.columns:
+            job_actual = df_compare.groupby("job_no").agg(
+                actual_hours=("hours_raw", "sum") if "hours_raw" in df_compare.columns else ("job_no", "count"),
+                actual_value=("rev_alloc", "sum") if "rev_alloc" in df_compare.columns else ("job_no", "count"),
+            ).reset_index()
+        else:
+            job_actual = pd.DataFrame()
+
+        job_quote = safe_quote_job_task(df_compare)
+        if len(job_quote) > 0:
+            job_quote = job_quote.groupby("job_no").agg(
+                quoted_hours=("quoted_time_total", "sum") if "quoted_time_total" in job_quote.columns else ("job_no", "count"),
+                quoted_value=("quoted_amount_total", "sum") if "quoted_amount_total" in job_quote.columns else ("job_no", "count"),
+            ).reset_index()
+        else:
+            job_quote = pd.DataFrame()
+
+        job_disp = None
+        if len(job_actual) > 0 or len(job_quote) > 0:
+            job_disp = job_actual.merge(job_quote, on="job_no", how="outer")
+            metrics = {
+                "Quoted Value": job_disp["quoted_value"] if "quoted_value" in job_disp.columns else pd.Series(dtype=float),
+                "Quoted Hours": job_disp["quoted_hours"] if "quoted_hours" in job_disp.columns else pd.Series(dtype=float),
+                "Actual Value": job_disp["actual_value"] if "actual_value" in job_disp.columns else pd.Series(dtype=float),
+                "Actual Hours": job_disp["actual_hours"] if "actual_hours" in job_disp.columns else pd.Series(dtype=float),
+            }
+            rows = []
+            for label, series in metrics.items():
+                if len(series.dropna()) == 0:
+                    continue
+                s = series.dropna()
+                p25 = s.quantile(0.25)
+                p75 = s.quantile(0.75)
+                med = s.median()
+                iqr = p75 - p25
+                spread = iqr / med if med and med != 0 else np.nan
+                rows.append({
+                    "Metric": label,
+                    "Min": s.min(),
+                    "P25": p25,
+                    "Median": med,
+                    "P75": p75,
+                    "Max": s.max(),
+                    "IQR/Median": spread,
+                })
+            if rows:
+                dispersion_df = pd.DataFrame(rows)
+                dispersion_df["Flag"] = np.where(
+                    dispersion_df["IQR/Median"] >= 1.0, "Wide",
+                    np.where(dispersion_df["IQR/Median"] >= 0.5, "Moderate", "Tight")
+                )
+                st.dataframe(
+                    dispersion_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Min": st.column_config.NumberColumn(format="%.1f"),
+                        "P25": st.column_config.NumberColumn(format="%.1f"),
+                        "Median": st.column_config.NumberColumn(format="%.1f"),
+                        "P75": st.column_config.NumberColumn(format="%.1f"),
+                        "Max": st.column_config.NumberColumn(format="%.1f"),
+                        "IQR/Median": st.column_config.NumberColumn(format="%.2f"),
+                    },
+                )
+                wide_metrics = dispersion_df[dispersion_df["Flag"] == "Wide"]["Metric"].tolist()
+                if wide_metrics:
+                    st.warning(
+                        "Dispersion alert: "
+                        + ", ".join(wide_metrics)
+                        + " are wide. Consider narrowing the comparable set before quoting."
+                    )
+                else:
+                    st.caption(
+                        "Dispersion looks tight/moderate across key metrics — comparable set is consistent."
+                    )
+            else:
+                st.caption("No dispersion metrics available for the current selection.")
+        else:
+            st.caption("No dispersion metrics available for the current selection.")
+
+        metric_cols = []
+        if job_disp is not None and len(job_disp) > 0:
+            for col in ["quoted_value", "quoted_hours", "actual_value", "actual_hours"]:
+                if col in job_disp.columns:
+                    metric_cols.append(col)
+
+        if job_disp is not None and metric_cols:
+            contrib_df = job_disp.copy()
+            contrib_df = contrib_df[contrib_df[metric_cols].notna().any(axis=1)]
+            if len(contrib_df) > 0:
+                for col in metric_cols:
+                    med = contrib_df[col].median()
+                    denom = med if med and med != 0 else (contrib_df[col].std() or 1.0)
+                    contrib_df[f"{col}_norm"] = (contrib_df[col] - med).abs() / denom
+                norm_cols = [f"{c}_norm" for c in metric_cols]
+                contrib_df["dispersion_score"] = contrib_df[norm_cols].mean(axis=1, skipna=True)
+                contrib_df["job_no"] = contrib_df["job_no"].astype(str)
+                contrib_df["job_label"] = contrib_df["job_no"].apply(
+                    lambda j: format_job_label(j, job_name_lookup)
+                )
+
+                outliers = contrib_df.sort_values("dispersion_score", ascending=False).head(8)
+                similar = contrib_df.sort_values("dispersion_score", ascending=True).head(8)
+
+                st.markdown("**Dispersion Contributors (Review These Jobs)**")
+                outlier_view = outliers.copy()
+                outlier_view["Exclude"] = False
+                outlier_view = outlier_view.set_index("job_no")
+                outlier_edit = st.data_editor(
+                    outlier_view[["Exclude", "job_label", "dispersion_score"] + metric_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Exclude": st.column_config.CheckboxColumn("Exclude"),
+                        "job_label": st.column_config.TextColumn("Job", disabled=True),
+                        "dispersion_score": st.column_config.NumberColumn("Dispersion Score", format="%.2f", disabled=True),
+                        "quoted_value": st.column_config.NumberColumn("Quoted Value", format="$%.0f", disabled=True),
+                        "quoted_hours": st.column_config.NumberColumn("Quoted Hours", format="%.1f", disabled=True),
+                        "actual_value": st.column_config.NumberColumn("Actual Value", format="$%.0f", disabled=True),
+                        "actual_hours": st.column_config.NumberColumn("Actual Hours", format="%.1f", disabled=True),
+                    },
+                    num_rows="fixed",
+                    key="quote_outlier_editor",
+                )
+                if st.button("Remove selected outliers from pool", key="quote_outlier_apply"):
+                    to_remove = outlier_edit[outlier_edit["Exclude"]].index.tolist()
+                    if to_remove:
+                        remaining = [j for j in compare_pool_jobs if j not in set(map(str, to_remove))]
+                        st.session_state["quote_compare_pool_jobs"] = sorted(set(remaining))
+                        _reset_task_state()
+                        st.rerun()
+                    else:
+                        st.info("Select at least one outlier to remove.")
+
+                st.markdown("**Most Similar Jobs (Closest to Median)**")
+                similar_view = similar.copy()
+                similar_view["Include"] = False
+                similar_view = similar_view.set_index("job_no")
+                similar_edit = st.data_editor(
+                    similar_view[["Include", "job_label", "dispersion_score"] + metric_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Include": st.column_config.CheckboxColumn("Include"),
+                        "job_label": st.column_config.TextColumn("Job", disabled=True),
+                        "dispersion_score": st.column_config.NumberColumn("Similarity Score", format="%.2f", disabled=True),
+                        "quoted_value": st.column_config.NumberColumn("Quoted Value", format="$%.0f", disabled=True),
+                        "quoted_hours": st.column_config.NumberColumn("Quoted Hours", format="%.1f", disabled=True),
+                        "actual_value": st.column_config.NumberColumn("Actual Value", format="$%.0f", disabled=True),
+                        "actual_hours": st.column_config.NumberColumn("Actual Hours", format="%.1f", disabled=True),
+                    },
+                    num_rows="fixed",
+                    key="quote_similar_editor",
+                )
+                st.caption("Apply replaces the pool with the selected similar jobs.")
+                if st.button("Use selected similar jobs as pool", key="quote_similar_apply"):
+                    selected = similar_edit[similar_edit["Include"]].index.tolist()
+                    if selected:
+                        st.session_state["quote_compare_pool_jobs"] = sorted(set(map(str, selected)))
+                        _reset_task_state()
+                        st.rerun()
+                    else:
+                        st.warning("Select at least one similar job to update the pool.")
+            else:
+                st.caption("No job-level metrics available to score similarity.")
+        elif job_disp is not None:
+            st.caption("No job-level metrics available to score similarity.")
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
         st.markdown("---")
         
+        pool_job_key = tuple(compare_pool_jobs)
         bench_key = (
             "quote_benchmarks",
             selected_dept,
             selected_cat,
             benchmark_window,
-            tuple(selected_clients),
-            tuple(selected_jobs),
+            pool_job_key,
             bool(recency_weighted),
         )
         if st.session_state.get("quote_bench_key") != bench_key:
@@ -520,7 +829,7 @@ def main():
         section_header("Task Template", "Select tasks, adjust hours, and build a usable quote plan fast")
         
         # Initialize table in session state if not exists or context changes
-        table_key = (selected_dept, selected_cat, benchmark_window, tuple(selected_clients), tuple(selected_jobs))
+        table_key = (selected_dept, selected_cat, benchmark_window, pool_job_key)
         if st.session_state.get("quote_task_table_key") != table_key:
             default_tasks = benchmarks[benchmarks["inclusion_rate"] >= 50]["task_name"].tolist()
             base_table = benchmarks.rename(columns={
@@ -925,169 +1234,6 @@ def main():
                 "Margin %": st.column_config.NumberColumn(format="%.1f%%"),
             },
         )
-
-        st.markdown(
-            """
-            <style>
-            .dispersion-highlight {
-                background: #fff7cc;
-                border: 1px solid #f2d675;
-                border-radius: 12px;
-                padding: 12px 14px;
-                margin: 6px 0 12px 0;
-            }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-        st.markdown('<div class="dispersion-highlight">', unsafe_allow_html=True)
-        st.markdown("#### Job Dispersion (Quoted vs Actual)")
-        if "job_no" in df_compare.columns:
-            job_actual = df_compare.groupby("job_no").agg(
-                actual_hours=("hours_raw", "sum") if "hours_raw" in df_compare.columns else ("job_no", "count"),
-                actual_value=("rev_alloc", "sum") if "rev_alloc" in df_compare.columns else ("job_no", "count"),
-            ).reset_index()
-        else:
-            job_actual = pd.DataFrame()
-
-        job_quote = safe_quote_job_task(df_compare)
-        if len(job_quote) > 0:
-            job_quote = job_quote.groupby("job_no").agg(
-                quoted_hours=("quoted_time_total", "sum") if "quoted_time_total" in job_quote.columns else ("job_no", "count"),
-                quoted_value=("quoted_amount_total", "sum") if "quoted_amount_total" in job_quote.columns else ("job_no", "count"),
-            ).reset_index()
-        else:
-            job_quote = pd.DataFrame()
-
-        job_disp = None
-        if len(job_actual) > 0 or len(job_quote) > 0:
-            job_disp = job_actual.merge(job_quote, on="job_no", how="outer")
-            metrics = {
-                "Quoted Value": job_disp["quoted_value"] if "quoted_value" in job_disp.columns else pd.Series(dtype=float),
-                "Quoted Hours": job_disp["quoted_hours"] if "quoted_hours" in job_disp.columns else pd.Series(dtype=float),
-                "Actual Value": job_disp["actual_value"] if "actual_value" in job_disp.columns else pd.Series(dtype=float),
-                "Actual Hours": job_disp["actual_hours"] if "actual_hours" in job_disp.columns else pd.Series(dtype=float),
-            }
-            rows = []
-            for label, series in metrics.items():
-                if len(series.dropna()) == 0:
-                    continue
-                s = series.dropna()
-                p25 = s.quantile(0.25)
-                p75 = s.quantile(0.75)
-                med = s.median()
-                iqr = p75 - p25
-                spread = iqr / med if med and med != 0 else np.nan
-                rows.append({
-                    "Metric": label,
-                    "Min": s.min(),
-                    "P25": p25,
-                    "Median": med,
-                    "P75": p75,
-                    "Max": s.max(),
-                    "IQR/Median": spread,
-                })
-            if rows:
-                dispersion_df = pd.DataFrame(rows)
-                dispersion_df["Flag"] = np.where(
-                    dispersion_df["IQR/Median"] >= 1.0, "Wide",
-                    np.where(dispersion_df["IQR/Median"] >= 0.5, "Moderate", "Tight")
-                )
-                st.dataframe(
-                    dispersion_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Min": st.column_config.NumberColumn(format="%.1f"),
-                        "P25": st.column_config.NumberColumn(format="%.1f"),
-                        "Median": st.column_config.NumberColumn(format="%.1f"),
-                        "P75": st.column_config.NumberColumn(format="%.1f"),
-                        "Max": st.column_config.NumberColumn(format="%.1f"),
-                        "IQR/Median": st.column_config.NumberColumn(format="%.2f"),
-                    },
-                )
-                wide_metrics = dispersion_df[dispersion_df["Flag"] == "Wide"]["Metric"].tolist()
-                if wide_metrics:
-                    st.warning(
-                        "Dispersion alert: "
-                        + ", ".join(wide_metrics)
-                        + " are wide. Consider narrowing the comparable set or applying filters before quoting."
-                    )
-                    # Identify dispersion contributors + most similar jobs
-                    contrib_df = job_disp.copy()
-                    metric_cols = []
-                    for col in ["quoted_value", "quoted_hours", "actual_value", "actual_hours"]:
-                        if col in contrib_df.columns:
-                            metric_cols.append(col)
-                    if metric_cols:
-                        # Normalize by median to avoid scale bias
-                        for col in metric_cols:
-                            med = contrib_df[col].median()
-                            denom = med if med and med != 0 else (contrib_df[col].std() or 1.0)
-                            contrib_df[f"{col}_norm"] = (contrib_df[col] - med).abs() / denom
-                        norm_cols = [f"{c}_norm" for c in metric_cols]
-                        contrib_df["dispersion_score"] = contrib_df[norm_cols].mean(axis=1, skipna=True)
-                        contrib_df["job_label"] = contrib_df["job_no"].apply(lambda j: format_job_label(j, job_name_lookup))
-
-                        outliers = contrib_df.sort_values("dispersion_score", ascending=False).head(8)
-                        outlier_ids = set(outliers["job_no"].astype(str).tolist())
-                        similar = (
-                            contrib_df[~contrib_df["job_no"].astype(str).isin(outlier_ids)]
-                            .sort_values("dispersion_score", ascending=True)
-                            .head(8)
-                        )
-
-                        st.markdown("**Dispersion Contributors (Review These Jobs)**")
-                        st.dataframe(
-                            outliers[["job_label", "dispersion_score"] + metric_cols],
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "dispersion_score": st.column_config.NumberColumn("Dispersion Score", format="%.2f"),
-                                "quoted_value": st.column_config.NumberColumn("Quoted Value", format="$%.0f"),
-                                "quoted_hours": st.column_config.NumberColumn("Quoted Hours", format="%.1f"),
-                                "actual_value": st.column_config.NumberColumn("Actual Value", format="$%.0f"),
-                                "actual_hours": st.column_config.NumberColumn("Actual Hours", format="%.1f"),
-                            },
-                        )
-                        remove_choices = outliers["job_no"].astype(str).tolist()
-                        remove_labels = dict(zip(outliers["job_no"].astype(str), outliers["job_label"]))
-                        to_remove = st.multiselect(
-                            "Deselect dispersion contributors",
-                            options=remove_choices,
-                            format_func=lambda j: remove_labels.get(str(j), str(j)),
-                            key="quote_remove_dispersion_jobs",
-                        )
-                        if st.button("Remove selected jobs and refresh quote", key="quote_remove_dispersion_apply"):
-                            existing = st.session_state.get("quote_compare_jobs", []) or []
-                            remaining = [j for j in existing if str(j) not in set(map(str, to_remove))]
-                            st.session_state["quote_compare_jobs_override"] = remaining
-                            st.session_state["quote_task_locked"] = False
-                            st.session_state["quote_task_locked_table"] = None
-                            st.rerun()
-
-                        st.markdown("**Most Similar Jobs (Closest to Median)**")
-                        st.dataframe(
-                            similar[["job_label", "dispersion_score"] + metric_cols],
-                            use_container_width=True,
-                            hide_index=True,
-                            column_config={
-                                "dispersion_score": st.column_config.NumberColumn("Similarity Score", format="%.2f"),
-                                "quoted_value": st.column_config.NumberColumn("Quoted Value", format="$%.0f"),
-                                "quoted_hours": st.column_config.NumberColumn("Quoted Hours", format="%.1f"),
-                                "actual_value": st.column_config.NumberColumn("Actual Value", format="$%.0f"),
-                                "actual_hours": st.column_config.NumberColumn("Actual Hours", format="%.1f"),
-                            },
-                        )
-                else:
-                    st.caption(
-                        "Dispersion looks tight/moderate across key metrics — comparable set is consistent."
-                    )
-            else:
-                st.caption("No dispersion metrics available for the current selection.")
-        else:
-            st.caption("No dispersion metrics available for the current selection.")
-        st.markdown("</div>", unsafe_allow_html=True)
 
         st.markdown("#### Task Diagnostics")
         diag_df = edited_df[[

@@ -135,11 +135,14 @@ def render_global_control_bar() -> Tuple[pd.Timestamp, pd.Timestamp, str]:
         "Last 30 Days": "30D",
         "Last 90 Days": "90D",
         "Last 6 Months": "6M",
+        "Last 12 Months": "12M",
     }
     if st.session_state.get("time_preset") in legacy_map:
         st.session_state["time_preset"] = legacy_map[st.session_state["time_preset"]]
-    if st.session_state.get("time_preset") not in {"30D", "90D", "6M", "Custom"}:
-        st.session_state["time_preset"] = "90D"
+    if st.session_state.get("time_preset") not in {"30D", "90D", "6M", "12M", "Custom"}:
+        st.session_state["time_preset"] = "12M"
+    if st.session_state.get("job_state") not in {"Active", "Completed", "All"}:
+        st.session_state["job_state"] = "Completed"
 
     with st.container():
         st.markdown('<span class="control-bar-anchor"></span>', unsafe_allow_html=True)
@@ -149,8 +152,8 @@ def render_global_control_bar() -> Tuple[pd.Timestamp, pd.Timestamp, str]:
             st.markdown('<p class="control-label">📅 Time Period</p>', unsafe_allow_html=True)
             time_preset = segmented_or_radio(
                 "Period",
-                options=["30D", "90D", "6M", "Custom"],
-                default="90D",
+                options=["30D", "90D", "6M", "12M", "Custom"],
+                default="12M",
                 key="time_preset",
             )
 
@@ -159,6 +162,7 @@ def render_global_control_bar() -> Tuple[pd.Timestamp, pd.Timestamp, str]:
                 "30D": (today - pd.Timedelta(days=30), today),
                 "90D": (today - pd.Timedelta(days=90), today),
                 "6M": (today - pd.Timedelta(days=180), today),
+                "12M": (today - pd.Timedelta(days=365), today),
             }
 
             if time_preset == "Custom":
@@ -183,7 +187,7 @@ def render_global_control_bar() -> Tuple[pd.Timestamp, pd.Timestamp, str]:
             job_state = segmented_or_radio(
                 "State",
                 options=["Active", "Completed", "All"],
-                default="All",
+                default="Completed",
                 key="job_state",
             )
 
@@ -266,9 +270,9 @@ def init_drill_state():
 
     if "global_context" not in st.session_state:
         st.session_state.global_context = {
-            "start_date": pd.Timestamp.today() - pd.Timedelta(days=90),
+            "start_date": pd.Timestamp.today() - pd.Timedelta(days=365),
             "end_date": pd.Timestamp.today(),
-            "job_state": "All",
+            "job_state": "Completed",
         }
 
 
@@ -1185,6 +1189,14 @@ def compute_category_scorecard(job_df: pd.DataFrame, department: str) -> pd.Data
         "severe_overrun_jobs",
         "total_jobs",
     ]
+
+    # Drop categories with no activity in the current period
+    cat_df = cat_df[
+        (cat_df["actual_hours"] > 0) | (cat_df["revenue"] > 0) | (cat_df["cost"] > 0)
+    ].copy()
+
+    if cat_df.empty:
+        return cat_df
 
     cat_df["category"] = cat_df["category"].fillna("(Uncategorised)")
 

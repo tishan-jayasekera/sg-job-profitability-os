@@ -105,9 +105,9 @@ def init_global_context():
     """Initialize global context state for time period and job state."""
     if "global_context" not in st.session_state:
         st.session_state.global_context = {
-            "start_date": pd.Timestamp.today() - pd.Timedelta(days=90),
+            "start_date": pd.Timestamp.today() - pd.Timedelta(days=365),
             "end_date": pd.Timestamp.today(),
-            "job_state": "All",
+            "job_state": "Completed",
         }
 
 
