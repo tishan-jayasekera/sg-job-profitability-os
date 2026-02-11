@@ -1456,7 +1456,7 @@ def main():
         # =====================================================================
         # ACTIONS
         # =====================================================================
-        action_cols = st.columns(4)
+        action_cols = st.columns(3)
         
         with action_cols[0]:
             if st.button("Save Quote Plan", type="primary"):
@@ -1484,31 +1484,6 @@ def main():
                 st.success("Quote plan saved!")
         
         with action_cols[1]:
-            if st.button("Send to Capacity Planner"):
-                # Save and redirect
-                tasks = []
-                for _, row in edited_df.iterrows():
-                    if row["Hours"] > 0:
-                        tasks.append(QuotePlanTask(
-                            task_name=row["Task"],
-                            hours=row["Hours"],
-                            cost_per_hour=row.get(cost_col, 0) or 0,
-                            quote_rate=row.get(rate_col, 0) or 0,
-                        ))
-                
-                plan = QuotePlan(
-                    department=selected_dept,
-                    category=selected_cat,
-                    tasks=tasks,
-                    benchmark_window=benchmark_window,
-                    recency_weighted=recency_weighted,
-                    created_at=datetime.now().isoformat(),
-                )
-                
-                set_quote_plan(plan)
-                st.switch_page("pages/3_Capacity_Profiles.py")
-        
-        with action_cols[2]:
             # Export as CSV
             export_df = edited_df[["Task", "Hours"]].copy()
             export_df["Department"] = selected_dept
@@ -1522,7 +1497,7 @@ def main():
                 mime="text/csv"
             )
         
-        with action_cols[3]:
+        with action_cols[2]:
             if st.button("Clear Plan"):
                 st.session_state.pop(plan_key, None)
                 st.rerun()
