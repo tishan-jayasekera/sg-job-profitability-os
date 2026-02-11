@@ -39,6 +39,31 @@ from src.ui.revenue_recon_components import (
 init_state()
 
 
+@st.fragment
+def _render_reconciliation_sections(df, recon_df, summary, job_name_lookup) -> None:
+    render_portfolio_summary(summary)
+
+    st.divider()
+
+    render_distribution_analysis(recon_df, summary)
+
+    st.divider()
+
+    render_concentration_analysis(recon_df, summary, job_name_lookup)
+
+    st.divider()
+
+    render_pattern_analysis(recon_df)
+
+    st.divider()
+
+    render_job_deep_dive(df, recon_df, job_name_lookup)
+
+    st.divider()
+
+    render_data_quality_section(recon_df)
+
+
 def main():
     # Header
     st.title("💰 Revenue Reconciliation & Leakage Diagnostics")
@@ -108,28 +133,7 @@ def main():
         summary = compute_reconciliation_summary(recon_df)
         job_name_lookup = build_job_name_lookup(df, "job_no", "job_name")
 
-    # Render sections
-    render_portfolio_summary(summary)
-
-    st.divider()
-
-    render_distribution_analysis(recon_df, summary)
-
-    st.divider()
-
-    render_concentration_analysis(recon_df, summary, job_name_lookup)
-
-    st.divider()
-
-    render_pattern_analysis(recon_df)
-
-    st.divider()
-
-    render_job_deep_dive(df, recon_df, job_name_lookup)
-
-    st.divider()
-
-    render_data_quality_section(recon_df)
+    _render_reconciliation_sections(df, recon_df, summary, job_name_lookup)
 
 
 if __name__ == "__main__":

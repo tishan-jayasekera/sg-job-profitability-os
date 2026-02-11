@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import Tuple
 
 from src.data.semantic import get_category_col
@@ -12,12 +13,13 @@ from src.data.semantic import get_category_col
 
 def _completed_jobs(df: pd.DataFrame) -> pd.DataFrame:
     if "job_completed_date" in df.columns:
-        return df[df["job_completed_date"].notna()].copy()
+        return df[df["job_completed_date"].notna()]
     if "job_status" in df.columns:
-        return df[df["job_status"].str.lower().str.contains("completed", na=False)].copy()
-    return df.iloc[0:0].copy()
+        return df[df["job_status"].str.lower().str.contains("completed", na=False)]
+    return df.iloc[0:0]
 
 
+@st.cache_data(show_spinner=False)
 def build_category_benchmarks(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Build benchmark distributions by (department, category).

@@ -74,6 +74,71 @@ def _build_margin_trend(monthly: pd.DataFrame) -> px.bar:
     return fig
 
 
+@st.fragment
+def _render_quadrant_and_focus_fragment(df_window: pd.DataFrame) -> tuple[str, pd.DataFrame, str]:
+    y_axis_label = st.radio(
+        "Y-axis",
+        ["Absolute Profit", "Margin %"],
+        horizontal=True,
+        key="client_quadrant_y_axis",
+    )
+    y_mode = "margin_pct" if y_axis_label == "Margin %" else "profit"
+    quadrant_df, median_x, median_y = compute_client_quadrants(df_window, y_mode=y_mode)
+    quote_rollup = safe_quote_rollup(df_window, ("client",))
+    if len(quote_rollup) > 0 and "quoted_amount" in quote_rollup.columns:
+        valid_clients = quote_rollup[quote_rollup["quoted_amount"] > 0]["client"].unique().tolist()
+        quadrant_df = quadrant_df[quadrant_df["client"].isin(valid_clients)]
+
+    y_title = "Margin %" if y_mode == "margin_pct" else "Profit"
+    scatter_fig = charts.client_quadrant_scatter(
+        quadrant_df,
+        x_col="revenue",
+        y_col="y_value",
+        size_col="hours",
+        quadrant_col="quadrant",
+        median_x=median_x,
+        median_y=median_y,
+        title="Client Portfolio: Revenue vs Profitability",
+        x_title="Revenue",
+        y_title=y_title,
+    )
+    render_client_quadrant_scatter(scatter_fig)
+
+    quadrant_options = ["Partners", "Underperformers", "Niche", "Drain"]
+    selected_quadrant = st.selectbox(
+        "Focus Quadrant",
+        options=quadrant_options,
+        key="selected_client_quadrant",
+    )
+    return y_mode, quadrant_df, selected_quadrant
+
+
+@st.fragment
+def _render_intervention_queue_fragment(
+    df_window: pd.DataFrame,
+    selected_quadrant: str,
+    y_mode: str,
+) -> None:
+    mode_options = ["Intervention", "Growth"]
+    selected_mode = st.radio(
+        "Queue Mode",
+        options=mode_options,
+        key="client_queue_mode",
+        horizontal=True,
+    )
+    shortlist_size = st.slider(
+        "Shortlist Size",
+        min_value=5,
+        max_value=30,
+        value=int(get_state("client_shortlist_size") or 10),
+        step=1,
+        key="client_shortlist_size",
+    )
+
+    queue_df = compute_client_queue(df_window, selected_quadrant, selected_mode, y_mode=y_mode)
+    render_client_intervention_queue(queue_df, shortlist_size)
+
+
 def main():
     st.title("Client Profitability & LTV Control Tower")
     st.caption("Segment clients by economic value, diagnose margin leakage, and drill to task/FTE drivers.")
@@ -123,60 +188,10 @@ def main():
     render_client_portfolio_health(summary)
 
     # SECTION 2 — Portfolio Quadrant Scatter
-    y_axis_label = st.radio(
-        "Y-axis",
-        ["Absolute Profit", "Margin %"],
-        horizontal=True,
-        key="client_quadrant_y_axis",
-    )
-    y_mode = "margin_pct" if y_axis_label == "Margin %" else "profit"
-    quadrant_df, median_x, median_y = compute_client_quadrants(df_window, y_mode=y_mode)
-    quote_rollup = safe_quote_rollup(df_window, ["client"])
-    if len(quote_rollup) > 0 and "quoted_amount" in quote_rollup.columns:
-        valid_clients = quote_rollup[quote_rollup["quoted_amount"] > 0]["client"].unique().tolist()
-        quadrant_df = quadrant_df[quadrant_df["client"].isin(valid_clients)]
-
-    y_title = "Margin %" if y_mode == "margin_pct" else "Profit"
-    scatter_fig = charts.client_quadrant_scatter(
-        quadrant_df,
-        x_col="revenue",
-        y_col="y_value",
-        size_col="hours",
-        quadrant_col="quadrant",
-        median_x=median_x,
-        median_y=median_y,
-        title="Client Portfolio: Revenue vs Profitability",
-        x_title="Revenue",
-        y_title=y_title,
-    )
-    render_client_quadrant_scatter(scatter_fig)
-
-    quadrant_options = ["Partners", "Underperformers", "Niche", "Drain"]
-    selected_quadrant = st.selectbox(
-        "Focus Quadrant",
-        options=quadrant_options,
-        key="selected_client_quadrant",
-    )
+    y_mode, quadrant_df, selected_quadrant = _render_quadrant_and_focus_fragment(df_window)
 
     # SECTION 3 — Intervention Queue
-    mode_options = ["Intervention", "Growth"]
-    selected_mode = st.radio(
-        "Queue Mode",
-        options=mode_options,
-        key="client_queue_mode",
-        horizontal=True,
-    )
-    shortlist_size = st.slider(
-        "Shortlist Size",
-        min_value=5,
-        max_value=30,
-        value=int(get_state("client_shortlist_size") or 10),
-        step=1,
-        key="client_shortlist_size",
-    )
-
-    queue_df = compute_client_queue(df_window, selected_quadrant, selected_mode, y_mode=y_mode)
-    render_client_intervention_queue(queue_df, shortlist_size)
+    _render_intervention_queue_fragment(df_window, selected_quadrant, y_mode)
 
     # SECTION 4 — Selected Client Deep-Dive
     if len(quadrant_df) > 0:
@@ -302,7 +317,7 @@ def main():
         df_client_window = df_client_window[df_client_window["staff_name"] == selected_staff]
 
     client_rollup = profitability_rollup(df_client_window)
-    quote_rollup = safe_quote_rollup(df_client_window, [])
+    quote_rollup = safe_quote_rollup(df_client_window, ())
     quoted_revenue = np.nan
     quoted_hours = np.nan
     quoted_cost = np.nan
@@ -468,7 +483,7 @@ def main():
                 name="Cumulative Hours",
             )
         )
-        quote_rollup_total = safe_quote_rollup(df_client_window, [])
+        quote_rollup_total = safe_quote_rollup(df_client_window, ())
         if len(quote_rollup_total) > 0 and "quoted_hours" in quote_rollup_total.columns:
             quoted_hours = quote_rollup_total["quoted_hours"].iloc[0]
             if pd.notna(quoted_hours) and quoted_hours > 0:
@@ -520,7 +535,7 @@ def main():
             job_fin["margin"] / job_fin["revenue"] * 100,
             np.nan,
         )
-        quote_by_job = safe_quote_rollup(df_client_window, ["job_no"])
+        quote_by_job = safe_quote_rollup(df_client_window, ("job_no",))
         if len(quote_by_job) > 0:
             job_fin = job_fin.merge(
                 quote_by_job[["job_no", "quoted_hours"]],

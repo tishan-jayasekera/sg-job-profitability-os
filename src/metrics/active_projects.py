@@ -5,6 +5,7 @@ Single source of truth for: active job identification, risk flags, attribution.
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import Optional, List, Dict
 from datetime import datetime, timedelta
 
@@ -18,6 +19,7 @@ from src.data.semantic import get_category_col
 from src.config import config
 
 
+@st.cache_data(show_spinner=False)
 def get_active_jobs_table(df: pd.DataFrame,
                           recency_days: Optional[int] = None,
                           department: Optional[str] = None,
@@ -27,7 +29,7 @@ def get_active_jobs_table(df: pd.DataFrame,
     
     Returns DataFrame suitable for delivery control tower display.
     """
-    df_filtered = df.copy()
+    df_filtered = df
     
     if department:
         df_filtered = df_filtered[df_filtered["department_final"] == department]
@@ -38,6 +40,7 @@ def get_active_jobs_table(df: pd.DataFrame,
     return get_active_jobs_with_metrics(df_filtered, recency_days)
 
 
+@st.cache_data(show_spinner=False)
 def get_at_risk_jobs(df: pd.DataFrame,
                      risk_threshold: float = 100,
                      recency_days: Optional[int] = None) -> pd.DataFrame:
@@ -54,6 +57,7 @@ def get_at_risk_jobs(df: pd.DataFrame,
     return at_risk.sort_values("pct_quote_consumed", ascending=False)
 
 
+@st.cache_data(show_spinner=False)
 def get_jobs_by_risk_status(df: pd.DataFrame,
                             recency_days: Optional[int] = None) -> Dict[str, pd.DataFrame]:
     """
@@ -73,6 +77,7 @@ def get_jobs_by_risk_status(df: pd.DataFrame,
     }
 
 
+@st.cache_data(show_spinner=False)
 def get_risk_summary(df: pd.DataFrame,
                      recency_days: Optional[int] = None) -> Dict[str, int]:
     """
@@ -88,6 +93,7 @@ def get_risk_summary(df: pd.DataFrame,
     }
 
 
+@st.cache_data(show_spinner=False)
 def get_job_detail(df: pd.DataFrame, job_no: str) -> Dict:
     """
     Get detailed information for a single job.
@@ -124,6 +130,7 @@ def get_job_detail(df: pd.DataFrame, job_no: str) -> Dict:
     }
 
 
+@st.cache_data(show_spinner=False)
 def get_overrun_attribution(df: pd.DataFrame,
                             job_no: str,
                             n_tasks: int = 5,
@@ -160,6 +167,7 @@ def get_overrun_attribution(df: pd.DataFrame,
     }
 
 
+@st.cache_data(show_spinner=False)
 def get_jobs_due_soon(df: pd.DataFrame,
                       days: int = 14,
                       recency_days: Optional[int] = None) -> pd.DataFrame:
@@ -186,6 +194,7 @@ def get_jobs_due_soon(df: pd.DataFrame,
     return due_soon.sort_values("job_due_date")
 
 
+@st.cache_data(show_spinner=False)
 def compute_active_jobs_trend(df: pd.DataFrame,
                               time_key: str = "month_key") -> pd.DataFrame:
     """
@@ -214,6 +223,7 @@ def compute_active_jobs_trend(df: pd.DataFrame,
     return pd.DataFrame(trend_data)
 
 
+@st.cache_data(show_spinner=False)
 def get_delivery_control_view(df: pd.DataFrame,
                               recency_days: Optional[int] = None) -> pd.DataFrame:
     """

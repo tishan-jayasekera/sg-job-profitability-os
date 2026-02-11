@@ -3,6 +3,7 @@ Three Forces Rate Bridge decomposition.
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 
@@ -42,11 +43,12 @@ class RateBridgeResult:
     revenue_capture_pct: float
 
 
+@st.cache_data(show_spinner=False)
 def compute_rate_bridge(df: pd.DataFrame, job_df: Optional[pd.DataFrame] = None) -> RateBridgeResult:
     """
     Compute the three forces rate bridge decomposition.
     """
-    quote_totals = safe_quote_rollup(df, [])
+    quote_totals = safe_quote_rollup(df, ())
     total_quoted_hours = quote_totals["quoted_hours"].iloc[0] if len(quote_totals) > 0 else 0
     total_quoted_amount = quote_totals["quoted_amount"].iloc[0] if len(quote_totals) > 0 else 0
 
@@ -152,6 +154,7 @@ def compute_rate_bridge(df: pd.DataFrame, job_df: Optional[pd.DataFrame] = None)
     )
 
 
+@st.cache_data(show_spinner=False)
 def compute_rate_bridge_by_group(df: pd.DataFrame, group_key: str) -> pd.DataFrame:
     """
     Compute rate bridge for each group (e.g., department).
@@ -176,6 +179,7 @@ def compute_rate_bridge_by_group(df: pd.DataFrame, group_key: str) -> pd.DataFra
     return pd.DataFrame(results)
 
 
+@st.cache_data(show_spinner=False)
 def get_dominant_force(bridge: RateBridgeResult) -> Tuple[str, float, str]:
     """
     Identify the dominant force driving the rate gap.
@@ -188,6 +192,7 @@ def get_dominant_force(bridge: RateBridgeResult) -> Tuple[str, float, str]:
     return max(forces, key=lambda x: abs(x[1]))
 
 
+@st.cache_data(show_spinner=False)
 def generate_bridge_insight(bridge: RateBridgeResult) -> str:
     """
     Generate plain-English insight from bridge results.

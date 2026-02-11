@@ -64,6 +64,261 @@ def _staff_weekly_series(df: pd.DataFrame, staff_name: str) -> pd.DataFrame:
     return weekly.tail(12)
 
 
+@st.fragment
+def _render_active_jobs_overlay_fragment(
+    df: pd.DataFrame,
+    window: int,
+    selected_dept: str,
+    selected_category: str,
+    category_col: str,
+    headroom_df: pd.DataFrame,
+) -> None:
+    st.subheader("Section 2.1 — Active Jobs Demand Overlay")
+    active_job_ids = get_active_jobs(df)
+    df_active = df[df["job_no"].isin(active_job_ids)] if "job_no" in df.columns else pd.DataFrame()
+
+    if len(df_active) == 0:
+        st.info("No active jobs found for the selected filters.")
+        return
+
+    df_active = df_active.copy()
+    if "fte_hours_scaling" not in df_active.columns:
+        df_active["fte_hours_scaling"] = 1.0
+    df_active["fte_hours_scaling"] = df_active["fte_hours_scaling"].fillna(1.0)
+    window_capacity = config.CAPACITY_HOURS_PER_WEEK * window
+    df_active["fte_equiv_window"] = df_active["hours_raw"] / window_capacity if window_capacity > 0 else np.nan
+    df_active["fte_equiv_scaled"] = df_active["hours_raw"] / (window_capacity * df_active["fte_hours_scaling"])
+
+    overlay_cols = st.columns(2)
+    with overlay_cols[0]:
+        st.markdown("**Active Demand (Bottom‑Up by Task)**")
+        task_bottom = df_active.groupby("task_name").agg(
+            active_hours=("hours_raw", "sum"),
+            fte_equiv=("fte_equiv_window", "sum"),
+            fte_equiv_scaled=("fte_equiv_scaled", "sum"),
+        ).reset_index().sort_values("active_hours", ascending=False)
+
+        total_active_hours = task_bottom["active_hours"].sum()
+        total_fte = task_bottom["fte_equiv"].sum()
+        st.caption(
+            f"Bottom‑up active demand totals: {fmt_hours(total_active_hours)} hours "
+            f"(~{total_fte:.2f} FTE‑equiv across {window}w)."
+        )
+        st.dataframe(
+            task_bottom.head(12).rename(columns={
+                "task_name": "Task",
+                "active_hours": "Active Hours",
+                "fte_equiv": "FTE‑equiv (window)",
+                "fte_equiv_scaled": "FTE‑equiv (scaled)",
+            }),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Active Hours": st.column_config.NumberColumn(format="%.1f"),
+                "FTE‑equiv (window)": st.column_config.NumberColumn(format="%.2f"),
+                "FTE‑equiv (scaled)": st.column_config.NumberColumn(format="%.2f"),
+            },
+        )
+
+        st.markdown("**Active Job Task Demand vs Historical Benchmarks**")
+        task_active = df_active.groupby("task_name")["hours_raw"].sum().sort_values(ascending=False)
+        active_total = task_active.sum()
+        task_active = task_active.reset_index().rename(columns={"task_name": "Task", "hours_raw": "Active Hours"})
+        task_active["Active Share"] = task_active["Active Hours"] / active_total * 100 if active_total > 0 else np.nan
+
+        df_completed = df.copy()
+        if "job_completed_date" in df_completed.columns:
+            df_completed = df_completed[df_completed["job_completed_date"].notna()]
+        elif "job_status" in df_completed.columns:
+            df_completed = df_completed[df_completed["job_status"].str.lower().str.contains("completed", na=False)]
+        else:
+            df_completed = df_completed.iloc[0:0]
+
+        if selected_dept != "All":
+            df_completed = df_completed[df_completed["department_final"] == selected_dept]
+        if selected_category != "All":
+            df_completed = df_completed[df_completed[category_col] == selected_category]
+
+        bench = df_completed.groupby("task_name")["hours_raw"].sum()
+        bench_total = bench.sum()
+        bench = bench.reset_index().rename(columns={"task_name": "Task", "hours_raw": "Benchmark Hours"})
+        bench["Benchmark Share"] = bench["Benchmark Hours"] / bench_total * 100 if bench_total > 0 else np.nan
+
+        task_overlay = task_active.merge(bench[["Task", "Benchmark Share"]], on="Task", how="left")
+        task_overlay["Share Delta (pp)"] = task_overlay["Active Share"] - task_overlay["Benchmark Share"]
+
+        st.dataframe(
+            task_overlay.head(12),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Active Hours": st.column_config.NumberColumn(format="%.1f"),
+                "Active Share": st.column_config.NumberColumn(format="%.1f%%"),
+                "Benchmark Share": st.column_config.NumberColumn(format="%.1f%%"),
+                "Share Delta (pp)": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
+        st.caption("Benchmark share is derived from completed jobs in the same department/category.")
+
+    with overlay_cols[1]:
+        st.markdown("**Active Demand (Bottom‑Up by Job)**")
+        if "job_no" in df_active.columns:
+            job_bottom = df_active.groupby("job_no").agg(
+                active_hours=("hours_raw", "sum"),
+                fte_equiv=("fte_equiv_window", "sum"),
+            ).reset_index().sort_values("active_hours", ascending=False)
+            st.dataframe(
+                job_bottom.head(12).rename(columns={
+                    "job_no": "Job",
+                    "active_hours": "Active Hours",
+                    "fte_equiv": "FTE‑equiv (window)",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Active Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "FTE‑equiv (window)": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+        else:
+            st.caption("Job numbers are not available in this dataset.")
+
+        st.markdown("**Active Job Staffing Capacity Forecast**")
+        active_staff = df_active.groupby("staff_name")["hours_raw"].sum().rename("active_hours").reset_index()
+        cols = ["staff_name", "headroom_hours", "capacity_hours_window", "capacity_hours_week"]
+        available_cols = [c for c in cols if c in headroom_df.columns]
+        staff_capacity = headroom_df[available_cols].copy()
+        staff_view = active_staff.merge(staff_capacity, on="staff_name", how="left")
+        staff_view["forecast_available_hours"] = staff_view["headroom_hours"].fillna(0)
+        staff_view = staff_view.sort_values("active_hours", ascending=False)
+
+        st.dataframe(
+            staff_view.head(12).rename(columns={
+                "staff_name": "Staff",
+                "active_hours": "Active Hours (window)",
+                "headroom_hours": "Headroom (window)",
+                "capacity_hours_week": "Capacity / week",
+                "forecast_available_hours": "Forecast Available",
+            }),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Active Hours (window)": st.column_config.NumberColumn(format="%.1f"),
+                "Headroom (window)": st.column_config.NumberColumn(format="%.1f"),
+                "Capacity / week": st.column_config.NumberColumn(format="%.1f"),
+                "Forecast Available": st.column_config.NumberColumn(format="%.1f"),
+            },
+        )
+        st.caption("Forecast available uses headroom from trailing window.")
+
+
+@st.fragment
+def _render_staff_profiles_fragment(
+    profiles: pd.DataFrame,
+    category_expertise: pd.DataFrame,
+    selected_dept: str,
+    selected_category: str,
+    df: pd.DataFrame,
+    task_expertise: pd.DataFrame,
+) -> None:
+    st.subheader("Section 4 — Staff Profiles (Action View)")
+    filter_cols = st.columns([0.3, 0.3, 0.4])
+    with filter_cols[0]:
+        search = st.text_input("Search staff", "")
+    with filter_cols[1]:
+        only_positive_headroom = st.checkbox("Only positive headroom", value=False)
+    with filter_cols[2]:
+        only_relevant = st.checkbox("Only relevant to selected category", value=False)
+
+    display = profiles.copy()
+    display["billable_pct"] = display["billable_ratio"] * 100
+
+    if search:
+        display = display[display["staff_name"].str.contains(search, case=False, na=False)]
+    if only_positive_headroom:
+        display = display[display["headroom_hours"] > 0]
+    if selected_dept != "All":
+        display = display[display["department_final"] == selected_dept]
+
+    cat_scores = category_expertise.copy()
+    if selected_category != "All":
+        cat_scores = cat_scores[cat_scores["category_rev_job"] == selected_category]
+    cat_scores = cat_scores.groupby("staff_name")["capability_score"].max().reset_index()
+    display = display.merge(cat_scores, on="staff_name", how="left")
+    if only_relevant:
+        display = display[display["capability_score"].fillna(0) > 0]
+
+    display_table = display[[
+        "staff_name", "department_final", "archetype",
+        "avg_hours_per_week", "billable_pct",
+        "headroom_hours", "capability_score", "active_jobs_count",
+    ]].rename(columns={
+        "staff_name": "Name",
+        "department_final": "Dept",
+        "archetype": "Archetype",
+        "avg_hours_per_week": "Hrs/Wk",
+        "billable_pct": "Bill%",
+        "headroom_hours": "Headroom (hrs)",
+        "capability_score": "Capability (cat)",
+        "active_jobs_count": "Jobs",
+    })
+
+    selection = st.dataframe(
+        display_table,
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key="profiles_table",
+        column_config={
+            "Hrs/Wk": st.column_config.NumberColumn(format="%.1f"),
+            "Bill%": st.column_config.NumberColumn(format="%.1f%%"),
+            "Headroom (hrs)": st.column_config.NumberColumn(format="%.1f"),
+            "Capability (cat)": st.column_config.NumberColumn(format="%.0f"),
+        },
+    )
+
+    selected_staff = None
+    if selection and selection.selection and selection.selection.rows:
+        selected_idx = selection.selection.rows[0]
+        selected_staff = display.iloc[selected_idx]["staff_name"]
+
+    if not selected_staff:
+        return
+
+    st.subheader(f"Section 5 — Staff Deep‑Dive: {selected_staff}")
+    detail_cols = st.columns(3)
+    staff_row = profiles[profiles["staff_name"] == selected_staff].iloc[0]
+    with detail_cols[0]:
+        st.metric("Avg Hours / Week", fmt_hours(staff_row.get("avg_hours_per_week")))
+    with detail_cols[1]:
+        st.metric("Billable %", fmt_percent(staff_row.get("billable_ratio") * 100))
+    with detail_cols[2]:
+        st.metric("Headroom (hrs)", fmt_hours(staff_row.get("headroom_hours")))
+
+    weekly = _staff_weekly_series(df, selected_staff)
+    if len(weekly) > 0:
+        st.line_chart(weekly.set_index(weekly.columns[0])["hours_raw"])
+
+    staff_tasks = task_expertise[task_expertise["staff_name"] == selected_staff]
+    staff_cats = category_expertise[category_expertise["staff_name"] == selected_staff]
+
+    top_tasks = staff_tasks.nlargest(5, "capability_score")[["task_name", "capability_score", "hours_total"]]
+    top_cats = staff_cats.nlargest(3, "capability_score")[["category_rev_job", "capability_score", "hours_total"]]
+
+    if len(top_tasks) > 0:
+        st.markdown("**Top Tasks**")
+        st.dataframe(top_tasks, use_container_width=True, hide_index=True)
+    if len(top_cats) > 0:
+        st.markdown("**Top Categories**")
+        st.dataframe(top_cats, use_container_width=True, hide_index=True)
+    if "job_no" in df.columns:
+        jobs = df[df["staff_name"] == selected_staff].groupby("job_no")["hours_raw"].sum().reset_index()
+        jobs = jobs.rename(columns={"hours_raw": "hours"}).sort_values("hours", ascending=False).head(10)
+        st.markdown("**Active Jobs (Top 10 by hours)**")
+        st.dataframe(jobs, use_container_width=True, hide_index=True)
+
+
 def main():
     st.title("Capacity & Profiles")
     st.caption("Empirical capacity, capability, and coverage diagnostics (no targets)")
@@ -195,143 +450,14 @@ def main():
     # =========================
     # SECTION 2.1 — ACTIVE JOBS DEMAND OVERLAY
     # =========================
-    st.subheader("Section 2.1 — Active Jobs Demand Overlay")
-    active_job_ids = get_active_jobs(df)
-    df_active = df[df["job_no"].isin(active_job_ids)].copy() if "job_no" in df.columns else pd.DataFrame()
-
-    if len(df_active) > 0:
-        df_active = df_active.copy()
-        if "fte_hours_scaling" not in df_active.columns:
-            df_active["fte_hours_scaling"] = 1.0
-        df_active["fte_hours_scaling"] = df_active["fte_hours_scaling"].fillna(1.0)
-        window_capacity = config.CAPACITY_HOURS_PER_WEEK * window
-        df_active["fte_equiv_window"] = df_active["hours_raw"] / window_capacity if window_capacity > 0 else np.nan
-        df_active["fte_equiv_scaled"] = df_active["hours_raw"] / (window_capacity * df_active["fte_hours_scaling"])
-
-        overlay_cols = st.columns(2)
-        with overlay_cols[0]:
-            st.markdown("**Active Demand (Bottom‑Up by Task)**")
-            task_bottom = df_active.groupby("task_name").agg(
-                active_hours=("hours_raw", "sum"),
-                fte_equiv=("fte_equiv_window", "sum"),
-                fte_equiv_scaled=("fte_equiv_scaled", "sum"),
-            ).reset_index().sort_values("active_hours", ascending=False)
-
-            total_active_hours = task_bottom["active_hours"].sum()
-            total_fte = task_bottom["fte_equiv"].sum()
-            st.caption(
-                f"Bottom‑up active demand totals: {fmt_hours(total_active_hours)} hours "
-                f"(~{total_fte:.2f} FTE‑equiv across {window}w)."
-            )
-            st.dataframe(
-                task_bottom.head(12).rename(columns={
-                    "task_name": "Task",
-                    "active_hours": "Active Hours",
-                    "fte_equiv": "FTE‑equiv (window)",
-                    "fte_equiv_scaled": "FTE‑equiv (scaled)",
-                }),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Active Hours": st.column_config.NumberColumn(format="%.1f"),
-                    "FTE‑equiv (window)": st.column_config.NumberColumn(format="%.2f"),
-                    "FTE‑equiv (scaled)": st.column_config.NumberColumn(format="%.2f"),
-                },
-            )
-
-            st.markdown("**Active Job Task Demand vs Historical Benchmarks**")
-            task_active = df_active.groupby("task_name")["hours_raw"].sum().sort_values(ascending=False)
-            active_total = task_active.sum()
-            task_active = task_active.reset_index().rename(columns={"task_name": "Task", "hours_raw": "Active Hours"})
-            task_active["Active Share"] = task_active["Active Hours"] / active_total * 100 if active_total > 0 else np.nan
-
-            # Historical benchmarks: completed jobs in same chain
-            df_completed = df.copy()
-            if "job_completed_date" in df_completed.columns:
-                df_completed = df_completed[df_completed["job_completed_date"].notna()]
-            elif "job_status" in df_completed.columns:
-                df_completed = df_completed[df_completed["job_status"].str.lower().str.contains("completed", na=False)]
-            else:
-                df_completed = df_completed.iloc[0:0]
-
-            if selected_dept != "All":
-                df_completed = df_completed[df_completed["department_final"] == selected_dept]
-            if selected_category != "All":
-                df_completed = df_completed[df_completed[category_col] == selected_category]
-
-            bench = df_completed.groupby("task_name")["hours_raw"].sum()
-            bench_total = bench.sum()
-            bench = bench.reset_index().rename(columns={"task_name": "Task", "hours_raw": "Benchmark Hours"})
-            bench["Benchmark Share"] = bench["Benchmark Hours"] / bench_total * 100 if bench_total > 0 else np.nan
-
-            task_overlay = task_active.merge(bench[["Task", "Benchmark Share"]], on="Task", how="left")
-            task_overlay["Share Delta (pp)"] = task_overlay["Active Share"] - task_overlay["Benchmark Share"]
-
-            st.dataframe(
-                task_overlay.head(12),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Active Hours": st.column_config.NumberColumn(format="%.1f"),
-                    "Active Share": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Benchmark Share": st.column_config.NumberColumn(format="%.1f%%"),
-                    "Share Delta (pp)": st.column_config.NumberColumn(format="%.1f"),
-                },
-            )
-            st.caption("Benchmark share is derived from completed jobs in the same department/category.")
-
-        with overlay_cols[1]:
-            st.markdown("**Active Demand (Bottom‑Up by Job)**")
-            if "job_no" in df_active.columns:
-                job_bottom = df_active.groupby("job_no").agg(
-                    active_hours=("hours_raw", "sum"),
-                    fte_equiv=("fte_equiv_window", "sum"),
-                ).reset_index().sort_values("active_hours", ascending=False)
-                st.dataframe(
-                    job_bottom.head(12).rename(columns={
-                        "job_no": "Job",
-                        "active_hours": "Active Hours",
-                        "fte_equiv": "FTE‑equiv (window)",
-                    }),
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "Active Hours": st.column_config.NumberColumn(format="%.1f"),
-                        "FTE‑equiv (window)": st.column_config.NumberColumn(format="%.2f"),
-                    },
-                )
-            else:
-                st.caption("Job numbers are not available in this dataset.")
-
-            st.markdown("**Active Job Staffing Capacity Forecast**")
-            active_staff = df_active.groupby("staff_name")["hours_raw"].sum().rename("active_hours").reset_index()
-            cols = ["staff_name", "headroom_hours", "capacity_hours_window", "capacity_hours_week"]
-            available_cols = [c for c in cols if c in headroom_df.columns]
-            staff_capacity = headroom_df[available_cols].copy()
-            staff_view = active_staff.merge(staff_capacity, on="staff_name", how="left")
-            staff_view["forecast_available_hours"] = staff_view["headroom_hours"].fillna(0)
-            staff_view = staff_view.sort_values("active_hours", ascending=False)
-
-            st.dataframe(
-                staff_view.head(12).rename(columns={
-                    "staff_name": "Staff",
-                    "active_hours": "Active Hours (window)",
-                    "headroom_hours": "Headroom (window)",
-                    "capacity_hours_week": "Capacity / week",
-                    "forecast_available_hours": "Forecast Available",
-                }),
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Active Hours (window)": st.column_config.NumberColumn(format="%.1f"),
-                    "Headroom (window)": st.column_config.NumberColumn(format="%.1f"),
-                    "Capacity / week": st.column_config.NumberColumn(format="%.1f"),
-                    "Forecast Available": st.column_config.NumberColumn(format="%.1f"),
-                },
-            )
-            st.caption("Forecast available uses headroom from trailing window.")
-    else:
-        st.info("No active jobs found for the selected filters.")
+    _render_active_jobs_overlay_fragment(
+        df=df,
+        window=window,
+        selected_dept=selected_dept,
+        selected_category=selected_category,
+        category_col=category_col,
+        headroom_df=headroom_df,
+    )
 
     # =========================
     # SECTION 3 — COVERAGE & CAPABILITY RISK
@@ -377,105 +503,14 @@ def main():
     # =========================
     # SECTION 4 — STAFF PROFILES (ACTION VIEW)
     # =========================
-    st.subheader("Section 4 — Staff Profiles (Action View)")
-    filter_cols = st.columns([0.3, 0.3, 0.4])
-    with filter_cols[0]:
-        search = st.text_input("Search staff", "")
-    with filter_cols[1]:
-        only_positive_headroom = st.checkbox("Only positive headroom", value=False)
-    with filter_cols[2]:
-        only_relevant = st.checkbox("Only relevant to selected category", value=False)
-
-    display = profiles.copy()
-    display["billable_pct"] = display["billable_ratio"] * 100
-
-    if search:
-        display = display[display["staff_name"].str.contains(search, case=False, na=False)]
-
-    if only_positive_headroom:
-        display = display[display["headroom_hours"] > 0]
-
-    if selected_dept != "All":
-        display = display[display["department_final"] == selected_dept]
-
-    cat_scores = category_expertise.copy()
-    if selected_category != "All":
-        cat_scores = cat_scores[cat_scores["category_rev_job"] == selected_category]
-    cat_scores = cat_scores.groupby("staff_name")["capability_score"].max().reset_index()
-    display = display.merge(cat_scores, on="staff_name", how="left")
-
-    if only_relevant:
-        display = display[display["capability_score"].fillna(0) > 0]
-
-    display_table = display[[
-        "staff_name", "department_final", "archetype",
-        "avg_hours_per_week", "billable_pct",
-        "headroom_hours", "capability_score", "active_jobs_count",
-    ]].rename(columns={
-        "staff_name": "Name",
-        "department_final": "Dept",
-        "archetype": "Archetype",
-        "avg_hours_per_week": "Hrs/Wk",
-        "billable_pct": "Bill%",
-        "headroom_hours": "Headroom (hrs)",
-        "capability_score": "Capability (cat)",
-        "active_jobs_count": "Jobs",
-    })
-
-    selection = st.dataframe(
-        display_table,
-        use_container_width=True,
-        hide_index=True,
-        on_select="rerun",
-        selection_mode="single-row",
-        key="profiles_table",
-        column_config={
-            "Hrs/Wk": st.column_config.NumberColumn(format="%.1f"),
-            "Bill%": st.column_config.NumberColumn(format="%.1f%%"),
-            "Headroom (hrs)": st.column_config.NumberColumn(format="%.1f"),
-            "Capability (cat)": st.column_config.NumberColumn(format="%.0f"),
-        },
+    _render_staff_profiles_fragment(
+        profiles=profiles,
+        category_expertise=category_expertise,
+        selected_dept=selected_dept,
+        selected_category=selected_category,
+        df=df,
+        task_expertise=task_expertise,
     )
-    
-    selected_staff = None
-    if selection and selection.selection and selection.selection.rows:
-        selected_idx = selection.selection.rows[0]
-        selected_staff = display.iloc[selected_idx]["staff_name"]
-    
-    if selected_staff:
-        st.subheader(f"Section 5 — Staff Deep‑Dive: {selected_staff}")
-        detail_cols = st.columns(3)
-        staff_row = profiles[profiles["staff_name"] == selected_staff].iloc[0]
-        with detail_cols[0]:
-            st.metric("Avg Hours / Week", fmt_hours(staff_row.get("avg_hours_per_week")))
-        with detail_cols[1]:
-            st.metric("Billable %", fmt_percent(staff_row.get("billable_ratio") * 100))
-        with detail_cols[2]:
-            st.metric("Headroom (hrs)", fmt_hours(staff_row.get("headroom_hours")))
-
-        weekly = _staff_weekly_series(df, selected_staff)
-        if len(weekly) > 0:
-            st.line_chart(weekly.set_index(weekly.columns[0])["hours_raw"])
-        
-        staff_tasks = task_expertise[task_expertise["staff_name"] == selected_staff]
-        staff_cats = category_expertise[category_expertise["staff_name"] == selected_staff]
-        
-        top_tasks = staff_tasks.nlargest(5, "capability_score")[["task_name", "capability_score", "hours_total"]]
-        top_cats = staff_cats.nlargest(3, "capability_score")[["category_rev_job", "capability_score", "hours_total"]]
-        
-        if len(top_tasks) > 0:
-            st.markdown("**Top Tasks**")
-            st.dataframe(top_tasks, use_container_width=True, hide_index=True)
-        
-        if len(top_cats) > 0:
-            st.markdown("**Top Categories**")
-            st.dataframe(top_cats, use_container_width=True, hide_index=True)
-        
-        if "job_no" in df.columns:
-            jobs = df[df["staff_name"] == selected_staff].groupby("job_no")["hours_raw"].sum().reset_index()
-            jobs = jobs.rename(columns={"hours_raw": "hours"}).sort_values("hours", ascending=False).head(10)
-            st.markdown("**Active Jobs (Top 10 by hours)**")
-            st.dataframe(jobs, use_container_width=True, hide_index=True)
     
     st.divider()
     

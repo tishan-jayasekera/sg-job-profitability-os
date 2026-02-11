@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 
 from src.config import config
 from src.data.semantic import leave_exclusion_mask, get_category_col
@@ -31,6 +32,7 @@ def _filter_training_window(df: pd.DataFrame, months: int) -> pd.DataFrame:
     return df[pd.to_datetime(df[date_col]) >= cutoff].copy()
 
 
+@st.cache_data(show_spinner=False)
 def compute_staff_capacity(df: pd.DataFrame, window_weeks: int = 4) -> pd.DataFrame:
     """
     Compute pure supply capacity per staff.
@@ -62,6 +64,7 @@ def compute_staff_capacity(df: pd.DataFrame, window_weeks: int = 4) -> pd.DataFr
     return staff_info
 
 
+@st.cache_data(show_spinner=False)
 def compute_staff_load(df: pd.DataFrame, window_weeks: int = 4) -> pd.DataFrame:
     """
     Compute empirical load from timesheet data.
@@ -121,6 +124,7 @@ def compute_staff_load(df: pd.DataFrame, window_weeks: int = 4) -> pd.DataFrame:
     return agg
 
 
+@st.cache_data(show_spinner=False)
 def compute_expected_load(df: pd.DataFrame,
                           trailing_weeks: int = 4,
                           forecast_weeks: int = 4) -> pd.DataFrame:
@@ -142,6 +146,7 @@ def compute_expected_load(df: pd.DataFrame,
     return load[["staff_name", "avg_weekly_hours", "expected_load_hours"]]
 
 
+@st.cache_data(show_spinner=False)
 def compute_headroom(capacity_df: pd.DataFrame,
                      expected_load_df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -182,6 +187,7 @@ def _months_since_last(date_series: pd.Series, reference: pd.Timestamp) -> float
     return max(months, 0)
 
 
+@st.cache_data(show_spinner=False)
 def compute_task_expertise(df: pd.DataFrame,
                            training_months: int = 12,
                            recency_half_life: int = 6) -> pd.DataFrame:
@@ -241,6 +247,7 @@ def compute_task_expertise(df: pd.DataFrame,
     return agg.drop(columns=["staff_total_hours", "task_max_weighted"])
 
 
+@st.cache_data(show_spinner=False)
 def compute_category_expertise(df: pd.DataFrame,
                                training_months: int = 12,
                                recency_half_life: int = 6) -> pd.DataFrame:
@@ -401,6 +408,7 @@ def compute_context_switching(df: pd.DataFrame,
     return agg
 
 
+@st.cache_data(show_spinner=False)
 def build_staff_profiles(df: pd.DataFrame,
                          window_weeks: int = 4,
                          training_months: int = 12,

@@ -171,6 +171,409 @@ def _style_spare_negative(df: pd.DataFrame, label_col: str = "Campaign") -> pd.i
     return styled
 
 
+@st.fragment
+def _render_staff_detail_fragment(
+    staff_summary: pd.DataFrame,
+    staff_job_month: pd.DataFrame,
+    staff_job_tasks: pd.DataFrame,
+    job_meta: pd.DataFrame,
+    months_in_period: list[pd.Timestamp],
+    num_months: int,
+    df_scope: pd.DataFrame,
+    job_name_lookup: dict,
+) -> None:
+    st.markdown("### Staff Detail")
+
+    month_labels = [_month_label(m) for m in months_in_period]
+    month_label_map = {m: _month_label(m) for m in months_in_period}
+
+    for _, staff_row in staff_summary.iterrows():
+        staff_name = staff_row["staff_name"]
+        staff_home_dept = staff_row["staff_home_dept"]
+        fte_scaling = staff_row["fte_scaling"]
+        capacity_pm = staff_row["capacity_pm"]
+        avg_load_pm = staff_row["avg_load_pm"]
+        spare_pm = staff_row["spare_pm"]
+        util_pct = staff_row["util_pct"]
+        campaigns = int(staff_row["campaign_count"])
+        status = staff_row["status"]
+
+        expander_label = (
+            f"{staff_name} | Home: {staff_home_dept} | FTE: {fte_scaling:.2f} | "
+            f"Cap: {capacity_pm:.1f} hrs/mo | Load: {avg_load_pm:.1f} hrs/mo ({campaigns} campaigns) | "
+            f"Spare: {spare_pm:.1f} hrs/mo | Util: {util_pct:.1f}% {status}"
+        )
+
+        with st.expander(expander_label, expanded=False):
+            staff_month = staff_job_month[staff_job_month["staff_name"] == staff_name]
+            if len(staff_month) == 0:
+                st.info("No campaign activity in period.")
+                continue
+
+            pivot = staff_month.pivot_table(
+                index="job_no",
+                columns="month_key",
+                values="hours_raw",
+                aggfunc="sum",
+                fill_value=0.0,
+            )
+            pivot = pivot.reindex(columns=months_in_period, fill_value=0.0)
+            pivot.columns = [month_label_map[m] for m in months_in_period]
+            table = pivot.reset_index()
+
+            table = table.merge(job_meta, on="job_no", how="left")
+            table = table.merge(
+                staff_job_tasks[staff_job_tasks["staff_name"] == staff_name],
+                on="job_no",
+                how="left",
+            )
+            table["tasks"] = table["tasks"].fillna(0).astype(int)
+
+            table["Campaign"] = table["job_no"].apply(lambda x: format_job_label(x, job_name_lookup))
+            table["Job Dept"] = table["department_final"].fillna("(Unknown)")
+            table["Category"] = table["category_display"].fillna("(No Category)")
+            table["Cross-Dept?"] = np.where(
+                table["department_final"] != staff_home_dept,
+                "Yes",
+                "No",
+            )
+
+            table["Avg hrs/mo"] = table[month_labels].sum(axis=1) / num_months
+            table["% of Load"] = np.where(
+                avg_load_pm > 0,
+                table["Avg hrs/mo"] / avg_load_pm * 100,
+                0.0,
+            )
+
+            job_options = table[["job_no", "Campaign", "Avg hrs/mo"]].copy()
+            job_options = job_options.sort_values("Avg hrs/mo", ascending=False)
+
+            display_cols = ["Campaign", "Job Dept", "Category", "Cross-Dept?"] + month_labels + [
+                "Avg hrs/mo",
+                "% of Load",
+                "tasks",
+            ]
+            table = table[display_cols]
+            table = table.rename(columns={"tasks": "Tasks"})
+            table = table.sort_values("Avg hrs/mo", ascending=False)
+
+            totals_month = table[month_labels].sum()
+            total_row = {
+                "Campaign": "TOTAL",
+                "Job Dept": "",
+                "Category": "",
+                "Cross-Dept?": "",
+                **{m: float(totals_month[m]) for m in month_labels},
+                "Avg hrs/mo": float(avg_load_pm),
+                "% of Load": 100.0,
+                "Tasks": "",
+            }
+            capacity_row = {
+                "Campaign": "Capacity",
+                "Job Dept": "",
+                "Category": "",
+                "Cross-Dept?": "",
+                **{m: float(capacity_pm) for m in month_labels},
+                "Avg hrs/mo": float(capacity_pm),
+                "% of Load": "",
+                "Tasks": "",
+            }
+            spare_row = {
+                "Campaign": "Spare",
+                "Job Dept": "",
+                "Category": "",
+                "Cross-Dept?": "",
+                **{m: float(capacity_pm - totals_month[m]) for m in month_labels},
+                "Avg hrs/mo": float(capacity_pm - avg_load_pm),
+                "% of Load": "",
+                "Tasks": "",
+            }
+
+            table_final = pd.concat(
+                [table, pd.DataFrame([total_row, capacity_row, spare_row])],
+                ignore_index=True,
+            )
+
+            numeric_cols = month_labels + ["Avg hrs/mo", "% of Load"]
+            for col in numeric_cols:
+                table_final[col] = pd.to_numeric(table_final[col], errors="coerce").round(1)
+
+            styled = _style_spare_negative(table_final, label_col="Campaign")
+            st.dataframe(styled, use_container_width=True, hide_index=True)
+            _download_button(
+                f"Download {staff_name} campaign load CSV",
+                table_final,
+                f"{staff_name}_campaign_load.csv",
+                key=f"download_staff_{staff_name}",
+            )
+
+            st.markdown("**Task Drill-Down**")
+            selected_job_no = st.selectbox(
+                "Drill into campaign",
+                options=job_options["job_no"].tolist(),
+                format_func=lambda x: format_job_label(x, job_name_lookup),
+                key=f"drill_{staff_name}",
+            )
+
+            df_task = df_scope[
+                (df_scope["staff_name"] == staff_name)
+                & (df_scope["job_no"] == selected_job_no)
+            ].copy()
+
+            if len(df_task) == 0:
+                st.info("No tasks found for this campaign in the period.")
+                continue
+
+            df_task["task_name"] = df_task["task_name"].fillna("(No Task)")
+            task_month = (
+                df_task.groupby(["task_name", "month_key"], dropna=False)["hours_raw"]
+                .sum()
+                .reset_index()
+            )
+            task_pivot = task_month.pivot_table(
+                index="task_name",
+                columns="month_key",
+                values="hours_raw",
+                aggfunc="sum",
+                fill_value=0.0,
+            )
+            task_pivot = task_pivot.reindex(columns=months_in_period, fill_value=0.0)
+            task_pivot.columns = month_labels
+            task_table = task_pivot.reset_index()
+            task_table["Total"] = task_table[month_labels].sum(axis=1)
+            task_table["Avg hrs/mo"] = task_table["Total"] / num_months
+
+            task_table[month_labels + ["Total", "Avg hrs/mo"]] = task_table[
+                month_labels + ["Total", "Avg hrs/mo"]
+            ].round(1)
+
+            st.dataframe(task_table, use_container_width=True, hide_index=True)
+            _download_button(
+                f"Download {staff_name} task drill CSV",
+                task_table,
+                f"{staff_name}_{selected_job_no}_task_drill.csv",
+                key=f"download_task_{staff_name}",
+            )
+
+
+@st.fragment
+def _render_cross_dept_fragment(
+    df_scope: pd.DataFrame,
+    selected_staff_home: str,
+    selected_job_dept: str,
+    num_months: int,
+    total_hours_pm: float,
+) -> float | None:
+    flow_total_hours_period = None
+
+    if selected_staff_home == "All" and selected_job_dept == "All":
+        return flow_total_hours_period
+
+    st.subheader("Cross-Departmental Work Flow")
+
+    if selected_staff_home != "All":
+        st.markdown(f"**Outbound — Where does {selected_staff_home} staff time go?**")
+        outbound = (
+            df_scope.groupby("department_final", dropna=False)
+            .agg(
+                hours=("hours_raw", "sum"),
+                staff_involved=("staff_name", "nunique"),
+                campaigns=("job_no", "nunique"),
+            )
+            .reset_index()
+        )
+        outbound["Hours p/m"] = outbound["hours"] / num_months
+        outbound["% of Team Load"] = np.where(
+            total_hours_pm > 0,
+            outbound["Hours p/m"] / total_hours_pm * 100,
+            np.nan,
+        )
+        outbound["Job Department"] = outbound["department_final"].astype(str)
+        outbound["Job Department"] = np.where(
+            outbound["department_final"] == selected_staff_home,
+            outbound["Job Department"] + " ✓ (home)",
+            outbound["Job Department"],
+        )
+        outbound_display = outbound[[
+            "Job Department",
+            "Hours p/m",
+            "% of Team Load",
+            "staff_involved",
+            "campaigns",
+        ]].rename(columns={
+            "staff_involved": "Staff Involved",
+            "campaigns": "Campaigns",
+        })
+        flow_total_hours_period = outbound["Hours p/m"].sum() * num_months
+        outbound_display["Hours p/m"] = outbound_display["Hours p/m"].round(1)
+        outbound_display["% of Team Load"] = outbound_display["% of Team Load"].round(1)
+        outbound_display["Staff Involved"] = outbound_display["Staff Involved"].astype(int)
+        outbound_display["Campaigns"] = outbound_display["Campaigns"].astype(int)
+        outbound_display = outbound_display.sort_values("Hours p/m", ascending=False)
+
+        st.dataframe(outbound_display, use_container_width=True, hide_index=True)
+        _download_button(
+            "Download outbound flow CSV",
+            outbound_display,
+            "cross_dept_outbound.csv",
+            key="download_outbound",
+        )
+
+    if selected_job_dept != "All":
+        st.markdown(f"**Inbound — Where do staff on {selected_job_dept} campaigns come from?**")
+        inbound = (
+            df_scope.groupby("staff_home_dept", dropna=False)
+            .agg(
+                hours=("hours_raw", "sum"),
+                staff_count=("staff_name", "nunique"),
+                campaigns=("job_no", "nunique"),
+            )
+            .reset_index()
+        )
+        inbound["Hours p/m"] = inbound["hours"] / num_months
+        inbound["% of Work"] = np.where(
+            total_hours_pm > 0,
+            inbound["Hours p/m"] / total_hours_pm * 100,
+            np.nan,
+        )
+        inbound["Staff Home Dept"] = inbound["staff_home_dept"].astype(str)
+        inbound["Staff Home Dept"] = np.where(
+            inbound["staff_home_dept"] == selected_job_dept,
+            inbound["Staff Home Dept"] + " ✓ (home)",
+            inbound["Staff Home Dept"],
+        )
+        inbound_display = inbound[[
+            "Staff Home Dept",
+            "Hours p/m",
+            "% of Work",
+            "staff_count",
+            "campaigns",
+        ]].rename(columns={
+            "staff_count": "Staff Count",
+            "campaigns": "Campaigns",
+        })
+        if flow_total_hours_period is None:
+            flow_total_hours_period = inbound["Hours p/m"].sum() * num_months
+        inbound_display["Hours p/m"] = inbound_display["Hours p/m"].round(1)
+        inbound_display["% of Work"] = inbound_display["% of Work"].round(1)
+        inbound_display["Staff Count"] = inbound_display["Staff Count"].astype(int)
+        inbound_display["Campaigns"] = inbound_display["Campaigns"].astype(int)
+        inbound_display = inbound_display.sort_values("Hours p/m", ascending=False)
+
+        st.dataframe(inbound_display, use_container_width=True, hide_index=True)
+        _download_button(
+            "Download inbound flow CSV",
+            inbound_display,
+            "cross_dept_inbound.csv",
+            key="download_inbound",
+        )
+
+    return flow_total_hours_period
+
+
+@st.fragment
+def _render_campaign_absorption_fragment(
+    df_scope: pd.DataFrame,
+    staff_summary: pd.DataFrame,
+) -> None:
+    st.subheader("How many more campaigns can we take on?")
+
+    benchmark_input = df_scope[["job_no", "category_display", "month_key", "hours_raw"]]
+    category_benchmarks = compute_category_benchmarks(benchmark_input, "category_display")
+
+    if len(category_benchmarks) == 0:
+        st.info("No category benchmarks available for the selected period.")
+        return
+
+    total_spare_pm = staff_summary["spare_pm"].clip(lower=0).sum()
+    n_staff_with_spare = int((staff_summary["spare_pm"] > 0).sum())
+
+    safe_avg = category_benchmarks["avg_hrs_per_campaign_pm"].replace(0, np.nan)
+    safe_median = category_benchmarks["median_hrs_per_campaign_pm"].replace(0, np.nan)
+    safe_p75 = category_benchmarks["p75_hrs_per_campaign_pm"].replace(0, np.nan)
+
+    category_benchmarks["est_additional_avg"] = np.floor(total_spare_pm / safe_avg).fillna(0).astype(int)
+    category_benchmarks["est_additional_median"] = np.floor(total_spare_pm / safe_median).fillna(0).astype(int)
+    category_benchmarks["est_additional_p75"] = np.floor(total_spare_pm / safe_p75).fillna(0).astype(int)
+
+    bench_display = category_benchmarks.rename(columns={
+        "category_display": "Category",
+        "campaigns_in_sample": "Campaigns in Data",
+        "avg_hrs_per_campaign_pm": "Avg hrs/camp/mo",
+        "median_hrs_per_campaign_pm": "Median",
+        "p25_hrs_per_campaign_pm": "P25 (light)",
+        "p75_hrs_per_campaign_pm": "P75 (heavy)",
+        "est_additional_avg": "Est. +Campaigns (avg)",
+        "est_additional_p75": "Est. +Campaigns (P75 / conservative)",
+    })
+    bench_display = bench_display[[
+        "Category",
+        "Campaigns in Data",
+        "Avg hrs/camp/mo",
+        "Median",
+        "P25 (light)",
+        "P75 (heavy)",
+        "Est. +Campaigns (avg)",
+        "Est. +Campaigns (P75 / conservative)",
+    ]]
+    bench_display["Avg hrs/camp/mo"] = bench_display["Avg hrs/camp/mo"].round(1)
+    bench_display["Median"] = bench_display["Median"].round(1)
+    bench_display["P25 (light)"] = bench_display["P25 (light)"].round(1)
+    bench_display["P75 (heavy)"] = bench_display["P75 (heavy)"].round(1)
+    bench_display["Campaigns in Data"] = bench_display["Campaigns in Data"].astype(int)
+    bench_display["Est. +Campaigns (avg)"] = bench_display["Est. +Campaigns (avg)"].astype(int)
+    bench_display["Est. +Campaigns (P75 / conservative)"] = bench_display["Est. +Campaigns (P75 / conservative)"].astype(int)
+
+    st.dataframe(bench_display, use_container_width=True, hide_index=True)
+    _download_button(
+        "Download campaign absorption benchmarks CSV",
+        bench_display,
+        "campaign_absorption_benchmarks.csv",
+        key="download_absorption_benchmarks",
+    )
+
+    st.info(
+        "Estimates show how many additional campaigns the team could absorb if total spare capacity "
+        f"({total_spare_pm:.0f} hrs/mo across {n_staff_with_spare} staff with headroom) were fully allocated. "
+        "'Avg' basis uses historical average hours per campaign per month. 'P75 / conservative' basis "
+        "assumes heavier-than-average campaigns. Actual feasibility depends on individual staff availability "
+        "and skill match — check the per-staff breakdown above."
+    )
+
+    st.markdown("**Per-Staff Absorption (Avg Basis)**")
+    staff_spare = staff_summary[staff_summary["spare_pm"] > 0][["staff_name", "spare_pm"]].copy()
+    if len(staff_spare) == 0:
+        st.info("No staff with spare capacity in the selected period.")
+        return
+
+    categories = category_benchmarks["category_display"].tolist()
+    avg_values = category_benchmarks["avg_hrs_per_campaign_pm"].replace(0, np.nan).values
+    spare_values = staff_spare["spare_pm"].values.reshape(-1, 1)
+    absorb_matrix = np.floor(spare_values / avg_values.reshape(1, -1))
+    absorb_matrix = np.nan_to_num(absorb_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
+    absorb_df = pd.DataFrame(absorb_matrix.astype(int), columns=[f"+{c} (avg)" for c in categories])
+    absorb_df.insert(0, "Staff", staff_spare["staff_name"].values)
+    absorb_df.insert(1, "Spare p/m", staff_spare["spare_pm"].round(1).values)
+
+    team_total = {
+        "Staff": "Team Total",
+        "Spare p/m": total_spare_pm,
+    }
+    for cat, avg_val in zip(categories, avg_values):
+        team_total[f"+{cat} (avg)"] = int(np.floor(total_spare_pm / avg_val)) if avg_val and avg_val > 0 else 0
+    absorb_df = pd.concat([absorb_df, pd.DataFrame([team_total])], ignore_index=True)
+    absorb_df["Spare p/m"] = pd.to_numeric(absorb_df["Spare p/m"], errors="coerce").round(1)
+
+    st.dataframe(absorb_df, use_container_width=True, hide_index=True)
+    _download_button(
+        "Download per-staff absorption CSV",
+        absorb_df,
+        "per_staff_absorption.csv",
+        key="download_per_staff_absorption",
+    )
+
+
 # =========================
 # Main
 # =========================
@@ -460,11 +863,6 @@ def main() -> None:
         key="download_staff_summary",
     )
 
-    st.markdown("### Staff Detail")
-
-    month_labels = [_month_label(m) for m in months_in_period]
-    month_label_map = {m: _month_label(m) for m in months_in_period}
-
     staff_job_month = (
         df_scope.groupby(["staff_name", "job_no", "month_key"], dropna=False)["hours_raw"]
         .sum()
@@ -486,379 +884,38 @@ def main() -> None:
     )
     job_name_lookup = build_job_name_lookup(df_scope)
 
-    for _, staff_row in staff_summary.iterrows():
-        staff_name = staff_row["staff_name"]
-        staff_home_dept = staff_row["staff_home_dept"]
-        fte_scaling = staff_row["fte_scaling"]
-        capacity_pm = staff_row["capacity_pm"]
-        avg_load_pm = staff_row["avg_load_pm"]
-        spare_pm = staff_row["spare_pm"]
-        util_pct = staff_row["util_pct"]
-        campaigns = int(staff_row["campaign_count"])
-        status = staff_row["status"]
-
-        expander_label = (
-            f"{staff_name} | Home: {staff_home_dept} | FTE: {fte_scaling:.2f} | "
-            f"Cap: {capacity_pm:.1f} hrs/mo | Load: {avg_load_pm:.1f} hrs/mo ({campaigns} campaigns) | "
-            f"Spare: {spare_pm:.1f} hrs/mo | Util: {util_pct:.1f}% {status}"
-        )
-
-        with st.expander(expander_label, expanded=False):
-            staff_month = staff_job_month[staff_job_month["staff_name"] == staff_name]
-            if len(staff_month) == 0:
-                st.info("No campaign activity in period.")
-                continue
-
-            pivot = staff_month.pivot_table(
-                index="job_no",
-                columns="month_key",
-                values="hours_raw",
-                aggfunc="sum",
-                fill_value=0.0,
-            )
-            pivot = pivot.reindex(columns=months_in_period, fill_value=0.0)
-            pivot.columns = [month_label_map[m] for m in months_in_period]
-            table = pivot.reset_index()
-
-            table = table.merge(job_meta, on="job_no", how="left")
-            table = table.merge(
-                staff_job_tasks[staff_job_tasks["staff_name"] == staff_name],
-                on="job_no",
-                how="left",
-            )
-            table["tasks"] = table["tasks"].fillna(0).astype(int)
-
-            table["Campaign"] = table["job_no"].apply(lambda x: format_job_label(x, job_name_lookup))
-            table["Job Dept"] = table["department_final"].fillna("(Unknown)")
-            table["Category"] = table["category_display"].fillna("(No Category)")
-            table["Cross-Dept?"] = np.where(
-                table["department_final"] != staff_home_dept,
-                "Yes",
-                "No",
-            )
-
-            table["Avg hrs/mo"] = table[month_labels].sum(axis=1) / num_months
-            table["% of Load"] = np.where(
-                avg_load_pm > 0,
-                table["Avg hrs/mo"] / avg_load_pm * 100,
-                0.0,
-            )
-
-            job_options = table[["job_no", "Campaign", "Avg hrs/mo"]].copy()
-            job_options = job_options.sort_values("Avg hrs/mo", ascending=False)
-
-            display_cols = ["Campaign", "Job Dept", "Category", "Cross-Dept?"] + month_labels + [
-                "Avg hrs/mo",
-                "% of Load",
-                "tasks",
-            ]
-            table = table[display_cols]
-            table = table.rename(columns={"tasks": "Tasks"})
-            table = table.sort_values("Avg hrs/mo", ascending=False)
-
-            totals_month = table[month_labels].sum()
-            total_row = {
-                "Campaign": "TOTAL",
-                "Job Dept": "",
-                "Category": "",
-                "Cross-Dept?": "",
-                **{m: float(totals_month[m]) for m in month_labels},
-                "Avg hrs/mo": float(avg_load_pm),
-                "% of Load": 100.0,
-                "Tasks": "",
-            }
-            capacity_row = {
-                "Campaign": "Capacity",
-                "Job Dept": "",
-                "Category": "",
-                "Cross-Dept?": "",
-                **{m: float(capacity_pm) for m in month_labels},
-                "Avg hrs/mo": float(capacity_pm),
-                "% of Load": "",
-                "Tasks": "",
-            }
-            spare_row = {
-                "Campaign": "Spare",
-                "Job Dept": "",
-                "Category": "",
-                "Cross-Dept?": "",
-                **{m: float(capacity_pm - totals_month[m]) for m in month_labels},
-                "Avg hrs/mo": float(capacity_pm - avg_load_pm),
-                "% of Load": "",
-                "Tasks": "",
-            }
-
-            table_final = pd.concat(
-                [table, pd.DataFrame([total_row, capacity_row, spare_row])],
-                ignore_index=True,
-            )
-
-            numeric_cols = month_labels + ["Avg hrs/mo", "% of Load"]
-            for col in numeric_cols:
-                table_final[col] = pd.to_numeric(table_final[col], errors="coerce").round(1)
-
-            styled = _style_spare_negative(table_final, label_col="Campaign")
-            st.dataframe(styled, use_container_width=True, hide_index=True)
-            _download_button(
-                f"Download {staff_name} campaign load CSV",
-                table_final,
-                f"{staff_name}_campaign_load.csv",
-                key=f"download_staff_{staff_name}",
-            )
-
-            # Task drill-down
-            st.markdown("**Task Drill-Down**")
-            selected_job_no = st.selectbox(
-                "Drill into campaign",
-                options=job_options["job_no"].tolist(),
-                format_func=lambda x: format_job_label(x, job_name_lookup),
-                key=f"drill_{staff_name}",
-            )
-
-            df_task = df_scope[
-                (df_scope["staff_name"] == staff_name)
-                & (df_scope["job_no"] == selected_job_no)
-            ].copy()
-
-            if len(df_task) == 0:
-                st.info("No tasks found for this campaign in the period.")
-            else:
-                df_task["task_name"] = df_task["task_name"].fillna("(No Task)")
-                task_month = (
-                    df_task.groupby(["task_name", "month_key"], dropna=False)["hours_raw"]
-                    .sum()
-                    .reset_index()
-                )
-                task_pivot = task_month.pivot_table(
-                    index="task_name",
-                    columns="month_key",
-                    values="hours_raw",
-                    aggfunc="sum",
-                    fill_value=0.0,
-                )
-                task_pivot = task_pivot.reindex(columns=months_in_period, fill_value=0.0)
-                task_pivot.columns = month_labels
-                task_table = task_pivot.reset_index()
-                task_table["Total"] = task_table[month_labels].sum(axis=1)
-                task_table["Avg hrs/mo"] = task_table["Total"] / num_months
-
-                task_table[month_labels + ["Total", "Avg hrs/mo"]] = task_table[
-                    month_labels + ["Total", "Avg hrs/mo"]
-                ].round(1)
-
-                st.dataframe(task_table, use_container_width=True, hide_index=True)
-                _download_button(
-                    f"Download {staff_name} task drill CSV",
-                    task_table,
-                    f"{staff_name}_{selected_job_no}_task_drill.csv",
-                    key=f"download_task_{staff_name}",
-                )
+    _render_staff_detail_fragment(
+        staff_summary=staff_summary,
+        staff_job_month=staff_job_month,
+        staff_job_tasks=staff_job_tasks,
+        job_meta=job_meta,
+        months_in_period=months_in_period,
+        num_months=num_months,
+        df_scope=df_scope,
+        job_name_lookup=job_name_lookup,
+    )
 
     st.divider()
 
     # =========================
     # Section 4 — Cross-Departmental Flow
     # =========================
-    flow_total_hours_period = None
-    if selected_staff_home != "All" or selected_job_dept != "All":
-        st.subheader("Cross-Departmental Work Flow")
-
-        if selected_staff_home != "All":
-            st.markdown(f"**Outbound — Where does {selected_staff_home} staff time go?**")
-            outbound = (
-                df_scope.groupby("department_final", dropna=False)
-                .agg(
-                    hours=("hours_raw", "sum"),
-                    staff_involved=("staff_name", "nunique"),
-                    campaigns=("job_no", "nunique"),
-                )
-                .reset_index()
-            )
-            outbound["Hours p/m"] = outbound["hours"] / num_months
-            outbound["% of Team Load"] = np.where(
-                total_hours_pm > 0,
-                outbound["Hours p/m"] / total_hours_pm * 100,
-                np.nan,
-            )
-            outbound["Job Department"] = outbound["department_final"].astype(str)
-            if selected_staff_home != "All":
-                outbound["Job Department"] = np.where(
-                    outbound["department_final"] == selected_staff_home,
-                    outbound["Job Department"] + " ✓ (home)",
-                    outbound["Job Department"],
-                )
-            outbound_display = outbound[[
-                "Job Department",
-                "Hours p/m",
-                "% of Team Load",
-                "staff_involved",
-                "campaigns",
-            ]].rename(columns={
-                "staff_involved": "Staff Involved",
-                "campaigns": "Campaigns",
-            })
-            flow_total_hours_period = outbound["Hours p/m"].sum() * num_months
-            outbound_display["Hours p/m"] = outbound_display["Hours p/m"].round(1)
-            outbound_display["% of Team Load"] = outbound_display["% of Team Load"].round(1)
-            outbound_display["Staff Involved"] = outbound_display["Staff Involved"].astype(int)
-            outbound_display["Campaigns"] = outbound_display["Campaigns"].astype(int)
-            outbound_display = outbound_display.sort_values("Hours p/m", ascending=False)
-
-            st.dataframe(outbound_display, use_container_width=True, hide_index=True)
-            _download_button(
-                "Download outbound flow CSV",
-                outbound_display,
-                "cross_dept_outbound.csv",
-                key="download_outbound",
-            )
-        if selected_job_dept != "All":
-            st.markdown(f"**Inbound — Where do staff on {selected_job_dept} campaigns come from?**")
-            inbound = (
-                df_scope.groupby("staff_home_dept", dropna=False)
-                .agg(
-                    hours=("hours_raw", "sum"),
-                    staff_count=("staff_name", "nunique"),
-                    campaigns=("job_no", "nunique"),
-                )
-                .reset_index()
-            )
-            inbound["Hours p/m"] = inbound["hours"] / num_months
-            inbound["% of Work"] = np.where(
-                total_hours_pm > 0,
-                inbound["Hours p/m"] / total_hours_pm * 100,
-                np.nan,
-            )
-            inbound["Staff Home Dept"] = inbound["staff_home_dept"].astype(str)
-            if selected_job_dept != "All":
-                inbound["Staff Home Dept"] = np.where(
-                    inbound["staff_home_dept"] == selected_job_dept,
-                    inbound["Staff Home Dept"] + " ✓ (home)",
-                    inbound["Staff Home Dept"],
-                )
-            inbound_display = inbound[[
-                "Staff Home Dept",
-                "Hours p/m",
-                "% of Work",
-                "staff_count",
-                "campaigns",
-            ]].rename(columns={
-                "staff_count": "Staff Count",
-                "campaigns": "Campaigns",
-            })
-            if flow_total_hours_period is None:
-                flow_total_hours_period = inbound["Hours p/m"].sum() * num_months
-            inbound_display["Hours p/m"] = inbound_display["Hours p/m"].round(1)
-            inbound_display["% of Work"] = inbound_display["% of Work"].round(1)
-            inbound_display["Staff Count"] = inbound_display["Staff Count"].astype(int)
-            inbound_display["Campaigns"] = inbound_display["Campaigns"].astype(int)
-            inbound_display = inbound_display.sort_values("Hours p/m", ascending=False)
-
-            st.dataframe(inbound_display, use_container_width=True, hide_index=True)
-            _download_button(
-                "Download inbound flow CSV",
-                inbound_display,
-                "cross_dept_inbound.csv",
-                key="download_inbound",
-            )
+    flow_total_hours_period = _render_cross_dept_fragment(
+        df_scope=df_scope,
+        selected_staff_home=selected_staff_home,
+        selected_job_dept=selected_job_dept,
+        num_months=num_months,
+        total_hours_pm=total_hours_pm,
+    )
     st.divider()
 
     # =========================
     # Section 5 — Campaign Absorption Estimate
     # =========================
-    st.subheader("How many more campaigns can we take on?")
-
-    benchmark_input = df_scope[["job_no", "category_display", "month_key", "hours_raw"]].copy()
-    category_benchmarks = compute_category_benchmarks(benchmark_input, "category_display")
-
-    if len(category_benchmarks) == 0:
-        st.info("No category benchmarks available for the selected period.")
-    else:
-        total_spare_pm = staff_summary["spare_pm"].clip(lower=0).sum()
-        n_staff_with_spare = int((staff_summary["spare_pm"] > 0).sum())
-
-        safe_avg = category_benchmarks["avg_hrs_per_campaign_pm"].replace(0, np.nan)
-        safe_median = category_benchmarks["median_hrs_per_campaign_pm"].replace(0, np.nan)
-        safe_p75 = category_benchmarks["p75_hrs_per_campaign_pm"].replace(0, np.nan)
-
-        category_benchmarks["est_additional_avg"] = np.floor(total_spare_pm / safe_avg).fillna(0).astype(int)
-        category_benchmarks["est_additional_median"] = np.floor(total_spare_pm / safe_median).fillna(0).astype(int)
-        category_benchmarks["est_additional_p75"] = np.floor(total_spare_pm / safe_p75).fillna(0).astype(int)
-
-        bench_display = category_benchmarks.rename(columns={
-            "category_display": "Category",
-            "campaigns_in_sample": "Campaigns in Data",
-            "avg_hrs_per_campaign_pm": "Avg hrs/camp/mo",
-            "median_hrs_per_campaign_pm": "Median",
-            "p25_hrs_per_campaign_pm": "P25 (light)",
-            "p75_hrs_per_campaign_pm": "P75 (heavy)",
-            "est_additional_avg": "Est. +Campaigns (avg)",
-            "est_additional_p75": "Est. +Campaigns (P75 / conservative)",
-        })
-        bench_display = bench_display[[
-            "Category",
-            "Campaigns in Data",
-            "Avg hrs/camp/mo",
-            "Median",
-            "P25 (light)",
-            "P75 (heavy)",
-            "Est. +Campaigns (avg)",
-            "Est. +Campaigns (P75 / conservative)",
-        ]]
-        bench_display["Avg hrs/camp/mo"] = bench_display["Avg hrs/camp/mo"].round(1)
-        bench_display["Median"] = bench_display["Median"].round(1)
-        bench_display["P25 (light)"] = bench_display["P25 (light)"].round(1)
-        bench_display["P75 (heavy)"] = bench_display["P75 (heavy)"].round(1)
-        bench_display["Campaigns in Data"] = bench_display["Campaigns in Data"].astype(int)
-        bench_display["Est. +Campaigns (avg)"] = bench_display["Est. +Campaigns (avg)"].astype(int)
-        bench_display["Est. +Campaigns (P75 / conservative)"] = bench_display["Est. +Campaigns (P75 / conservative)"].astype(int)
-
-        st.dataframe(bench_display, use_container_width=True, hide_index=True)
-        _download_button(
-            "Download campaign absorption benchmarks CSV",
-            bench_display,
-            "campaign_absorption_benchmarks.csv",
-            key="download_absorption_benchmarks",
-        )
-
-        st.info(
-            "Estimates show how many additional campaigns the team could absorb if total spare capacity "
-            f"({total_spare_pm:.0f} hrs/mo across {n_staff_with_spare} staff with headroom) were fully allocated. "
-            "'Avg' basis uses historical average hours per campaign per month. 'P75 / conservative' basis "
-            "assumes heavier-than-average campaigns. Actual feasibility depends on individual staff availability "
-            "and skill match — check the per-staff breakdown above."
-        )
-
-        st.markdown("**Per-Staff Absorption (Avg Basis)**")
-        staff_spare = staff_summary[staff_summary["spare_pm"] > 0][["staff_name", "spare_pm"]].copy()
-        if len(staff_spare) == 0:
-            st.info("No staff with spare capacity in the selected period.")
-        else:
-            categories = category_benchmarks["category_display"].tolist()
-            avg_values = category_benchmarks["avg_hrs_per_campaign_pm"].replace(0, np.nan).values
-            spare_values = staff_spare["spare_pm"].values.reshape(-1, 1)
-            absorb_matrix = np.floor(spare_values / avg_values.reshape(1, -1))
-            absorb_matrix = np.nan_to_num(absorb_matrix, nan=0.0, posinf=0.0, neginf=0.0)
-
-            absorb_df = pd.DataFrame(absorb_matrix.astype(int), columns=[f"+{c} (avg)" for c in categories])
-            absorb_df.insert(0, "Staff", staff_spare["staff_name"].values)
-            absorb_df.insert(1, "Spare p/m", staff_spare["spare_pm"].round(1).values)
-
-            team_total = {
-                "Staff": "Team Total",
-                "Spare p/m": total_spare_pm,
-            }
-            for cat, avg_val in zip(categories, avg_values):
-                team_total[f"+{cat} (avg)"] = int(np.floor(total_spare_pm / avg_val)) if avg_val and avg_val > 0 else 0
-            absorb_df = pd.concat([absorb_df, pd.DataFrame([team_total])], ignore_index=True)
-            absorb_df["Spare p/m"] = pd.to_numeric(absorb_df["Spare p/m"], errors="coerce").round(1)
-
-            st.dataframe(absorb_df, use_container_width=True, hide_index=True)
-            _download_button(
-                "Download per-staff absorption CSV",
-                absorb_df,
-                "per_staff_absorption.csv",
-                key="download_per_staff_absorption",
-            )
+    _render_campaign_absorption_fragment(
+        df_scope=df_scope,
+        staff_summary=staff_summary,
+    )
 
     st.divider()
 

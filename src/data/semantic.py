@@ -5,6 +5,7 @@ CRITICAL: All aggregations must use these helpers to ensure consistency.
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import List, Optional, Dict, Any
 
 
@@ -48,7 +49,7 @@ def leave_exclusion_mask(df: pd.DataFrame) -> pd.Series:
 
 def exclude_leave(df: pd.DataFrame) -> pd.DataFrame:
     """Return dataframe with leave tasks excluded."""
-    return df[~leave_exclusion_mask(df)].copy()
+    return df[~leave_exclusion_mask(df)]
 
 
 def get_category_col(df: pd.DataFrame) -> str:
@@ -68,6 +69,7 @@ def get_category_col(df: pd.DataFrame) -> str:
 # Quote fields repeat on every row for the same (job_no, task_name).
 # We MUST dedupe at job-task level before summing to avoid inflation.
 
+@st.cache_data(show_spinner=False)
 def safe_quote_job_task(df: pd.DataFrame) -> pd.DataFrame:
     """
     Reduce to unique (job_no, task_name) with quote constants.
@@ -99,7 +101,8 @@ def safe_quote_job_task(df: pd.DataFrame) -> pd.DataFrame:
     return job_task
 
 
-def safe_quote_rollup(df: pd.DataFrame, group_keys: List[str]) -> pd.DataFrame:
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
+def safe_quote_rollup(df: pd.DataFrame, group_keys: tuple[str, ...] = ()) -> pd.DataFrame:
     """
     Safely roll up quote totals after deduping at job-task level.
     
@@ -110,6 +113,8 @@ def safe_quote_rollup(df: pd.DataFrame, group_keys: List[str]) -> pd.DataFrame:
     Returns:
         DataFrame with safe quote totals per group
     """
+    keys = list(group_keys)
+
     # First dedupe at job-task
     job_task = safe_quote_job_task(df)
     
@@ -118,8 +123,8 @@ def safe_quote_rollup(df: pd.DataFrame, group_keys: List[str]) -> pd.DataFrame:
     
     # Now we need to join group_keys back from original df
     # Get unique job_no + task_name + group_keys mapping
-    if group_keys:
-        key_cols = ["job_no", "task_name"] + group_keys
+    if keys:
+        key_cols = ["job_no", "task_name"] + keys
         key_cols = list(dict.fromkeys(key_cols))
         key_mapping = df[key_cols].drop_duplicates()
         job_task = job_task.merge(key_mapping, on=["job_no", "task_name"], how="left")
@@ -134,7 +139,7 @@ def safe_quote_rollup(df: pd.DataFrame, group_keys: List[str]) -> pd.DataFrame:
     # Count job-tasks
     agg_dict["job_no"] = "nunique"
     
-    if not group_keys:
+    if not keys:
         result = pd.DataFrame([{
             "quoted_hours": job_task["quoted_time_total"].sum() if "quoted_time_total" in job_task.columns else 0,
             "quoted_amount": job_task["quoted_amount_total"].sum() if "quoted_amount_total" in job_task.columns else 0,
@@ -142,7 +147,7 @@ def safe_quote_rollup(df: pd.DataFrame, group_keys: List[str]) -> pd.DataFrame:
             "job_count": job_task["job_no"].nunique(),
         }])
     else:
-        result = job_task.groupby(group_keys).agg(
+        result = job_task.groupby(keys).agg(
             quoted_hours=("quoted_time_total", "sum") if "quoted_time_total" in job_task.columns else ("job_no", "count"),
             quoted_amount=("quoted_amount_total", "sum") if "quoted_amount_total" in job_task.columns else ("job_no", "count"),
             job_task_count=("task_name", "count"),
@@ -169,7 +174,8 @@ def safe_quote_rollup(df: pd.DataFrame, group_keys: List[str]) -> pd.DataFrame:
 # PROFITABILITY ROLLUP
 # =============================================================================
 
-def profitability_rollup(df: pd.DataFrame, group_keys: Optional[List[str]] = None) -> pd.DataFrame:
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
+def profitability_rollup(df: pd.DataFrame, group_keys: Optional[tuple[str, ...]] = None) -> pd.DataFrame:
     """
     Standard profitability metrics rollup.
     
@@ -181,8 +187,10 @@ def profitability_rollup(df: pd.DataFrame, group_keys: Optional[List[str]] = Non
         "revenue": ("rev_alloc", "sum"),
     }
     
-    if group_keys:
-        result = df.groupby(group_keys).agg(**agg_dict).reset_index()
+    keys = list(group_keys) if group_keys else []
+
+    if keys:
+        result = df.groupby(keys).agg(**agg_dict).reset_index()
     else:
         result = pd.DataFrame([{
             "hours": df["hours_raw"].sum(),
@@ -214,10 +222,11 @@ def rate_rollups(df: pd.DataFrame, group_keys: Optional[List[str]] = None) -> pd
     Compute realised rate and quote rate (safely) for groups.
     """
     # Profitability for realised rate
-    prof = profitability_rollup(df, group_keys)
+    group_keys_tuple = tuple(group_keys) if group_keys else None
+    prof = profitability_rollup(df, group_keys_tuple)
     
     # Safe quote rollup for quote rate
-    quote = safe_quote_rollup(df, group_keys if group_keys else [])
+    quote = safe_quote_rollup(df, tuple(group_keys) if group_keys else ())
     
     if group_keys and len(quote) > 0:
         result = prof.merge(
@@ -281,28 +290,31 @@ def scope_creep_metrics(df: pd.DataFrame, group_keys: Optional[List[str]] = None
     return result
 
 
-def quote_delivery_metrics(df: pd.DataFrame, group_keys: Optional[List[str]] = None) -> pd.DataFrame:
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
+def quote_delivery_metrics(df: pd.DataFrame, group_keys: Optional[tuple[str, ...]] = None) -> pd.DataFrame:
     """
     Full quote vs delivery analysis.
     """
+    keys = list(group_keys) if group_keys else []
+
     # Safe quote totals
-    quote = safe_quote_rollup(df, group_keys if group_keys else [])
+    quote = safe_quote_rollup(df, tuple(keys))
     
     # Actual hours
-    if group_keys:
-        actuals = df.groupby(group_keys).agg(
+    if keys:
+        actuals = df.groupby(keys).agg(
             actual_hours=("hours_raw", "sum")
         ).reset_index()
     else:
         actuals = pd.DataFrame([{"actual_hours": df["hours_raw"].sum()}])
     
     # Scope creep
-    scope = scope_creep_metrics(df, group_keys)
+    scope = scope_creep_metrics(df, keys if keys else None)
     
     # Merge all
-    if group_keys:
-        result = quote.merge(actuals, on=group_keys, how="outer")
-        result = result.merge(scope[group_keys + ["unquoted_hours", "unquoted_share"]], on=group_keys, how="left")
+    if keys:
+        result = quote.merge(actuals, on=keys, how="outer")
+        result = result.merge(scope[keys + ["unquoted_hours", "unquoted_share"]], on=keys, how="left")
     else:
         result = quote.copy()
         result["actual_hours"] = actuals["actual_hours"].iloc[0]
@@ -367,6 +379,7 @@ def utilisation_metrics(df: pd.DataFrame, group_keys: Optional[List[str]] = None
 # JOB STATE FILTERING
 # =============================================================================
 
+@st.cache_data(show_spinner=False)
 def filter_jobs_by_state(df: pd.DataFrame, state: str) -> pd.DataFrame:
     """
     Filter dataframe to Active / Completed / All jobs using job-level status.
@@ -393,7 +406,7 @@ def filter_jobs_by_state(df: pd.DataFrame, state: str) -> pd.DataFrame:
     else:
         keep_jobs = job_meta.loc[completed, "job_no"]
 
-    return df[df["job_no"].isin(keep_jobs)].copy()
+    return df[df["job_no"].isin(keep_jobs)]
 
 
 # =============================================================================
@@ -409,7 +422,7 @@ def full_metric_pack(df: pd.DataFrame, group_keys: Optional[List[str]] = None,
     rates = rate_rollups(df, group_keys)
     
     # Quote delivery
-    delivery = quote_delivery_metrics(df, group_keys)
+    delivery = quote_delivery_metrics(df, tuple(group_keys) if group_keys else None)
     
     # Utilisation
     util = utilisation_metrics(df, group_keys, exclude_leave)

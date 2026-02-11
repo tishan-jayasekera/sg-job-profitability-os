@@ -3,6 +3,7 @@ Job lifecycle management: active job definitions, first activity, completion sta
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Any
 
@@ -122,6 +123,7 @@ def is_job_active(df: pd.DataFrame,
     return job_status.set_index("job_no")["is_active"]
 
 
+@st.cache_data(show_spinner=False)
 def get_active_jobs_with_metrics(df: pd.DataFrame,
                                   recency_days: Optional[int] = None,
                                   reference_date: Optional[datetime] = None) -> pd.DataFrame:
@@ -145,7 +147,7 @@ def get_active_jobs_with_metrics(df: pd.DataFrame,
     active_mask = is_job_active(df, recency_days, reference_date)
     active_jobs = active_mask[active_mask].index.tolist()
     
-    df_active = df[df["job_no"].isin(active_jobs)].copy()
+    df_active = df[df["job_no"].isin(active_jobs)]
     
     if len(df_active) == 0:
         return pd.DataFrame()

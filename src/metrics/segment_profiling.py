@@ -3,6 +3,7 @@ Segment profiling for Executive Summary.
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import Dict, List, Optional
 
 from src.metrics.quote_delivery import compute_hours_variance, compute_scope_creep
@@ -37,6 +38,7 @@ SEGMENT_CONFIG = {
 }
 
 
+@st.cache_data(show_spinner=False)
 def assign_job_segment(row: pd.Series) -> str:
     """
     Assign a job to one of four segments based on execution + commercial profile.
@@ -64,6 +66,7 @@ def assign_job_segment(row: pd.Series) -> str:
     return "Subsidiser"
 
 
+@st.cache_data(show_spinner=False)
 def compute_job_segments(df: pd.DataFrame, job_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute segment assignments for all jobs.
@@ -87,7 +90,7 @@ def compute_job_segments(df: pd.DataFrame, job_df: pd.DataFrame) -> pd.DataFrame
         )
 
     if "scope_creep_pct_job" not in result.columns:
-        scope = compute_scope_creep(df, ["job_no"])
+        scope = compute_scope_creep(df, ("job_no",))
         if len(scope) > 0:
             result = result.merge(
                 scope[["job_no", "unquoted_share"]].rename(
@@ -130,6 +133,7 @@ def compute_job_segments(df: pd.DataFrame, job_df: pd.DataFrame) -> pd.DataFrame
     return result
 
 
+@st.cache_data(show_spinner=False)
 def compute_segment_profile(
     df: pd.DataFrame,
     job_df: pd.DataFrame,
@@ -331,6 +335,7 @@ def _compute_overrun_decomposition(job_df: pd.DataFrame, segment: str) -> Dict:
     }
 
 
+@st.cache_data(show_spinner=False)
 def generate_reason_codes(row: pd.Series, benchmark_duration_p75: float = 30) -> List[str]:
     """
     Generate human-readable reason codes for why a job is in its segment.
@@ -367,6 +372,7 @@ def generate_reason_codes(row: pd.Series, benchmark_duration_p75: float = 30) ->
     return reasons[:3]
 
 
+@st.cache_data(show_spinner=False)
 def compute_job_shortlist(
     job_df: pd.DataFrame,
     segment: str,

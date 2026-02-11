@@ -10,12 +10,14 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 
 from src.data.job_lifecycle import get_active_jobs_with_metrics
 from src.data.semantic import get_category_col, safe_quote_job_task
 from src.modeling.intervention import compute_intervention_risk_score
 
 
+@st.cache_data(show_spinner=False)
 def compute_delivery_control_view(df: pd.DataFrame, recency_days: int = 28) -> pd.DataFrame:
     """
     Build the delivery control view.
@@ -84,23 +86,23 @@ def compute_delivery_control_view(df: pd.DataFrame, recency_days: int = 28) -> p
 
     jobs_df["peer_median_runtime_days"] = jobs_df.get("median_runtime_days")
 
-    risk_result = jobs_df.apply(
-        lambda row: compute_intervention_risk_score(row),
-        axis=1,
-        result_type="expand",
+    risk_result = compute_intervention_risk_score(jobs_df)
+    if isinstance(risk_result, pd.DataFrame) and "risk_score" in risk_result.columns:
+        jobs_df["risk_score"] = risk_result["risk_score"].values
+    else:
+        jobs_df["risk_score"] = jobs_df.apply(
+            lambda row: compute_intervention_risk_score(row)[0],
+            axis=1,
+        )
+    jobs_df["risk_band"] = np.select(
+        [jobs_df["risk_score"] >= 70, jobs_df["risk_score"] >= 50],
+        ["Red", "Amber"],
+        default="Green",
     )
-    risk_result.columns = ["risk_score", "reason_codes"]
-    jobs_df["risk_score"] = risk_result["risk_score"]
-    jobs_df["risk_band"] = jobs_df["risk_score"].apply(_compute_risk_band)
 
-    driver_action = jobs_df.apply(
-        lambda row: _compute_primary_driver(row),
-        axis=1,
-        result_type="expand",
-    )
-    driver_action.columns = ["primary_driver", "recommended_action"]
-    jobs_df["primary_driver"] = driver_action["primary_driver"]
-    jobs_df["recommended_action"] = driver_action["recommended_action"]
+    driver_action = _compute_primary_driver(jobs_df)
+    jobs_df["primary_driver"] = driver_action["primary_driver"].values
+    jobs_df["recommended_action"] = driver_action["recommended_action"].values
 
     jobs_df["margin_at_risk"] = (
         (jobs_df["median_margin_pct"].fillna(0) - jobs_df["forecast_margin_pct"].fillna(0))
@@ -149,6 +151,7 @@ def compute_delivery_control_view(df: pd.DataFrame, recency_days: int = 28) -> p
     return jobs_df[existing_cols].sort_values("risk_score", ascending=False)
 
 
+@st.cache_data(show_spinner=False)
 def compute_benchmarks(df: pd.DataFrame) -> pd.DataFrame:
     """Compute dept+category benchmarks from completed jobs."""
     if "job_no" not in df.columns:
@@ -523,31 +526,51 @@ def _compute_risk_band(score: float) -> str:
     return "Green"
 
 
-def _compute_primary_driver(row: pd.Series) -> Tuple[str, str]:
+def _compute_primary_driver(rows: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute primary driver and recommended action.
-
-    Returns (driver_text, action_text)
+    Compute primary driver and recommended action for all rows in a vectorized pass.
     """
-    scope_pct = row.get("scope_creep_pct", 0)
-    if pd.notna(scope_pct) and scope_pct > 20:
-        return f"Scope creep +{scope_pct:.0f}%", "Initiate change order"
+    scope_pct = pd.to_numeric(rows.get("scope_creep_pct"), errors="coerce").fillna(0)
+    hours_var = pd.to_numeric(rows.get("hours_variance_pct"), errors="coerce").fillna(0)
+    rate_var = pd.to_numeric(rows.get("rate_variance"), errors="coerce").fillna(0)
+    margin = pd.to_numeric(rows.get("forecast_margin_pct"), errors="coerce")
+    bench = pd.to_numeric(rows.get("median_margin_pct"), errors="coerce")
+    runtime_delta = pd.to_numeric(rows.get("runtime_delta_days"), errors="coerce").fillna(0)
 
-    hours_var = row.get("hours_variance_pct", 0)
-    if pd.notna(hours_var) and hours_var > 30:
-        return f"Hours overrun +{hours_var:.0f}%", "PM scope review"
+    c_scope = scope_pct > 20
+    c_hours = (~c_scope) & (hours_var > 30)
+    c_rate = (~c_scope) & (~c_hours) & (rate_var < -15)
+    c_margin = (~c_scope) & (~c_hours) & (~c_rate) & (margin < (bench - 10))
+    c_runtime = (~c_scope) & (~c_hours) & (~c_rate) & (~c_margin) & (runtime_delta > 14)
 
-    rate_var = row.get("rate_variance", 0)
-    if pd.notna(rate_var) and rate_var < -15:
-        return f"Rate leakage ${rate_var:.0f}/hr", "Rate audit needed"
+    primary_driver = np.select(
+        [c_scope, c_hours, c_rate, c_margin, c_runtime],
+        [
+            "Scope creep +" + scope_pct.round(0).astype(int).astype(str) + "%",
+            "Hours overrun +" + hours_var.round(0).astype(int).astype(str) + "%",
+            "Rate leakage $" + rate_var.round(0).astype(int).astype(str) + "/hr",
+            "Margin " + margin.round(0).astype("Int64").astype(str) + "% (bench " + bench.round(0).astype("Int64").astype(str) + "%)",
+            "Running +" + runtime_delta.round(0).astype(int).astype(str) + "d over",
+        ],
+        default="Monitor",
+    )
 
-    margin = row.get("forecast_margin_pct", 0)
-    bench = row.get("median_margin_pct", 0)
-    if pd.notna(margin) and pd.notna(bench) and margin < bench - 10:
-        return f"Margin {margin:.0f}% (bench {bench:.0f}%)", "Cost review"
+    recommended_action = np.select(
+        [c_scope, c_hours, c_rate, c_margin, c_runtime],
+        [
+            "Initiate change order",
+            "PM scope review",
+            "Rate audit needed",
+            "Cost review",
+            "Escalate timeline",
+        ],
+        default="Continue standard review",
+    )
 
-    runtime_delta = row.get("runtime_delta_days", 0)
-    if pd.notna(runtime_delta) and runtime_delta > 14:
-        return f"Running +{runtime_delta:.0f}d over", "Escalate timeline"
-
-    return "Monitor", "Continue standard review"
+    return pd.DataFrame(
+        {
+            "primary_driver": primary_driver,
+            "recommended_action": recommended_action,
+        },
+        index=rows.index,
+    )

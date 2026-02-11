@@ -3,6 +3,7 @@ Time window handling, recency weighting, and cohort definitions.
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List
 
@@ -52,6 +53,7 @@ def get_time_window_dates(window: str, reference_date: Optional[datetime] = None
     return start_date, end_date
 
 
+@st.cache_data(show_spinner=False)
 def filter_by_time_window(df: pd.DataFrame, window: str, 
                           date_col: str = "month_key",
                           reference_date: Optional[datetime] = None) -> pd.DataFrame:
@@ -64,7 +66,7 @@ def filter_by_time_window(df: pd.DataFrame, window: str,
     start_date, end_date = get_time_window_dates(window, reference_date)
     
     mask = (df[date_col] >= start_date) & (df[date_col] <= end_date)
-    return df[mask].copy()
+    return df[mask]
 
 
 def get_available_months(df: pd.DataFrame, date_col: str = "month_key") -> List[datetime]:
@@ -80,6 +82,7 @@ def get_available_months(df: pd.DataFrame, date_col: str = "month_key") -> List[
 # RECENCY WEIGHTING
 # =============================================================================
 
+@st.cache_data(show_spinner=False)
 def compute_recency_weights(df: pd.DataFrame, 
                             date_col: str = "month_key",
                             half_life_months: Optional[int] = None,
@@ -155,6 +158,7 @@ def effective_sample_size(weights: pd.Series) -> float:
 # ACTIVE STAFF COHORT
 # =============================================================================
 
+@st.cache_data(show_spinner=False)
 def get_active_staff(df: pd.DataFrame, 
                      recency_months: Optional[int] = None,
                      min_hours: float = 1.0,
@@ -202,13 +206,14 @@ def filter_active_staff(df: pd.DataFrame,
     if "staff_name" not in df.columns:
         return df
     
-    return df[df["staff_name"].isin(active)].copy()
+    return df[df["staff_name"].isin(active)]
 
 
 # =============================================================================
 # ACTIVE JOBS
 # =============================================================================
 
+@st.cache_data(show_spinner=False)
 def get_active_jobs(df: pd.DataFrame,
                     recency_days: Optional[int] = None,
                     reference_date: Optional[datetime] = None) -> List[str]:
@@ -232,8 +237,6 @@ def get_active_jobs(df: pd.DataFrame,
             reference_date = datetime.now()
     
     cutoff_date = reference_date - timedelta(days=recency_days)
-    
-    df = df.copy()
     
     # Check completion status
     is_not_completed = pd.Series(True, index=df.index)
@@ -268,7 +271,7 @@ def filter_active_jobs(df: pd.DataFrame,
     if "job_no" not in df.columns:
         return df
     
-    return df[df["job_no"].isin(active)].copy()
+    return df[df["job_no"].isin(active)]
 
 
 # =============================================================================

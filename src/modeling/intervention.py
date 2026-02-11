@@ -8,15 +8,17 @@ for active jobs to help delivery leaders prioritize interventions.
 import pandas as pd
 import numpy as np
 from typing import Tuple, Dict, List, Optional
+import streamlit as st
 
 
+@st.cache_data(show_spinner=False)
 def compute_intervention_risk_score(
-    row: pd.Series,
+    data: pd.Series | pd.DataFrame,
     margin_threshold: float = 15.0,
     revenue_coverage_threshold: float = 0.7,
     hours_overrun_threshold: float = 10.0,
     rate_leakage_threshold: float = 0.85,
-) -> Tuple[float, List[str]]:
+) -> Tuple[float, List[str]] | pd.DataFrame:
     """
     Compute risk score (0–100) and reason codes for a job.
     
@@ -37,56 +39,96 @@ def compute_intervention_risk_score(
     Returns:
         (risk_score (0-100), list of reason codes (human readable))
     """
-    reason_codes = []
-    risk_score = 0.0
-    
-    # 1. Margin erosion
-    margin = row.get('margin_pct_to_date', np.nan)
-    if pd.notna(margin):
-        if margin < margin_threshold:
-            reason_codes.append("Low margin %")
-            risk_score += max(0, (margin_threshold - margin) / margin_threshold * 30)
-    
-    # 2. Revenue lag
-    rev_coverage = row.get('quote_to_revenue', np.nan)
-    if pd.notna(rev_coverage):
-        if rev_coverage < revenue_coverage_threshold:
-            reason_codes.append("Revenue lagging quote")
-            risk_score += max(0, (revenue_coverage_threshold - rev_coverage) / revenue_coverage_threshold * 25)
-    
-    # 3. Scope creep (hours overrun)
-    hours_overrun = row.get('hours_overrun_pct', np.nan)
-    if pd.notna(hours_overrun):
-        if hours_overrun > hours_overrun_threshold:
-            reason_codes.append("Hours overrun vs quote")
-            risk_score += max(0, (hours_overrun - hours_overrun_threshold) / 50 * 25)
-    
-    # 4. Rate leakage
-    real_rate = row.get('realised_rate', np.nan)
-    quote_rate = row.get('quote_rate', np.nan)
-    if pd.notna(real_rate) and pd.notna(quote_rate) and quote_rate > 0:
-        rate_ratio = real_rate / quote_rate
-        if rate_ratio < rate_leakage_threshold:
-            reason_codes.append("Realized rate below quote")
-            risk_score += max(0, (rate_leakage_threshold - rate_ratio) / rate_leakage_threshold * 20)
-    
-    # 5. Runtime over peer median (zombie risk)
-    runtime = row.get('runtime_days', np.nan)
-    peer_median = row.get('peer_median_runtime_days', np.nan)
-    if pd.notna(runtime) and pd.notna(peer_median) and peer_median > 0:
-        if runtime > peer_median * 1.5:  # 50% over median
-            reason_codes.append("Runtime exceeds peers")
-            risk_score += max(0, min((runtime - peer_median) / peer_median / 1.5 * 20, 20))
-    
-    # Cap risk score at 100
-    risk_score = min(risk_score, 100.0)
-    
-    # Return top 2-3 reason codes
-    top_reasons = reason_codes[:3]
-    
-    return risk_score, top_reasons
+    if isinstance(data, pd.Series):
+        result = compute_intervention_risk_score(
+            pd.DataFrame([data]),
+            margin_threshold=margin_threshold,
+            revenue_coverage_threshold=revenue_coverage_threshold,
+            hours_overrun_threshold=hours_overrun_threshold,
+            rate_leakage_threshold=rate_leakage_threshold,
+        )
+        return float(result["risk_score"].iloc[0]), list(result["reason_codes"].iloc[0])
+
+    if data is None or len(data) == 0:
+        return pd.DataFrame(columns=["risk_score", "reason_codes"])
+
+    margin = pd.to_numeric(data.get("margin_pct_to_date"), errors="coerce")
+    rev_coverage = pd.to_numeric(data.get("quote_to_revenue"), errors="coerce")
+    hours_overrun = pd.to_numeric(data.get("hours_overrun_pct"), errors="coerce")
+    real_rate = pd.to_numeric(data.get("realised_rate"), errors="coerce")
+    quote_rate = pd.to_numeric(data.get("quote_rate"), errors="coerce")
+    runtime = pd.to_numeric(data.get("runtime_days"), errors="coerce")
+    peer_median = pd.to_numeric(data.get("peer_median_runtime_days"), errors="coerce")
+
+    margin_component = np.where(
+        margin < margin_threshold,
+        np.maximum(0, (margin_threshold - margin) / margin_threshold * 30),
+        0,
+    )
+    revenue_component = np.where(
+        rev_coverage < revenue_coverage_threshold,
+        np.maximum(
+            0,
+            (revenue_coverage_threshold - rev_coverage)
+            / revenue_coverage_threshold
+            * 25,
+        ),
+        0,
+    )
+    hours_component = np.where(
+        hours_overrun > hours_overrun_threshold,
+        np.maximum(0, (hours_overrun - hours_overrun_threshold) / 50 * 25),
+        0,
+    )
+
+    rate_ratio = np.where(quote_rate > 0, real_rate / quote_rate, np.nan)
+    rate_component = np.where(
+        rate_ratio < rate_leakage_threshold,
+        np.maximum(0, (rate_leakage_threshold - rate_ratio) / rate_leakage_threshold * 20),
+        0,
+    )
+
+    runtime_component = np.where(
+        (runtime > (peer_median * 1.5)) & (peer_median > 0),
+        np.maximum(0, np.minimum((runtime - peer_median) / peer_median / 1.5 * 20, 20)),
+        0,
+    )
+
+    risk_score = np.minimum(
+        margin_component + revenue_component + hours_component + rate_component + runtime_component,
+        100.0,
+    )
+
+    primary_reason = np.select(
+        [
+            margin < margin_threshold,
+            rev_coverage < revenue_coverage_threshold,
+            hours_overrun > hours_overrun_threshold,
+            rate_ratio < rate_leakage_threshold,
+            (runtime > (peer_median * 1.5)) & (peer_median > 0),
+        ],
+        [
+            "Low margin %",
+            "Revenue lagging quote",
+            "Hours overrun vs quote",
+            "Realized rate below quote",
+            "Runtime exceeds peers",
+        ],
+        default="Monitor",
+    )
+
+    reason_codes = [[str(reason)] if reason != "Monitor" else [] for reason in primary_reason]
+
+    return pd.DataFrame(
+        {
+            "risk_score": risk_score,
+            "reason_codes": reason_codes,
+        },
+        index=data.index,
+    )
 
 
+@st.cache_data(show_spinner=False)
 def build_intervention_queue(
     quadrant_jobs: pd.DataFrame,
     active_only: bool = True,
@@ -127,15 +169,15 @@ def build_intervention_queue(
         return pd.DataFrame()
     
     # Compute risk scores and reasons
-    results = df.apply(
-        lambda row: compute_intervention_risk_score(row),
-        axis=1,
-        result_type="expand"
-    )
-    results.columns = ["risk_score", "reason_codes"]
-    
-    df["risk_score"] = results["risk_score"]
-    df["primary_issue"] = results["reason_codes"].apply(lambda x: "; ".join(x) if x else "Monitor")
+    results = compute_intervention_risk_score(df)
+    if isinstance(results, pd.DataFrame) and len(results) > 0:
+        df["risk_score"] = results["risk_score"].values
+        df["primary_issue"] = results["reason_codes"].apply(
+            lambda x: "; ".join(x) if isinstance(x, list) and x else "Monitor"
+        )
+    else:
+        df["risk_score"] = np.nan
+        df["primary_issue"] = "Monitor"
     
     # Compute deltas for table columns
     df["margin_delta"] = df.get("margin_pct_to_date", 0) - df.get("margin_pct_quote", 0)
@@ -151,6 +193,7 @@ def build_intervention_queue(
     return df.head(top_n)
 
 
+@st.cache_data(show_spinner=False)
 def compute_quadrant_health_summary(quadrant_jobs: pd.DataFrame) -> Dict[str, any]:
     """
     Compute health KPIs for a quadrant.
@@ -181,11 +224,11 @@ def compute_quadrant_health_summary(quadrant_jobs: pd.DataFrame) -> Dict[str, an
     
     # Compute risk scores if not present
     if "risk_score" not in df.columns:
-        results = df.apply(
-            lambda row: compute_intervention_risk_score(row)[0],
-            axis=1
-        )
-        df["risk_score"] = results
+        results = compute_intervention_risk_score(df)
+        if isinstance(results, pd.DataFrame) and "risk_score" in results.columns:
+            df["risk_score"] = results["risk_score"].values
+        else:
+            df["risk_score"] = np.nan
     
     return {
         'job_count': len(df),
@@ -199,6 +242,7 @@ def compute_quadrant_health_summary(quadrant_jobs: pd.DataFrame) -> Dict[str, an
     }
 
 
+@st.cache_data(show_spinner=False)
 def get_peer_context(
     job_row: pd.Series,
     peer_segment: pd.DataFrame,

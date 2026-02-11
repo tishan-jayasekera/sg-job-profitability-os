@@ -5,6 +5,7 @@ Single source of truth for: job intake, portfolio mix, implied FTE demand.
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import Optional, List, Dict
 
 from src.data.semantic import safe_quote_job_task, get_category_col
@@ -12,6 +13,7 @@ from src.data.job_lifecycle import get_job_first_activity, get_job_first_revenue
 from src.config import config
 
 
+@st.cache_data(show_spinner=False)
 def assign_job_cohort(df: pd.DataFrame, 
                       cohort_definition: str = "first_activity") -> pd.DataFrame:
     """
@@ -44,8 +46,9 @@ def assign_job_cohort(df: pd.DataFrame,
     return cohort
 
 
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
 def compute_job_mix(df: pd.DataFrame,
-                    group_keys: Optional[List[str]] = None,
+                    group_keys: Optional[tuple[str, ...]] = None,
                     cohort_definition: str = "first_activity") -> pd.DataFrame:
     """
     Compute job mix metrics by cohort month.
@@ -89,7 +92,7 @@ def compute_job_mix(df: pd.DataFrame,
     # Build group keys
     agg_keys = ["cohort_month"]
     if group_keys:
-        agg_keys = group_keys + ["cohort_month"]
+        agg_keys = [*group_keys, "cohort_month"]
     
     # Aggregate
     result = jobs.groupby(agg_keys).agg(
@@ -110,8 +113,9 @@ def compute_job_mix(df: pd.DataFrame,
     return result
 
 
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
 def compute_implied_fte_demand(df: pd.DataFrame,
-                               group_keys: Optional[List[str]] = None,
+                               group_keys: Optional[tuple[str, ...]] = None,
                                cohort_definition: str = "first_activity",
                                weeks_per_month: float = 4.33) -> pd.DataFrame:
     """
@@ -137,7 +141,7 @@ def compute_implied_fte_demand(df: pd.DataFrame,
     # Also compute from actuals
     agg_keys = ["cohort_month"]
     if group_keys:
-        agg_keys = group_keys + ["cohort_month"]
+        agg_keys = [*group_keys, "cohort_month"]
     
     # Join cohort to fact
     cohort = assign_job_cohort(df, cohort_definition)
@@ -154,6 +158,7 @@ def compute_implied_fte_demand(df: pd.DataFrame,
     return mix
 
 
+@st.cache_data(show_spinner=False)
 def compute_demand_vs_supply(df: pd.DataFrame,
                              weeks: int = 4) -> pd.DataFrame:
     """
@@ -179,7 +184,7 @@ def compute_demand_vs_supply(df: pd.DataFrame,
     
     # Safe quote totals
     from src.data.semantic import safe_quote_rollup
-    quote = safe_quote_rollup(df_recent, [])
+    quote = safe_quote_rollup(df_recent, ())
     
     monthly_capacity = config.CAPACITY_HOURS_PER_WEEK * 4.33
     
@@ -208,6 +213,7 @@ def compute_demand_vs_supply(df: pd.DataFrame,
     return result
 
 
+@st.cache_data(show_spinner=False)
 def compute_job_quadrant(df: pd.DataFrame,
                          cohort_definition: str = "first_activity") -> pd.DataFrame:
     """
@@ -250,27 +256,28 @@ def compute_job_quadrant(df: pd.DataFrame,
     hours_median = jobs["quoted_hours"].median()
     amount_median = jobs["quoted_amount"].median()
     
-    # Assign quadrants
-    def assign_quadrant(row):
-        high_value = row["quoted_amount"] >= amount_median
-        high_effort = row["quoted_hours"] >= hours_median
-        
-        if high_value and not high_effort:
-            return "High Value / Low Effort"
-        elif high_value and high_effort:
-            return "High Value / High Effort"
-        elif not high_value and not high_effort:
-            return "Low Value / Low Effort"
-        else:
-            return "Low Value / High Effort"
-    
-    jobs["quadrant"] = jobs.apply(assign_quadrant, axis=1)
+    high_value = jobs["quoted_amount"] >= amount_median
+    high_effort = jobs["quoted_hours"] >= hours_median
+    jobs["quadrant"] = np.select(
+        [
+            high_value & (~high_effort),
+            high_value & high_effort,
+            (~high_value) & (~high_effort),
+        ],
+        [
+            "High Value / Low Effort",
+            "High Value / High Effort",
+            "Low Value / Low Effort",
+        ],
+        default="Low Value / High Effort",
+    )
     jobs["hours_median"] = hours_median
     jobs["amount_median"] = amount_median
     
     return jobs
 
 
+@st.cache_data(show_spinner=False)
 def get_job_mix_summary(df: pd.DataFrame,
                         cohort_definition: str = "first_activity") -> Dict[str, float]:
     """

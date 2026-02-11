@@ -5,6 +5,7 @@ Single source of truth for: weekly capacity, load, headroom.
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import Optional, List, Dict
 from datetime import datetime, timedelta
 
@@ -12,6 +13,7 @@ from src.data.semantic import leave_exclusion_mask
 from src.config import config
 
 
+@st.cache_data(show_spinner=False)
 def compute_staff_capacity(df: pd.DataFrame,
                            weeks: int = 4,
                            reference_date: Optional[datetime] = None) -> pd.DataFrame:
@@ -109,6 +111,7 @@ def compute_staff_capacity(df: pd.DataFrame,
     return staff_info
 
 
+@st.cache_data(show_spinner=False)
 def compute_capacity_summary(df: pd.DataFrame,
                              weeks: int = 4,
                              reference_date: Optional[datetime] = None) -> Dict[str, float]:
@@ -130,6 +133,7 @@ def compute_capacity_summary(df: pd.DataFrame,
     }
 
 
+@st.cache_data(show_spinner=False)
 def compute_department_capacity(df: pd.DataFrame,
                                 weeks: int = 4,
                                 reference_date: Optional[datetime] = None) -> pd.DataFrame:
@@ -158,6 +162,7 @@ def compute_department_capacity(df: pd.DataFrame,
     return result
 
 
+@st.cache_data(show_spinner=False)
 def get_staff_with_headroom(df: pd.DataFrame,
                             min_headroom: float = 10,
                             weeks: int = 4) -> pd.DataFrame:
@@ -169,6 +174,7 @@ def get_staff_with_headroom(df: pd.DataFrame,
     return staff[staff["headroom"] >= min_headroom].sort_values("headroom", ascending=False)
 
 
+@st.cache_data(show_spinner=False)
 def get_overloaded_staff(df: pd.DataFrame,
                          weeks: int = 4) -> pd.DataFrame:
     """
@@ -179,6 +185,7 @@ def get_overloaded_staff(df: pd.DataFrame,
     return staff[staff["headroom"] < 0].sort_values("headroom")
 
 
+@st.cache_data(show_spinner=False)
 def compute_capacity_forecast(df: pd.DataFrame,
                               forecast_weeks: int = 8,
                               trailing_weeks: int = 4) -> pd.DataFrame:

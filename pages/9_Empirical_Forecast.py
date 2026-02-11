@@ -284,13 +284,9 @@ def _build_rate_tables(df: pd.DataFrame, category_col: str) -> dict:
     }
 
 
-def _get_cached_tables(signature: tuple, df: pd.DataFrame, category_col: str) -> dict:
-    cache = st.session_state.get("rc_rate_cache")
-    if cache and cache.get("signature") == signature:
-        return cache["tables"]
-    tables = _build_rate_tables(df, category_col)
-    st.session_state["rc_rate_cache"] = {"signature": signature, "tables": tables}
-    return tables
+@st.cache_data(show_spinner=False)
+def _get_cached_tables(df: pd.DataFrame, category_col: str) -> dict:
+    return _build_rate_tables(df, category_col)
 
 
 def _rate_table_column_config() -> dict:
@@ -483,6 +479,174 @@ def _render_breadcrumb(job_label: str | None):
                 st.rerun()
 
 
+@st.fragment
+def _render_rate_capture_drill(
+    df_valid: pd.DataFrame,
+    rate_tables: dict,
+    category_col: str,
+    available_departments: list[str],
+    min_job_hours: int,
+    job_name_lookup: dict,
+) -> None:
+    section_header("Department Detail", "Select a department to view category performance.")
+
+    dept_rates = rate_tables["dept"].copy()
+    dept_rates = dept_rates.dropna(subset=["rate_variance"], how="all")
+    dept_rates["total_leakage"] = np.where(
+        dept_rates["rate_variance"] < 0,
+        -dept_rates["rate_variance"] * dept_rates["hours"],
+        0,
+    )
+    dept_rates = dept_rates.sort_values("rate_variance").reset_index(drop=True)
+
+    dept_options = ["All"] + sorted(available_departments)
+    selected_department = st.selectbox(
+        "Department",
+        options=dept_options,
+        index=0,
+        key="rc_department_select",
+    )
+    if selected_department == "All":
+        selected_department = None
+
+    if not selected_department:
+        return
+
+    df_dept = df_valid[df_valid["department_final"] == selected_department]
+    dept_row = dept_rates[dept_rates["department_final"] == selected_department].head(1)
+    if len(dept_row) > 0:
+        dept_row = dept_row.iloc[0]
+        dept_quote_rate = dept_row.get("quote_rate", np.nan)
+        dept_realised_rate = dept_row.get("realised_rate", np.nan)
+        dept_variance = dept_row.get("rate_variance", np.nan)
+    else:
+        dept_quote_rate = dept_realised_rate = dept_variance = np.nan
+
+    billable_share = np.nan
+    if "is_billable" in df_dept.columns:
+        total_hours = df_dept["hours_raw"].sum()
+        billable_hours = df_dept.loc[df_dept["is_billable"] == True, "hours_raw"].sum()
+        billable_share = (billable_hours / total_hours * 100) if total_hours > 0 else np.nan
+
+    kpi_cols = st.columns(4)
+    with kpi_cols[0]:
+        st.metric("Dept Quote Rate", fmt_rate(dept_quote_rate))
+    with kpi_cols[1]:
+        st.metric("Dept Realised Rate", fmt_rate(dept_realised_rate))
+    with kpi_cols[2]:
+        st.metric("Rate Variance", _fmt_rate_delta(dept_variance))
+    with kpi_cols[3]:
+        st.metric("Billable Share", fmt_percent(billable_share))
+
+    if category_col not in df_dept.columns:
+        st.warning("Category field missing from dataset.")
+    else:
+        cat_rates = rate_tables["category"].copy()
+        cat_rates = cat_rates[cat_rates["department_final"] == selected_department]
+        cat_rates["total_leakage"] = np.where(
+            cat_rates["rate_variance"] < 0,
+            -cat_rates["rate_variance"] * cat_rates["hours"],
+            0,
+        )
+        cat_rates = cat_rates.sort_values("rate_variance").reset_index(drop=True)
+
+        display_cols = [
+            category_col,
+            "quote_rate",
+            "realised_rate",
+            "rate_variance",
+            "rate_capture_pct",
+            "total_leakage",
+            "hours",
+            "revenue",
+        ]
+        cat_display = cat_rates[display_cols].copy()
+        cat_display = cat_display.rename(columns={
+            category_col: "Category",
+            "quote_rate": "Quote Rate",
+            "realised_rate": "Realised Rate",
+            "rate_variance": "Rate Variance",
+            "rate_capture_pct": "Rate Capture %",
+            "total_leakage": "Total Leakage",
+            "hours": "Hours",
+            "revenue": "Revenue",
+        })
+
+        section_header("Categories by Rate Variance", "Department slice (no drill).")
+        st.dataframe(
+            cat_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config=_rate_table_column_config(),
+        )
+
+    show_job_detail = st.checkbox("Show job detail (slower)", value=False, key="rc_show_job_detail")
+    if not show_job_detail:
+        return
+
+    job_rates = rate_tables["job"].copy()
+    job_rates = job_rates[job_rates["department_final"] == selected_department]
+    job_rates = job_rates[job_rates["hours"] >= min_job_hours]
+    job_rates["total_leakage"] = np.where(
+        job_rates["rate_variance"] < 0,
+        -job_rates["rate_variance"] * job_rates["hours"],
+        0,
+    )
+    job_rates = job_rates.sort_values("rate_variance").reset_index(drop=True)
+
+    if len(job_rates) == 0:
+        st.info("No jobs meet the current filters.")
+        return
+
+    show_all_jobs = st.checkbox(
+        "Show all jobs (slow)",
+        value=False,
+        key="rc_jobs_all",
+    )
+    job_limit = 200
+    if not show_all_jobs:
+        job_limit = st.slider(
+            "Max jobs",
+            min_value=25,
+            max_value=500,
+            value=200,
+            step=25,
+            key="rc_jobs_limit",
+        )
+
+    display_rates = job_rates if show_all_jobs else job_rates.head(job_limit)
+    display_rates = display_rates.copy()
+    display_rates["job_label"] = _build_job_label_series(display_rates["job_no"], job_name_lookup)
+    display_cols = [
+        "job_label",
+        "quote_rate",
+        "realised_rate",
+        "rate_variance",
+        "rate_capture_pct",
+        "total_leakage",
+        "hours",
+        "revenue",
+    ]
+    job_display = display_rates[display_cols].rename(columns={
+        "job_label": "Job",
+        "quote_rate": "Quote Rate",
+        "realised_rate": "Realised Rate",
+        "rate_variance": "Rate Variance",
+        "rate_capture_pct": "Rate Capture %",
+        "total_leakage": "Total Leakage",
+        "hours": "Hours",
+        "revenue": "Revenue",
+    })
+
+    section_header("Jobs by Rate Variance", "Department slice (optional detail).")
+    st.dataframe(
+        job_display,
+        use_container_width=True,
+        hide_index=True,
+        column_config=_rate_table_column_config(),
+    )
+
+
 init_state()
 _init_rc_state()
 
@@ -525,7 +689,7 @@ if date_col in df_all.columns:
 if exclude_leave_toggle:
     df_filtered = exclude_leave(df_all)
 else:
-    df_filtered = df_all.copy()
+    df_filtered = df_all
 
 if not include_nonbillable and "is_billable" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["is_billable"] == True]
@@ -553,7 +717,7 @@ if category_col in df_filtered.columns:
     valid_mask = valid_mask & df_filtered[category_col].notna()
 
 excluded_rows = int((~valid_mask).sum())
-df_valid = df_filtered.loc[valid_mask].copy()
+df_valid = df_filtered.loc[valid_mask]
 if excluded_rows > 0:
     excluded_hours = df_filtered.loc[~valid_mask, "hours_raw"].sum() if "hours_raw" in df_filtered.columns else 0
     st.caption(
@@ -562,16 +726,7 @@ if excluded_rows > 0:
 
 job_name_lookup = build_job_name_lookup(df_valid)
 
-signature = (
-    time_window,
-    job_state,
-    exclude_leave_toggle,
-    include_nonbillable,
-    len(df_valid),
-    df_valid[date_col].min() if date_col in df_valid.columns else None,
-    df_valid[date_col].max() if date_col in df_valid.columns else None,
-)
-rate_tables = _get_cached_tables(signature, df_valid, category_col)
+rate_tables = _get_cached_tables(df_valid, category_col)
 
 # Validate selections against filtered data
 available_departments = df_valid["department_final"].dropna().unique().tolist()
@@ -671,148 +826,13 @@ if "department_final" in df_valid.columns:
 else:
     st.warning("Department field missing from dataset.")
 
-section_header("Department Detail", "Select a department to view category performance.")
-
-dept_options = ["All"] + sorted(available_departments)
-selected_department = st.selectbox(
-    "Department",
-    options=dept_options,
-    index=0,
-    key="rc_department_select",
+_render_rate_capture_drill(
+    df_valid=df_valid,
+    rate_tables=rate_tables,
+    category_col=category_col,
+    available_departments=available_departments,
+    min_job_hours=min_job_hours,
+    job_name_lookup=job_name_lookup,
 )
-if selected_department == "All":
-    selected_department = None
-
-if selected_department:
-    df_dept = df_valid[df_valid["department_final"] == selected_department]
-    dept_row = dept_rates[dept_rates["department_final"] == selected_department].head(1)
-    if len(dept_row) > 0:
-        dept_row = dept_row.iloc[0]
-        dept_quote_rate = dept_row.get("quote_rate", np.nan)
-        dept_realised_rate = dept_row.get("realised_rate", np.nan)
-        dept_variance = dept_row.get("rate_variance", np.nan)
-    else:
-        dept_quote_rate = dept_realised_rate = dept_variance = np.nan
-
-    billable_share = np.nan
-    if "is_billable" in df_dept.columns:
-        total_hours = df_dept["hours_raw"].sum()
-        billable_hours = df_dept.loc[df_dept["is_billable"] == True, "hours_raw"].sum()
-        billable_share = (billable_hours / total_hours * 100) if total_hours > 0 else np.nan
-
-    kpi_cols = st.columns(4)
-    with kpi_cols[0]:
-        st.metric("Dept Quote Rate", fmt_rate(dept_quote_rate))
-    with kpi_cols[1]:
-        st.metric("Dept Realised Rate", fmt_rate(dept_realised_rate))
-    with kpi_cols[2]:
-        st.metric("Rate Variance", _fmt_rate_delta(dept_variance))
-    with kpi_cols[3]:
-        st.metric("Billable Share", fmt_percent(billable_share))
-
-    if category_col not in df_dept.columns:
-        st.warning("Category field missing from dataset.")
-    else:
-        cat_rates = rate_tables["category"].copy()
-        cat_rates = cat_rates[cat_rates["department_final"] == selected_department]
-        cat_rates["total_leakage"] = np.where(
-            cat_rates["rate_variance"] < 0,
-            -cat_rates["rate_variance"] * cat_rates["hours"],
-            0,
-        )
-        cat_rates = cat_rates.sort_values("rate_variance").reset_index(drop=True)
-
-        display_cols = [
-            category_col,
-            "quote_rate",
-            "realised_rate",
-            "rate_variance",
-            "rate_capture_pct",
-            "total_leakage",
-            "hours",
-            "revenue",
-        ]
-        cat_display = cat_rates[display_cols].copy()
-        cat_display = cat_display.rename(columns={
-            category_col: "Category",
-            "quote_rate": "Quote Rate",
-            "realised_rate": "Realised Rate",
-            "rate_variance": "Rate Variance",
-            "rate_capture_pct": "Rate Capture %",
-            "total_leakage": "Total Leakage",
-            "hours": "Hours",
-            "revenue": "Revenue",
-        })
-
-        section_header("Categories by Rate Variance", "Department slice (no drill).")
-        st.dataframe(
-            cat_display,
-            use_container_width=True,
-            hide_index=True,
-            column_config=_rate_table_column_config(),
-        )
-
-    show_job_detail = st.checkbox("Show job detail (slower)", value=False, key="rc_show_job_detail")
-    if show_job_detail:
-        job_rates = rate_tables["job"].copy()
-        job_rates = job_rates[job_rates["department_final"] == selected_department]
-        job_rates = job_rates[job_rates["hours"] >= min_job_hours].copy()
-        job_rates["total_leakage"] = np.where(
-            job_rates["rate_variance"] < 0,
-            -job_rates["rate_variance"] * job_rates["hours"],
-            0,
-        )
-        job_rates = job_rates.sort_values("rate_variance").reset_index(drop=True)
-
-        if len(job_rates) == 0:
-            st.info("No jobs meet the current filters.")
-        else:
-            show_all_jobs = st.checkbox(
-                "Show all jobs (slow)",
-                value=False,
-                key="rc_jobs_all",
-            )
-            job_limit = 200
-            if not show_all_jobs:
-                job_limit = st.slider(
-                    "Max jobs",
-                    min_value=25,
-                    max_value=500,
-                    value=200,
-                    step=25,
-                    key="rc_jobs_limit",
-                )
-
-            display_rates = job_rates if show_all_jobs else job_rates.head(job_limit)
-            display_rates = display_rates.copy()
-            display_rates["job_label"] = _build_job_label_series(display_rates["job_no"], job_name_lookup)
-            display_cols = [
-                "job_label",
-                "quote_rate",
-                "realised_rate",
-                "rate_variance",
-                "rate_capture_pct",
-                "total_leakage",
-                "hours",
-                "revenue",
-            ]
-            job_display = display_rates[display_cols].rename(columns={
-                "job_label": "Job",
-                "quote_rate": "Quote Rate",
-                "realised_rate": "Realised Rate",
-                "rate_variance": "Rate Variance",
-                "rate_capture_pct": "Rate Capture %",
-                "total_leakage": "Total Leakage",
-                "hours": "Hours",
-                "revenue": "Revenue",
-            })
-
-            section_header("Jobs by Rate Variance", "Department slice (optional detail).")
-            st.dataframe(
-                job_display,
-                use_container_width=True,
-                hide_index=True,
-                column_config=_rate_table_column_config(),
-            )
 
 st.caption("Quote fields are deduped at the job-task level to prevent value inflation. Realised rates are hours-weighted.")

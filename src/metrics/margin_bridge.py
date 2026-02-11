@@ -9,13 +9,15 @@ Decomposes margin variance into:
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import Optional, List, Dict
 
 from src.data.semantic import safe_quote_rollup
 
 
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
 def compute_margin_bridge(df: pd.DataFrame,
-                          group_keys: Optional[List[str]] = None,
+                          group_keys: Optional[tuple[str, ...]] = None,
                           baseline_cost_per_hour: Optional[float] = None) -> pd.DataFrame:
     """
     Compute margin bridge decomposition.
@@ -27,12 +29,14 @@ def compute_margin_bridge(df: pd.DataFrame,
     - actual metrics
     - variance decomposition components
     """
+    keys = list(group_keys) if group_keys else []
+
     # Safe quote totals
-    quote = safe_quote_rollup(df, group_keys if group_keys else [])
+    quote = safe_quote_rollup(df, tuple(keys))
     
     # Actual profitability
-    if group_keys:
-        actuals = df.groupby(group_keys).agg(
+    if keys:
+        actuals = df.groupby(keys).agg(
             actual_hours=("hours_raw", "sum"),
             actual_cost=("base_cost", "sum"),
             actual_revenue=("rev_alloc", "sum"),
@@ -47,8 +51,8 @@ def compute_margin_bridge(df: pd.DataFrame,
         }])
     
     # Merge
-    if group_keys:
-        result = quote.merge(actuals, on=group_keys, how="outer")
+    if keys:
+        result = quote.merge(actuals, on=keys, how="outer")
     else:
         result = quote.copy()
         for col in actuals.columns:
@@ -128,6 +132,7 @@ def compute_margin_bridge(df: pd.DataFrame,
     return result
 
 
+@st.cache_data(show_spinner=False)
 def get_margin_bridge_waterfall(df: pd.DataFrame) -> pd.DataFrame:
     """
     Get margin bridge data formatted for waterfall chart.
@@ -153,6 +158,7 @@ def get_margin_bridge_waterfall(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(waterfall_data)
 
 
+@st.cache_data(show_spinner=False)
 def get_margin_bridge_summary(df: pd.DataFrame) -> Dict[str, float]:
     """
     Get margin bridge summary as a dictionary.
@@ -179,6 +185,7 @@ def get_margin_bridge_summary(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 
+@st.cache_data(show_spinner=False)
 def compute_margin_drivers(df: pd.DataFrame, 
                            group_key: str,
                            n: int = 10) -> pd.DataFrame:
@@ -187,7 +194,7 @@ def compute_margin_drivers(df: pd.DataFrame,
     
     Returns groups sorted by contribution to margin variance.
     """
-    bridge = compute_margin_bridge(df, [group_key])
+    bridge = compute_margin_bridge(df, (group_key,))
     
     # Sort by absolute variance
     bridge["abs_variance"] = bridge["margin_variance"].abs()

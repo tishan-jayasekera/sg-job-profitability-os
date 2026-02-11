@@ -7,10 +7,12 @@ from typing import List, Dict
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 
 from src.data.semantic import leave_exclusion_mask
 
 
+@st.cache_data(show_spinner=False)
 def compute_allocation_breakdown(df: pd.DataFrame,
                                  group_by: str = "staff_name") -> pd.DataFrame:
     """
@@ -66,6 +68,7 @@ def compute_allocation_breakdown(df: pd.DataFrame,
     return agg
 
 
+@st.cache_data(show_spinner=False)
 def compute_nonbillable_detail(df: pd.DataFrame,
                                staff_name: str = None) -> pd.DataFrame:
     """
@@ -101,6 +104,7 @@ def compute_nonbillable_detail(df: pd.DataFrame,
     return detail.sort_values("hours", ascending=False)
 
 
+@st.cache_data(show_spinner=False)
 def compute_hhi(df: pd.DataFrame,
                 group_col: str,
                 value_col: str = "hours_raw") -> pd.DataFrame:
@@ -129,6 +133,7 @@ def compute_hhi(df: pd.DataFrame,
     return hhi
 
 
+@st.cache_data(show_spinner=False)
 def compute_crowdout_flags(allocation_df: pd.DataFrame,
                            admin_threshold: float = 0.20,
                            internal_threshold: float = 0.30,
@@ -193,6 +198,7 @@ def compute_crowdout_flags(allocation_df: pd.DataFrame,
     return flags
 
 
+@st.cache_data(show_spinner=False)
 def compute_team_allocation(df: pd.DataFrame,
                             group_by: str = "department_final") -> pd.DataFrame:
     """

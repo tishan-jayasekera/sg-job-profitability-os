@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import List
 
 
@@ -12,6 +13,7 @@ def _date_col(df: pd.DataFrame) -> str:
     return "work_date" if "work_date" in df.columns else "month_key"
 
 
+@st.cache_data(show_spinner=False)
 def calculate_team_velocity(df: pd.DataFrame, active_job_no: str, weeks: int = 4) -> pd.DataFrame:
     """
     Calculate empirical team velocity per task for an active job.
@@ -37,7 +39,8 @@ def calculate_team_velocity(df: pd.DataFrame, active_job_no: str, weeks: int = 4
     return task_velocity[["job_no", "task_name", "team_velocity_hours_week"]]
 
 
-def build_velocity_for_active_jobs(df: pd.DataFrame, active_jobs: List[str], weeks: int = 4) -> pd.DataFrame:
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
+def build_velocity_for_active_jobs(df: pd.DataFrame, active_jobs: tuple[str, ...], weeks: int = 4) -> pd.DataFrame:
     rows = []
     for job_no in active_jobs:
         vel = calculate_team_velocity(df, job_no, weeks=weeks)

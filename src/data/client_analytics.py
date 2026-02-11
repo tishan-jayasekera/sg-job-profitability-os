@@ -17,15 +17,17 @@ def _as_datetime(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.to_datetime(df[col])
 
 
+@st.cache_data(show_spinner=False)
 def compute_client_rollup(df: pd.DataFrame) -> pd.DataFrame:
     if "client" not in df.columns or len(df) == 0:
         return pd.DataFrame()
-    rollup = profitability_rollup(df, ["client"])
+    rollup = profitability_rollup(df, ("client",))
     jobs = df.groupby("client")["job_no"].nunique().rename("job_count").reset_index()
     rollup = rollup.merge(jobs, on="client", how="left")
     return rollup
 
 
+@st.cache_data(show_spinner=False)
 def compute_client_portfolio_summary(df: pd.DataFrame) -> Dict[str, float]:
     rollup = compute_client_rollup(df)
     if len(rollup) == 0:
@@ -56,6 +58,7 @@ def compute_client_portfolio_summary(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 
+@st.cache_data(show_spinner=False)
 def compute_client_quadrants(
     df: pd.DataFrame,
     y_mode: str = "profit",
@@ -90,12 +93,14 @@ def compute_client_quadrants(
     return rollup, med_x, med_y
 
 
+@st.cache_data(show_spinner=False)
 def compute_client_hours_overrun(df: pd.DataFrame) -> pd.DataFrame:
     if "quoted_time_total" not in df.columns:
         return pd.DataFrame()
-    return quote_delivery_metrics(df, ["client"])
+    return quote_delivery_metrics(df, ("client",))
 
 
+@st.cache_data(show_spinner=False)
 def compute_client_growth(df: pd.DataFrame, months: int = 3) -> pd.DataFrame:
     if "month_key" not in df.columns or "client" not in df.columns:
         return pd.DataFrame()
@@ -123,11 +128,12 @@ def compute_client_growth(df: pd.DataFrame, months: int = 3) -> pd.DataFrame:
     return growth
 
 
+@st.cache_data(show_spinner=False)
 def compute_primary_driver(df: pd.DataFrame) -> pd.DataFrame:
     if "client" not in df.columns or "department_final" not in df.columns:
         return pd.DataFrame(columns=["client", "primary_driver"])
 
-    dept = profitability_rollup(df, ["client", "department_final"])
+    dept = profitability_rollup(df, ("client", "department_final"))
     dept = dept.sort_values(["client", "margin_pct"], ascending=[True, True])
     worst = dept.groupby("client").head(1).copy()
     worst["primary_driver"] = np.where(
@@ -138,7 +144,7 @@ def compute_primary_driver(df: pd.DataFrame) -> pd.DataFrame:
 
     overrun = pd.DataFrame()
     if "quoted_time_total" in df.columns:
-        overrun = quote_delivery_metrics(df, ["client", "department_final"])
+        overrun = quote_delivery_metrics(df, ("client", "department_final"))
         if len(overrun) > 0:
             overrun = overrun.sort_values(["client", "hours_variance_pct"], ascending=[True, False])
             overrun = overrun.groupby("client").head(1).copy()
@@ -157,6 +163,7 @@ def compute_primary_driver(df: pd.DataFrame) -> pd.DataFrame:
     return worst
 
 
+@st.cache_data(show_spinner=False)
 def compute_client_queue(df: pd.DataFrame, quadrant: Optional[str], mode: str, y_mode: str = "profit") -> pd.DataFrame:
     rollup = compute_client_rollup(df)
     if len(rollup) == 0:
@@ -203,6 +210,7 @@ def compute_client_queue(df: pd.DataFrame, quadrant: Optional[str], mode: str, y
     return rollup
 
 
+@st.cache_data(show_spinner=False)
 def compute_client_job_ledger(df: pd.DataFrame) -> pd.DataFrame:
     if "job_no" not in df.columns:
         return pd.DataFrame()
@@ -215,7 +223,7 @@ def compute_client_job_ledger(df: pd.DataFrame) -> pd.DataFrame:
     ).reset_index()
 
     # Safe quote rollup at job level
-    quote = safe_quote_rollup(df, ["job_no"])
+    quote = safe_quote_rollup(df, ("job_no",))
     if len(quote) > 0:
         ledger = ledger.merge(
             quote[["job_no", "quoted_hours", "quoted_amount"]],
@@ -251,13 +259,15 @@ def compute_client_job_ledger(df: pd.DataFrame) -> pd.DataFrame:
     return ledger
 
 
+@st.cache_data(show_spinner=False)
 def compute_client_department_profit(df: pd.DataFrame) -> pd.DataFrame:
     if "department_final" not in df.columns:
         return pd.DataFrame()
-    dept = profitability_rollup(df, ["department_final"])
+    dept = profitability_rollup(df, ("department_final",))
     return dept.sort_values("margin", ascending=True)
 
 
+@st.cache_data(show_spinner=False)
 def compute_client_task_mix(df: pd.DataFrame) -> pd.DataFrame:
     if "task_name" not in df.columns:
         return pd.DataFrame()
@@ -294,6 +304,7 @@ def compute_company_cost_rate(df: pd.DataFrame) -> float:
     return df["base_cost"].sum() / total_hours
 
 
+@st.cache_data(show_spinner=False)
 def compute_client_ltv(df: pd.DataFrame, client_name: str) -> Dict[str, pd.DataFrame]:
     if "client" not in df.columns or client_name is None:
         return {"monthly": pd.DataFrame(), "cumulative": pd.DataFrame()}
@@ -326,6 +337,7 @@ def compute_client_ltv(df: pd.DataFrame, client_name: str) -> Dict[str, pd.DataF
     return {"monthly": monthly, "cumulative": monthly[[date_col, "months_since_start", "cumulative_profit"]].copy()}
 
 
+@st.cache_data(show_spinner=False)
 def compute_client_tenure_months(df: pd.DataFrame, client_name: str) -> int:
     if "client" not in df.columns or client_name is None:
         return 0

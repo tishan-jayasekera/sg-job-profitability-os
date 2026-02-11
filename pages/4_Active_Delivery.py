@@ -43,6 +43,22 @@ def _resolve_selected_job(jobs_df) -> Optional[str]:
     return top_job
 
 
+@st.fragment
+def _render_master_detail(df, jobs_df, job_name_lookup) -> None:
+    left_col, right_col = st.columns([1, 2])
+
+    with left_col:
+        include_green = st.session_state.get("include_green_jobs", False)
+        selected_job = render_job_queue(jobs_df, job_name_lookup, include_green)
+
+    with right_col:
+        selected_job = selected_job or _resolve_selected_job(jobs_df)
+        if selected_job and selected_job in jobs_df["job_no"].values:
+            render_selected_job_panel(df, jobs_df, selected_job, job_name_lookup)
+        else:
+            st.info("← Select a job from the queue")
+
+
 def main() -> None:
     st.markdown("## Active Delivery Control Tower")
 
@@ -97,19 +113,7 @@ def main() -> None:
 
     render_alert_strip(jobs_df)
     st.divider()
-
-    left_col, right_col = st.columns([1, 2])
-
-    with left_col:
-        include_green = st.session_state.get("include_green_jobs", False)
-        selected_job = render_job_queue(jobs_df, job_name_lookup, include_green)
-
-    with right_col:
-        selected_job = selected_job or _resolve_selected_job(jobs_df)
-        if selected_job and selected_job in jobs_df["job_no"].values:
-            render_selected_job_panel(df, jobs_df, selected_job, job_name_lookup)
-        else:
-            st.info("← Select a job from the queue")
+    _render_master_detail(df, jobs_df, job_name_lookup)
 
 
 if __name__ == "__main__":

@@ -5,11 +5,13 @@ Single source of truth for: hours, cost, revenue, margin, margin%, realised_rate
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import Optional, List, Dict, Any
 
 
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
 def compute_profitability(df: pd.DataFrame, 
-                          group_keys: Optional[List[str]] = None) -> pd.DataFrame:
+                          group_keys: Optional[tuple[str, ...]] = None) -> pd.DataFrame:
     """
     Compute core profitability metrics.
     
@@ -27,8 +29,10 @@ def compute_profitability(df: pd.DataFrame,
         "revenue": ("rev_alloc", "sum"),
     }
     
-    if group_keys:
-        result = df.groupby(group_keys).agg(**agg_dict).reset_index()
+    keys = list(group_keys) if group_keys else []
+
+    if keys:
+        result = df.groupby(keys).agg(**agg_dict).reset_index()
     else:
         result = pd.DataFrame([{
             "hours": df["hours_raw"].sum(),
@@ -54,10 +58,11 @@ def compute_profitability(df: pd.DataFrame,
     return result
 
 
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
 def compute_profitability_comparison(df: pd.DataFrame,
-                                     group_keys: List[str],
+                                     group_keys: tuple[str, ...],
                                      compare_key: str,
-                                     compare_values: List[Any]) -> pd.DataFrame:
+                                     compare_values: tuple[Any, ...]) -> pd.DataFrame:
     """
     Compute profitability metrics with comparison across a dimension.
     
@@ -74,6 +79,7 @@ def compute_profitability_comparison(df: pd.DataFrame,
     return pd.concat(results, ignore_index=True)
 
 
+@st.cache_data(show_spinner=False)
 def compute_margin_contribution(df: pd.DataFrame,
                                 group_key: str) -> pd.DataFrame:
     """
@@ -81,7 +87,7 @@ def compute_margin_contribution(df: pd.DataFrame,
     
     Shows what % of total margin comes from each group.
     """
-    prof = compute_profitability(df, [group_key])
+    prof = compute_profitability(df, (group_key,))
     
     total_margin = prof["margin"].sum()
     total_revenue = prof["revenue"].sum()
@@ -101,8 +107,9 @@ def compute_margin_contribution(df: pd.DataFrame,
     return prof.sort_values("margin", ascending=False)
 
 
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
 def compute_profitability_trend(df: pd.DataFrame,
-                                group_keys: Optional[List[str]] = None,
+                                group_keys: Optional[tuple[str, ...]] = None,
                                 time_key: str = "month_key") -> pd.DataFrame:
     """
     Compute profitability metrics over time.
@@ -112,11 +119,12 @@ def compute_profitability_trend(df: pd.DataFrame,
     
     all_keys = [time_key]
     if group_keys:
-        all_keys = group_keys + [time_key]
-    
-    return compute_profitability(df, all_keys).sort_values(time_key)
+        all_keys = [*group_keys, time_key]
+
+    return compute_profitability(df, tuple(all_keys)).sort_values(time_key)
 
 
+@st.cache_data(show_spinner=False)
 def compute_realised_rate_distribution(df: pd.DataFrame,
                                        group_key: str = "job_no") -> pd.DataFrame:
     """
@@ -124,7 +132,7 @@ def compute_realised_rate_distribution(df: pd.DataFrame,
     
     Useful for understanding rate variability.
     """
-    prof = compute_profitability(df, [group_key])
+    prof = compute_profitability(df, (group_key,))
     
     # Filter to valid rates
     valid = prof[prof["realised_rate"].notna() & (prof["hours"] > 0)]

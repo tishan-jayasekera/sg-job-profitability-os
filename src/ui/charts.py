@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import List, Optional, Dict, Any
 
 
@@ -44,6 +45,7 @@ def apply_layout(fig: go.Figure, **kwargs) -> go.Figure:
 # KPI CHARTS
 # =============================================================================
 
+@st.cache_data(show_spinner=False)
 def kpi_gauge(value: float, target: Optional[float] = None, 
               title: str = "", suffix: str = "%",
               color: str = "primary") -> go.Figure:
@@ -72,6 +74,7 @@ def kpi_gauge(value: float, target: Optional[float] = None,
 # BAR CHARTS
 # =============================================================================
 
+@st.cache_data(show_spinner=False)
 def horizontal_bar(df: pd.DataFrame, x: str, y: str, 
                    title: str = "", color: Optional[str] = None,
                    text: Optional[str] = None) -> go.Figure:
@@ -91,7 +94,8 @@ def horizontal_bar(df: pd.DataFrame, x: str, y: str,
     return apply_layout(fig)
 
 
-def grouped_bar(df: pd.DataFrame, x: str, y: List[str],
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
+def grouped_bar(df: pd.DataFrame, x: str, y: tuple[str, ...],
                 title: str = "", barmode: str = "group") -> go.Figure:
     """
     Create grouped or stacked bar chart.
@@ -113,6 +117,7 @@ def grouped_bar(df: pd.DataFrame, x: str, y: List[str],
     return apply_layout(fig)
 
 
+@st.cache_data(show_spinner=False)
 def waterfall_chart(df: pd.DataFrame, 
                     labels: str, values: str,
                     title: str = "") -> go.Figure:
@@ -149,10 +154,11 @@ def waterfall_chart(df: pd.DataFrame,
 # SCATTER PLOTS
 # =============================================================================
 
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
 def scatter_plot(df: pd.DataFrame, x: str, y: str,
                  size: Optional[str] = None, color: Optional[str] = None,
                  hover_name: Optional[str] = None,
-                 hover_data: Optional[List[str]] = None,
+                 hover_data: Optional[tuple[str, ...]] = None,
                  title: str = "",
                  x_title: str = "", y_title: str = "") -> go.Figure:
     """
@@ -187,6 +193,7 @@ def scatter_plot(df: pd.DataFrame, x: str, y: str,
     return apply_layout(fig)
 
 
+@st.cache_data(show_spinner=False)
 def client_quadrant_scatter(
     df: pd.DataFrame,
     x_col: str,
@@ -253,15 +260,16 @@ def client_quadrant_scatter(
     return apply_layout(fig)
 
 
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
 def render_risk_matrix(df: pd.DataFrame,
                        x: str,
                        y: str,
                        size: str,
                        color: str,
                        hover_name: str,
-                       hover_data: List[str],
+                       hover_data: tuple[str, ...],
                        title: str = "Risk Matrix",
-                       custom_data: Optional[List[str]] = None) -> go.Figure:
+                       custom_data: Optional[tuple[str, ...]] = None) -> go.Figure:
     """
     Render risk matrix scatter with shaded risk zones.
     """

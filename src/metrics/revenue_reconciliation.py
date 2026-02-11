@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 
 from src.data.semantic import safe_quote_rollup, safe_quote_job_task, get_category_col
 
@@ -141,6 +142,7 @@ class JobDiagnosis:
 # =============================================================================
 
 
+@st.cache_data(show_spinner=False)
 def compute_job_reconciliation(df: pd.DataFrame) -> pd.DataFrame:
     """
     Reconcile quoted amount vs actual revenue at job level.
@@ -156,7 +158,7 @@ def compute_job_reconciliation(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     # Safe quote totals per job (deduped at job-task level)
-    quote_by_job = safe_quote_rollup(df, ["job_no"])
+    quote_by_job = safe_quote_rollup(df, ("job_no",))
 
     # Actuals per job
     agg_dict = {
@@ -255,6 +257,7 @@ def _assign_revenue_status(df: pd.DataFrame) -> pd.Series:
     return np.select(conditions, choices, default="Unknown")
 
 
+@st.cache_data(show_spinner=False)
 def compute_reconciliation_summary(recon_df: pd.DataFrame) -> ReconciliationSummary:
     """
     Compute portfolio-level reconciliation summary.
@@ -336,6 +339,7 @@ def compute_reconciliation_summary(recon_df: pd.DataFrame) -> ReconciliationSumm
 # =============================================================================
 
 
+@st.cache_data(show_spinner=False)
 def analyze_patterns_by_dimension(recon_df: pd.DataFrame, dimension: str) -> pd.DataFrame:
     """
     Analyze reconciliation patterns by a grouping dimension.
@@ -386,6 +390,7 @@ def analyze_patterns_by_dimension(recon_df: pd.DataFrame, dimension: str) -> pd.
     return result.sort_values("total_delta", ascending=True)
 
 
+@st.cache_data(show_spinner=False)
 def compute_concentration_curve(recon_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute cumulative leakage curve for concentration analysis.
@@ -415,6 +420,7 @@ def compute_concentration_curve(recon_df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 
+@st.cache_data(show_spinner=False)
 def diagnose_job(
     df: pd.DataFrame, recon_df: pd.DataFrame, job_no: str
 ) -> Optional[JobDiagnosis]:
@@ -621,6 +627,7 @@ def _get_task_breakdown(df: pd.DataFrame, job_no: str) -> Optional[pd.DataFrame]
 # =============================================================================
 
 
+@st.cache_data(show_spinner=False)
 def check_data_quality(recon_df: pd.DataFrame) -> Dict[str, float]:
     """
     Check data quality issues in quote-revenue matching.

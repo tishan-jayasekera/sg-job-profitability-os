@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import Tuple
 
 
+@st.cache_data(show_spinner=False)
 def forecast_remaining_work(
     df_active: pd.DataFrame,
     benchmarks: pd.DataFrame,
@@ -40,7 +42,7 @@ def forecast_remaining_work(
     )
     job_meta["projected_eac_hours"] = job_meta["job_total_hours_p50"].fillna(job_meta["actual_job_hours"])
 
-    task_mix_use = task_mix.copy()
+    task_mix_use = task_mix
     remaining_rows = []
 
     for _, job in job_meta.iterrows():
@@ -88,6 +90,7 @@ def forecast_remaining_work(
     return pd.DataFrame(remaining_rows)
 
 
+@st.cache_data(show_spinner=False)
 def solve_bottlenecks(
     remaining_df: pd.DataFrame,
     velocity_df: pd.DataFrame,
@@ -140,6 +143,7 @@ def solve_bottlenecks(
     return merged, job_level
 
 
+@st.cache_data(show_spinner=False)
 def compute_risk_score(due_weeks: float, eta_weeks: float) -> float:
     """
     Compute risk score for a job in range [0, 1.0].
@@ -175,6 +179,7 @@ def compute_risk_score(due_weeks: float, eta_weeks: float) -> float:
     return float(min(max(score, 0.0), 1.0))
 
 
+@st.cache_data(show_spinner=False)
 def compute_risk_scores_for_jobs(job_level: pd.DataFrame) -> pd.DataFrame:
     """
     Vectorized risk scoring for all jobs.
@@ -186,16 +191,29 @@ def compute_risk_scores_for_jobs(job_level: pd.DataFrame) -> pd.DataFrame:
         Same DataFrame with added 'risk_score' column
     """
     job_level = job_level.copy()
-    job_level["risk_score"] = job_level.apply(
-        lambda row: compute_risk_score(row.get("due_weeks"), row.get("job_eta_weeks")),
-        axis=1
+    due = pd.to_numeric(job_level.get("due_weeks"), errors="coerce")
+    eta = pd.to_numeric(job_level.get("job_eta_weeks"), errors="coerce")
+    score = np.where(
+        (due.isna()) | (eta.isna()),
+        np.nan,
+        np.where(
+            due <= 0,
+            1.0,
+            np.where(
+                np.isinf(eta),
+                1.0,
+                np.clip(1.0 - np.maximum(0.0, (due - eta) / due), 0.0, 1.0),
+            ),
+        ),
     )
+    job_level["risk_score"] = score
     return job_level
 
 # ============================================================================
 # PHASE 1B: 5-LEVEL DRILL-CHAIN SCOPING FUNCTIONS
 # ============================================================================
 
+@st.cache_data(show_spinner=False)
 def translate_job_state(
     risk_score: float,
     due_weeks: float,
@@ -238,6 +256,7 @@ def translate_job_state(
         return ("Blocked", f"🔴 Critical (buffer: {due_weeks:.1f}w)")
 
 
+@st.cache_data(show_spinner=False)
 def get_company_forecast(
     job_level: pd.DataFrame,
     horizon_weeks: int = 12,
@@ -296,6 +315,7 @@ def get_company_forecast(
     }
 
 
+@st.cache_data(show_spinner=False)
 def get_dept_forecast(
     job_level: pd.DataFrame,
     dept: str,
@@ -351,6 +371,7 @@ def get_dept_forecast(
     }
 
 
+@st.cache_data(show_spinner=False)
 def get_category_jobs(
     job_level: pd.DataFrame,
     dept: str,
@@ -385,6 +406,7 @@ def get_category_jobs(
     return cat_jobs
 
 
+@st.cache_data(show_spinner=False)
 def get_job_tasks(
     remaining_by_task: pd.DataFrame,
     job_id: int,

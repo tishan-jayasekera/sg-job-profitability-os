@@ -5,6 +5,7 @@ Single source of truth for: quote rate, realised rate, rate variance.
 """
 import pandas as pd
 import numpy as np
+import streamlit as st
 from typing import Optional, List, Dict
 
 from src.data.semantic import safe_quote_rollup
@@ -12,8 +13,9 @@ from src.data.semantic import quote_delivery_metrics, utilisation_metrics
 from src.data.semantic import get_category_col
 
 
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
 def compute_rate_metrics(df: pd.DataFrame,
-                         group_keys: Optional[List[str]] = None) -> pd.DataFrame:
+                         group_keys: Optional[tuple[str, ...]] = None) -> pd.DataFrame:
     """
     Compute rate capture metrics.
     
@@ -23,12 +25,14 @@ def compute_rate_metrics(df: pd.DataFrame,
     - rate_variance: realised_rate - quote_rate
     - hours, revenue, quoted_hours, quoted_amount
     """
+    keys = list(group_keys) if group_keys else []
+
     # Safe quote rollup
-    quote = safe_quote_rollup(df, group_keys if group_keys else [])
+    quote = safe_quote_rollup(df, tuple(keys))
     
     # Profitability metrics for realised rate
-    if group_keys:
-        actuals = df.groupby(group_keys).agg(
+    if keys:
+        actuals = df.groupby(keys).agg(
             hours=("hours_raw", "sum"),
             revenue=("rev_alloc", "sum"),
         ).reset_index()
@@ -39,14 +43,14 @@ def compute_rate_metrics(df: pd.DataFrame,
         }])
     
     # Merge
-    if group_keys:
+    if keys:
         result = actuals.merge(
-            quote[group_keys + ["quoted_hours", "quoted_amount", "quote_rate"]],
-            on=group_keys,
+            quote[keys + ["quoted_hours", "quoted_amount", "quote_rate"]],
+            on=keys,
             how="outer"
         )
     else:
-        result = actuals.copy()
+        result = actuals
         result["quoted_hours"] = quote["quoted_hours"].iloc[0] if len(quote) > 0 else 0
         result["quoted_amount"] = quote["quoted_amount"].iloc[0] if len(quote) > 0 else 0
         result["quote_rate"] = quote["quote_rate"].iloc[0] if len(quote) > 0 else np.nan
@@ -71,6 +75,7 @@ def compute_rate_metrics(df: pd.DataFrame,
     return result
 
 
+@st.cache_data(show_spinner=False)
 def compute_weighted_rates(df: pd.DataFrame) -> Dict[str, float]:
     """
     Compute hours-weighted average rates for summary display.
@@ -90,6 +95,7 @@ def compute_weighted_rates(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 
+@st.cache_data(show_spinner=False)
 def compute_rate_distribution(df: pd.DataFrame,
                               group_key: str = "job_no") -> pd.DataFrame:
     """
@@ -97,7 +103,7 @@ def compute_rate_distribution(df: pd.DataFrame,
     
     Returns stats for both quote rate and realised rate.
     """
-    rates = compute_rate_metrics(df, [group_key])
+    rates = compute_rate_metrics(df, (group_key,))
     
     # Filter to valid rates
     valid_quote = rates[rates["quote_rate"].notna()]
@@ -122,8 +128,9 @@ def compute_rate_distribution(df: pd.DataFrame,
     return pd.DataFrame([result])
 
 
+@st.cache_data(show_spinner=False, hash_funcs={list: lambda x: tuple(x)})
 def compute_rate_leakage(df: pd.DataFrame,
-                         group_keys: Optional[List[str]] = None,
+                         group_keys: Optional[tuple[str, ...]] = None,
                          threshold: float = -10) -> pd.DataFrame:
     """
     Identify rate leakage (negative rate variance).
@@ -149,6 +156,7 @@ def compute_rate_leakage(df: pd.DataFrame,
     return rates
 
 
+@st.cache_data(show_spinner=False)
 def get_rate_capture_summary(df: pd.DataFrame) -> Dict[str, float]:
     """
     Get summary rate capture metrics as a dictionary.
@@ -169,13 +177,14 @@ def get_rate_capture_summary(df: pd.DataFrame) -> Dict[str, float]:
     }
 
 
+@st.cache_data(show_spinner=False)
 def get_top_rate_leakage(df: pd.DataFrame,
                          group_key: str,
                          n: int = 10) -> pd.DataFrame:
     """
     Get top groups by rate leakage (worst rate capture).
     """
-    rates = compute_rate_metrics(df, [group_key])
+    rates = compute_rate_metrics(df, (group_key,))
     
     # Filter to negative variance
     leakage = rates[rates["rate_variance"] < 0].copy()
@@ -184,6 +193,7 @@ def get_top_rate_leakage(df: pd.DataFrame,
     return leakage.nsmallest(n, "total_leakage")
 
 
+@st.cache_data(show_spinner=False)
 def compute_rate_variance_diagnosis(df: pd.DataFrame,
                                     group_key: str = "job_no",
                                     min_hours: float = 5) -> pd.DataFrame:
@@ -193,8 +203,8 @@ def compute_rate_variance_diagnosis(df: pd.DataFrame,
     if group_key not in df.columns:
         return pd.DataFrame()
     
-    rates = compute_rate_metrics(df, [group_key])
-    delivery = quote_delivery_metrics(df, [group_key])
+    rates = compute_rate_metrics(df, (group_key,))
+    delivery = quote_delivery_metrics(df, (group_key,))
     util = utilisation_metrics(df, [group_key], exclude_leave=True)
     
     result = rates.merge(delivery[[group_key, "hours_variance_pct", "unquoted_share"]], on=group_key, how="left")

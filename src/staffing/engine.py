@@ -4,10 +4,12 @@ Staffing engine: match staff to tasks based on demonstrated capability.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import streamlit as st
 
 from src.config import config
 
@@ -38,6 +40,7 @@ def _get_category_row(df: pd.DataFrame, staff_name: str, category: str) -> Optio
     return match.iloc[0]
 
 
+@st.cache_data(show_spinner=False)
 def check_eligibility(staff_name: str,
                       task_name: str,
                       category: str,
@@ -66,6 +69,10 @@ def check_eligibility(staff_name: str,
     return False, "no_match"
 
 
+@st.cache_data(
+    show_spinner=False,
+    hash_funcs={dict: lambda d: json.dumps(d, sort_keys=True, default=str)},
+)
 def score_staff_for_task(task_name: str,
                          category: str,
                          hours_needed: float,
@@ -136,6 +143,10 @@ def score_staff_for_task(task_name: str,
     return result
 
 
+@st.cache_data(
+    show_spinner=False,
+    hash_funcs={dict: lambda d: json.dumps(d, sort_keys=True, default=str)},
+)
 def recommend_staff_for_plan(quote_plan: dict,
                              task_expertise_df: pd.DataFrame,
                              category_expertise_df: pd.DataFrame,
@@ -212,6 +223,7 @@ def recommend_staff_for_plan(quote_plan: dict,
     return pd.DataFrame(recommendations), warnings
 
 
+@st.cache_data(show_spinner=False)
 def get_capability_coverage(category_expertise_df: pd.DataFrame,
                             min_score: float = 30) -> pd.DataFrame:
     """
