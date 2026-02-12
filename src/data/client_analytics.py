@@ -18,18 +18,18 @@ def _as_datetime(df: pd.DataFrame, col: str) -> pd.Series:
 
 
 @st.cache_data(show_spinner=False)
-def compute_client_rollup(df: pd.DataFrame) -> pd.DataFrame:
-    if "client" not in df.columns or len(df) == 0:
+def compute_client_rollup(df: pd.DataFrame, client_col: str = "client") -> pd.DataFrame:
+    if client_col not in df.columns or len(df) == 0:
         return pd.DataFrame()
-    rollup = profitability_rollup(df, ("client",))
-    jobs = df.groupby("client")["job_no"].nunique().rename("job_count").reset_index()
-    rollup = rollup.merge(jobs, on="client", how="left")
+    rollup = profitability_rollup(df, (client_col,))
+    jobs = df.groupby(client_col)["job_no"].nunique().rename("job_count").reset_index()
+    rollup = rollup.merge(jobs, on=client_col, how="left")
     return rollup
 
 
 @st.cache_data(show_spinner=False)
-def compute_client_portfolio_summary(df: pd.DataFrame) -> Dict[str, float]:
-    rollup = compute_client_rollup(df)
+def compute_client_portfolio_summary(df: pd.DataFrame, client_col: str = "client") -> Dict[str, float]:
+    rollup = compute_client_rollup(df, client_col=client_col)
     if len(rollup) == 0:
         return {
             "total_clients": 0,
@@ -49,7 +49,7 @@ def compute_client_portfolio_summary(df: pd.DataFrame) -> Dict[str, float]:
     )
 
     return {
-        "total_clients": rollup["client"].nunique(),
+        "total_clients": rollup[client_col].nunique(),
         "portfolio_revenue": rollup["revenue"].sum(),
         "portfolio_profit": total_profit,
         "median_margin_pct": rollup["margin_pct"].median(),
@@ -62,8 +62,9 @@ def compute_client_portfolio_summary(df: pd.DataFrame) -> Dict[str, float]:
 def compute_client_quadrants(
     df: pd.DataFrame,
     y_mode: str = "profit",
+    client_col: str = "client",
 ) -> Tuple[pd.DataFrame, float, float]:
-    rollup = compute_client_rollup(df)
+    rollup = compute_client_rollup(df, client_col=client_col)
     if len(rollup) == 0:
         return pd.DataFrame(), np.nan, np.nan
 
@@ -94,15 +95,15 @@ def compute_client_quadrants(
 
 
 @st.cache_data(show_spinner=False)
-def compute_client_hours_overrun(df: pd.DataFrame) -> pd.DataFrame:
+def compute_client_hours_overrun(df: pd.DataFrame, client_col: str = "client") -> pd.DataFrame:
     if "quoted_time_total" not in df.columns:
         return pd.DataFrame()
-    return quote_delivery_metrics(df, ("client",))
+    return quote_delivery_metrics(df, (client_col,))
 
 
 @st.cache_data(show_spinner=False)
-def compute_client_growth(df: pd.DataFrame, months: int = 3) -> pd.DataFrame:
-    if "month_key" not in df.columns or "client" not in df.columns:
+def compute_client_growth(df: pd.DataFrame, months: int = 3, client_col: str = "client") -> pd.DataFrame:
+    if "month_key" not in df.columns or client_col not in df.columns:
         return pd.DataFrame()
     df = df.copy()
     df["month_key"] = _as_datetime(df, "month_key")
@@ -116,8 +117,8 @@ def compute_client_growth(df: pd.DataFrame, months: int = 3) -> pd.DataFrame:
     recent_df = df[df["month_key"].isin(recent)]
     prior_df = df[df["month_key"].isin(prior)] if prior else pd.DataFrame(columns=df.columns)
 
-    recent_rev = recent_df.groupby("client")["rev_alloc"].sum().rename("recent_revenue")
-    prior_rev = prior_df.groupby("client")["rev_alloc"].sum().rename("prior_revenue")
+    recent_rev = recent_df.groupby(client_col)["rev_alloc"].sum().rename("recent_revenue")
+    prior_rev = prior_df.groupby(client_col)["rev_alloc"].sum().rename("prior_revenue")
 
     growth = pd.concat([recent_rev, prior_rev], axis=1).fillna(0).reset_index()
     growth["revenue_growth_pct"] = np.where(
@@ -129,13 +130,13 @@ def compute_client_growth(df: pd.DataFrame, months: int = 3) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def compute_primary_driver(df: pd.DataFrame) -> pd.DataFrame:
-    if "client" not in df.columns or "department_final" not in df.columns:
-        return pd.DataFrame(columns=["client", "primary_driver"])
+def compute_primary_driver(df: pd.DataFrame, client_col: str = "client") -> pd.DataFrame:
+    if client_col not in df.columns or "department_final" not in df.columns:
+        return pd.DataFrame(columns=[client_col, "primary_driver"])
 
-    dept = profitability_rollup(df, ("client", "department_final"))
-    dept = dept.sort_values(["client", "margin_pct"], ascending=[True, True])
-    worst = dept.groupby("client").head(1).copy()
+    dept = profitability_rollup(df, (client_col, "department_final"))
+    dept = dept.sort_values([client_col, "margin_pct"], ascending=[True, True])
+    worst = dept.groupby(client_col).head(1).copy()
     worst["primary_driver"] = np.where(
         worst["margin"] < 0,
         "Loss in Dept " + worst["department_final"].astype(str),
@@ -144,58 +145,64 @@ def compute_primary_driver(df: pd.DataFrame) -> pd.DataFrame:
 
     overrun = pd.DataFrame()
     if "quoted_time_total" in df.columns:
-        overrun = quote_delivery_metrics(df, ("client", "department_final"))
+        overrun = quote_delivery_metrics(df, (client_col, "department_final"))
         if len(overrun) > 0:
-            overrun = overrun.sort_values(["client", "hours_variance_pct"], ascending=[True, False])
-            overrun = overrun.groupby("client").head(1).copy()
+            overrun = overrun.sort_values([client_col, "hours_variance_pct"], ascending=[True, False])
+            overrun = overrun.groupby(client_col).head(1).copy()
             overrun["primary_driver"] = np.where(
                 overrun["hours_variance_pct"] > 10,
                 "Overrun in Dept " + overrun["department_final"].astype(str),
                 np.nan,
             )
-            overrun = overrun[["client", "primary_driver"]]
+            overrun = overrun[[client_col, "primary_driver"]]
 
     if len(overrun) > 0:
-        worst = worst.merge(overrun, on="client", how="left", suffixes=("", "_overrun"))
+        worst = worst.merge(overrun, on=client_col, how="left", suffixes=("", "_overrun"))
         worst["primary_driver"] = worst["primary_driver_overrun"].fillna(worst["primary_driver"])
-        worst = worst[["client", "primary_driver"]]
+        worst = worst[[client_col, "primary_driver"]]
 
     return worst
 
 
 @st.cache_data(show_spinner=False)
-def compute_client_queue(df: pd.DataFrame, quadrant: Optional[str], mode: str, y_mode: str = "profit") -> pd.DataFrame:
-    rollup = compute_client_rollup(df)
+def compute_client_queue(
+    df: pd.DataFrame,
+    quadrant: Optional[str],
+    mode: str,
+    y_mode: str = "profit",
+    client_col: str = "client",
+) -> pd.DataFrame:
+    rollup = compute_client_rollup(df, client_col=client_col)
     if len(rollup) == 0:
         return pd.DataFrame()
 
-    overrun = compute_client_hours_overrun(df)
-    growth = compute_client_growth(df)
-    drivers = compute_primary_driver(df)
+    overrun = compute_client_hours_overrun(df, client_col=client_col)
+    growth = compute_client_growth(df, client_col=client_col)
+    drivers = compute_primary_driver(df, client_col=client_col)
 
     if len(overrun) > 0:
         rollup = rollup.merge(
-            overrun[["client", "hours_variance_pct"]],
-            on="client",
+            overrun[[client_col, "hours_variance_pct"]],
+            on=client_col,
             how="left",
         )
     else:
         rollup["hours_variance_pct"] = np.nan
 
     if len(growth) > 0:
-        rollup = rollup.merge(growth[["client", "revenue_growth_pct"]], on="client", how="left")
+        rollup = rollup.merge(growth[[client_col, "revenue_growth_pct"]], on=client_col, how="left")
     else:
         rollup["revenue_growth_pct"] = np.nan
 
     if len(drivers) > 0:
-        rollup = rollup.merge(drivers, on="client", how="left")
+        rollup = rollup.merge(drivers, on=client_col, how="left")
     else:
         rollup["primary_driver"] = "—"
 
     if quadrant:
-        quadrant_df, _, _ = compute_client_quadrants(df, y_mode=y_mode)
+        quadrant_df, _, _ = compute_client_quadrants(df, y_mode=y_mode, client_col=client_col)
         if len(quadrant_df) > 0:
-            rollup = rollup.merge(quadrant_df[["client", "quadrant"]], on="client", how="left")
+            rollup = rollup.merge(quadrant_df[[client_col, "quadrant"]], on=client_col, how="left")
             rollup = rollup[rollup["quadrant"] == quadrant]
 
     if mode == "Growth":
@@ -278,12 +285,12 @@ def compute_client_task_mix(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def compute_global_task_median_mix(df: pd.DataFrame) -> pd.DataFrame:
-    if "client" not in df.columns or "task_name" not in df.columns:
+def compute_global_task_median_mix(df: pd.DataFrame, client_col: str = "client") -> pd.DataFrame:
+    if client_col not in df.columns or "task_name" not in df.columns:
         return pd.DataFrame(columns=["task_name", "global_share_pct"])
-    client_task = df.groupby(["client", "task_name"])["hours_raw"].sum().reset_index()
-    client_total = client_task.groupby("client")["hours_raw"].sum().rename("client_hours")
-    client_task = client_task.merge(client_total.reset_index(), on="client", how="left")
+    client_task = df.groupby([client_col, "task_name"])["hours_raw"].sum().reset_index()
+    client_total = client_task.groupby(client_col)["hours_raw"].sum().rename("client_hours")
+    client_task = client_task.merge(client_total.reset_index(), on=client_col, how="left")
     client_task["share_pct"] = np.where(
         client_task["client_hours"] > 0,
         client_task["hours_raw"] / client_task["client_hours"] * 100,
@@ -305,11 +312,11 @@ def compute_company_cost_rate(df: pd.DataFrame) -> float:
 
 
 @st.cache_data(show_spinner=False)
-def compute_client_ltv(df: pd.DataFrame, client_name: str) -> Dict[str, pd.DataFrame]:
-    if "client" not in df.columns or client_name is None:
+def compute_client_ltv(df: pd.DataFrame, client_name: str, client_col: str = "client") -> Dict[str, pd.DataFrame]:
+    if client_col not in df.columns or client_name is None:
         return {"monthly": pd.DataFrame(), "cumulative": pd.DataFrame()}
 
-    df_client = df[df["client"] == client_name].copy()
+    df_client = df[df[client_col] == client_name].copy()
     if len(df_client) == 0:
         return {"monthly": pd.DataFrame(), "cumulative": pd.DataFrame()}
 
@@ -338,10 +345,10 @@ def compute_client_ltv(df: pd.DataFrame, client_name: str) -> Dict[str, pd.DataF
 
 
 @st.cache_data(show_spinner=False)
-def compute_client_tenure_months(df: pd.DataFrame, client_name: str) -> int:
-    if "client" not in df.columns or client_name is None:
+def compute_client_tenure_months(df: pd.DataFrame, client_name: str, client_col: str = "client") -> int:
+    if client_col not in df.columns or client_name is None:
         return 0
-    df_client = df[df["client"] == client_name].copy()
+    df_client = df[df[client_col] == client_name].copy()
     if len(df_client) == 0:
         return 0
     date_col = "month_key" if "month_key" in df_client.columns else "work_date"

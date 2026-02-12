@@ -17,9 +17,10 @@ from src.data.loader import load_fact_timesheet
 from src.data.semantic import get_category_col
 from src.metrics.delivery_control import compute_delivery_control_view
 from src.ui.delivery_control_components import (
-    render_alert_strip,
+    inject_delivery_control_theme,
     render_job_queue,
     render_selected_job_panel,
+    summarize_alerts,
 )
 from src.ui.formatting import build_job_name_lookup
 from src.ui.state import init_state
@@ -44,7 +45,7 @@ def _resolve_selected_job(jobs_df) -> Optional[str]:
 
 
 @st.fragment
-def _render_master_detail(df, jobs_df, job_name_lookup) -> None:
+def _render_master_detail(df_scope, df_all, jobs_df, job_name_lookup) -> None:
     left_col, right_col = st.columns([1, 2])
 
     with left_col:
@@ -54,66 +55,97 @@ def _render_master_detail(df, jobs_df, job_name_lookup) -> None:
     with right_col:
         selected_job = selected_job or _resolve_selected_job(jobs_df)
         if selected_job and selected_job in jobs_df["job_no"].values:
-            render_selected_job_panel(df, jobs_df, selected_job, job_name_lookup)
+            render_selected_job_panel(
+                df_scope,
+                jobs_df,
+                selected_job,
+                job_name_lookup,
+                df_all=df_all,
+            )
         else:
             st.info("← Select a job from the queue")
 
 
 def main() -> None:
-    st.markdown("## Active Delivery Control Tower")
+    inject_delivery_control_theme()
+    st.markdown('<div class="dc-page-title">Active Delivery Control Tower</div>', unsafe_allow_html=True)
 
-    df = load_fact_timesheet()
+    df_all = load_fact_timesheet()
+    with st.container(border=True):
+        col1, col2, col3, col4, col5 = st.columns([1.1, 1.1, 1.2, 0.8, 0.8], gap="small")
 
-    col1, col2, col3 = st.columns([1, 1, 2])
+        with col1:
+            st.markdown('<div class="dc-filter-label">Department</div>', unsafe_allow_html=True)
+            depts = ["All"] + sorted(df_all["department_final"].dropna().unique().tolist())
+            dept = st.selectbox(
+                "Department",
+                depts,
+                key="dc_dept",
+                label_visibility="collapsed",
+            )
 
-    with col1:
-        depts = ["All"] + sorted(df["department_final"].dropna().unique().tolist())
-        dept = st.selectbox(
-            "Department",
-            depts,
-            key="dc_dept",
-            label_visibility="collapsed",
-        )
+        df_scope = df_all if dept == "All" else df_all[df_all["department_final"] == dept]
 
-    df_filtered = df if dept == "All" else df[df["department_final"] == dept]
+        with col2:
+            st.markdown('<div class="dc-filter-label">Category</div>', unsafe_allow_html=True)
+            cat_col = get_category_col(df_scope)
+            cats = ["All"] + sorted(df_scope[cat_col].dropna().unique().tolist())
+            cat = st.selectbox(
+                "Category",
+                cats,
+                key="dc_cat",
+                label_visibility="collapsed",
+            )
 
-    with col2:
-        cat_col = get_category_col(df_filtered)
-        cats = ["All"] + sorted(df_filtered[cat_col].dropna().unique().tolist())
-        cat = st.selectbox(
-            "Category",
-            cats,
-            key="dc_cat",
-            label_visibility="collapsed",
-        )
+        with col3:
+            st.markdown('<div class="dc-filter-label">Recency</div>', unsafe_allow_html=True)
+            recency_label = st.selectbox(
+                "Recency",
+                ["Last 14d", "Last 28d", "Last 60d", "Last 90d"],
+                index=1,
+                key="dc_recency",
+                label_visibility="collapsed",
+            )
 
-    with col3:
-        recency_label = st.selectbox(
-            "Recency",
-            ["Last 14d", "Last 28d", "Last 60d", "Last 90d"],
-            index=1,
-            key="dc_recency",
-            label_visibility="collapsed",
-        )
+        recency_days = int(recency_label.split()[1].replace("d", ""))
+        if cat != "All":
+            df_scope = df_scope[df_scope[cat_col] == cat]
 
-    recency_days = int(recency_label.split()[1].replace("d", ""))
+        jobs_df = compute_delivery_control_view(df_scope, recency_days=recency_days)
+        summary = summarize_alerts(jobs_df) if len(jobs_df) > 0 else {"red_count": 0, "amber_count": 0, "margin_at_risk": 0}
 
-    if dept != "All":
-        df = df[df["department_final"] == dept]
-    if cat != "All":
-        df = df[df[cat_col] == cat]
+        with col4:
+            st.markdown(
+                f"""
+                <div class="dc-pill dc-pill-critical">
+                    <div class="dc-pill-title">Critical Exposure</div>
+                    <div class="dc-pill-value">{int(summary["red_count"])} jobs</div>
+                    <div class="dc-pill-sub">${summary["margin_at_risk"]:,.0f} margin at risk</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-    jobs_df = compute_delivery_control_view(df, recency_days=recency_days)
+        with col5:
+            st.markdown(
+                f"""
+                <div class="dc-pill dc-pill-watch">
+                    <div class="dc-pill-title">Watchlist</div>
+                    <div class="dc-pill-value">{int(summary["amber_count"])} jobs</div>
+                    <div class="dc-pill-sub">Require review this cycle</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+        st.markdown('<div class="dc-command-divider"></div>', unsafe_allow_html=True)
 
     if len(jobs_df) == 0:
         st.info("No active jobs found for the selected filters.")
         return
 
-    job_name_lookup = build_job_name_lookup(df)
-
-    render_alert_strip(jobs_df)
-    st.divider()
-    _render_master_detail(df, jobs_df, job_name_lookup)
+    job_name_lookup = build_job_name_lookup(df_all)
+    _render_master_detail(df_scope, df_all, jobs_df, job_name_lookup)
 
 
 if __name__ == "__main__":

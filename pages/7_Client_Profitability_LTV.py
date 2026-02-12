@@ -42,6 +42,14 @@ from src.ui.state import init_state, get_state, set_state
 from src.ui.formatting import build_job_name_lookup, format_job_label
 
 
+def _get_client_col(df: pd.DataFrame) -> str:
+    """Return the best available client grouping column.
+    Prefer client_group_rev_job (parent group); fall back to client (entity)."""
+    if "client_group_rev_job" in df.columns and df["client_group_rev_job"].notna().any():
+        return "client_group_rev_job"
+    return "client"
+
+
 st.set_page_config(page_title="Client Profitability & LTV", page_icon="📈", layout="wide")
 
 init_state()
@@ -74,8 +82,8 @@ def _build_margin_trend(monthly: pd.DataFrame) -> px.bar:
     return fig
 
 
-@st.fragment
 def _render_quadrant_and_focus_fragment(df_window: pd.DataFrame) -> tuple[str, pd.DataFrame, str]:
+    CLIENT_COL = st.session_state.get("_client_col", "client")
     y_axis_label = st.radio(
         "Y-axis",
         ["Absolute Profit", "Margin %"],
@@ -83,11 +91,11 @@ def _render_quadrant_and_focus_fragment(df_window: pd.DataFrame) -> tuple[str, p
         key="client_quadrant_y_axis",
     )
     y_mode = "margin_pct" if y_axis_label == "Margin %" else "profit"
-    quadrant_df, median_x, median_y = compute_client_quadrants(df_window, y_mode=y_mode)
-    quote_rollup = safe_quote_rollup(df_window, ("client",))
+    quadrant_df, median_x, median_y = compute_client_quadrants(df_window, y_mode=y_mode, client_col=CLIENT_COL)
+    quote_rollup = safe_quote_rollup(df_window, (CLIENT_COL,))
     if len(quote_rollup) > 0 and "quoted_amount" in quote_rollup.columns:
-        valid_clients = quote_rollup[quote_rollup["quoted_amount"] > 0]["client"].unique().tolist()
-        quadrant_df = quadrant_df[quadrant_df["client"].isin(valid_clients)]
+        valid_clients = quote_rollup[quote_rollup["quoted_amount"] > 0][CLIENT_COL].unique().tolist()
+        quadrant_df = quadrant_df[quadrant_df[CLIENT_COL].isin(valid_clients)]
 
     y_title = "Margin %" if y_mode == "margin_pct" else "Profit"
     scatter_fig = charts.client_quadrant_scatter(
@@ -101,6 +109,7 @@ def _render_quadrant_and_focus_fragment(df_window: pd.DataFrame) -> tuple[str, p
         title="Client Portfolio: Revenue vs Profitability",
         x_title="Revenue",
         y_title=y_title,
+        client_col=CLIENT_COL,
     )
     render_client_quadrant_scatter(scatter_fig)
 
@@ -119,6 +128,7 @@ def _render_intervention_queue_fragment(
     selected_quadrant: str,
     y_mode: str,
 ) -> None:
+    CLIENT_COL = st.session_state.get("_client_col", "client")
     mode_options = ["Intervention", "Growth"]
     selected_mode = st.radio(
         "Queue Mode",
@@ -135,8 +145,14 @@ def _render_intervention_queue_fragment(
         key="client_shortlist_size",
     )
 
-    queue_df = compute_client_queue(df_window, selected_quadrant, selected_mode, y_mode=y_mode)
-    render_client_intervention_queue(queue_df, shortlist_size)
+    queue_df = compute_client_queue(
+        df_window,
+        selected_quadrant,
+        selected_mode,
+        y_mode=y_mode,
+        client_col=CLIENT_COL,
+    )
+    render_client_intervention_queue(queue_df, shortlist_size, client_col=CLIENT_COL)
 
 
 def main():
@@ -148,6 +164,9 @@ def main():
         st.warning("No fact_timesheet_day_enriched data available.")
         return
 
+    CLIENT_COL = _get_client_col(df_all)
+    st.session_state["_client_col"] = CLIENT_COL
+
     if "month_key" in df_all.columns:
         df_all["month_key"] = pd.to_datetime(df_all["month_key"])
 
@@ -156,6 +175,10 @@ def main():
     def _reset_client_selection():
         if "selected_client_name" in st.session_state:
             st.session_state["selected_client_name"] = []
+
+    if "_client_ltv_job_state_initialized" not in st.session_state:
+        st.session_state["job_state_filter"] = "Completed"
+        st.session_state["_client_ltv_job_state_initialized"] = True
 
     time_window = st.sidebar.selectbox(
         "Time Window",
@@ -179,12 +202,14 @@ def main():
             df_window = df_window[df_window["job_no"].isin(state_jobs["job_no"].unique())]
     else:
         df_window = filter_jobs_by_state(df_window, selected_state)
-    if "client" not in df_window.columns:
+    if CLIENT_COL not in df_window.columns:
         st.warning("Client field missing from dataset.")
         return
+    time_window_label = f"Last {time_window}" if time_window != "all" else "All Time"
+    st.caption(f"Current View: {time_window_label} | Job Status: {selected_state}")
 
     # SECTION 1 — Executive Portfolio Health
-    summary = compute_client_portfolio_summary(df_window)
+    summary = compute_client_portfolio_summary(df_window, client_col=CLIENT_COL)
     render_client_portfolio_health(summary)
 
     # SECTION 2 — Portfolio Quadrant Scatter
@@ -194,13 +219,21 @@ def main():
     _render_intervention_queue_fragment(df_window, selected_quadrant, y_mode)
 
     # SECTION 4 — Selected Client Deep-Dive
-    if len(quadrant_df) > 0:
-        client_pool = quadrant_df[quadrant_df["quadrant"] == selected_quadrant]["client"].unique().tolist()
-    else:
-        client_pool = []
+    override_quadrant = st.checkbox(
+        "Show all clients (override quadrant filter)",
+        value=False,
+        key="client_override_quadrant",
+    )
 
-    if not client_pool:
-        client_pool = sorted(df_window["client"].dropna().unique().tolist())
+    if override_quadrant:
+        client_pool = sorted(df_window[CLIENT_COL].dropna().unique().tolist())
+    else:
+        if len(quadrant_df) > 0:
+            client_pool = quadrant_df[quadrant_df["quadrant"] == selected_quadrant][CLIENT_COL].unique().tolist()
+        else:
+            client_pool = []
+        if not client_pool:
+            client_pool = sorted(df_window[CLIENT_COL].dropna().unique().tolist())
 
     prior_clients = st.session_state.get("selected_client_name")
     if isinstance(prior_clients, str):
@@ -222,7 +255,7 @@ def main():
         st.info("Select at least one client to continue.")
         return
 
-    df_client_window = df_window[df_window["client"].isin(selected_clients)].copy()
+    df_client_window = df_window[df_window[CLIENT_COL].isin(selected_clients)].copy()
 
     # Canonical drill chain filters
     chain_key_map = {
@@ -317,22 +350,6 @@ def main():
         df_client_window = df_client_window[df_client_window["staff_name"] == selected_staff]
 
     client_rollup = profitability_rollup(df_client_window)
-    quote_rollup = safe_quote_rollup(df_client_window, ())
-    quoted_revenue = np.nan
-    quoted_hours = np.nan
-    quoted_cost = np.nan
-    quoted_margin_pct = np.nan
-    if len(quote_rollup) > 0:
-        quoted_revenue = quote_rollup["quoted_amount"].iloc[0]
-        quoted_hours = quote_rollup["quoted_hours"].iloc[0]
-        total_hours = df_client_window["hours_raw"].sum()
-        total_cost = df_client_window["base_cost"].sum()
-        cost_rate = total_cost / total_hours if total_hours > 0 else np.nan
-        if pd.notna(quoted_hours) and pd.notna(cost_rate):
-            quoted_cost = quoted_hours * cost_rate
-        if pd.notna(quoted_revenue) and quoted_revenue > 0 and pd.notna(quoted_cost):
-            quoted_margin_pct = (quoted_revenue - quoted_cost) / quoted_revenue * 100
-
     if len(client_rollup) > 0:
         client_rollup = client_rollup.iloc[0]
         jobs_count = df_client_window["job_no"].nunique()
@@ -342,10 +359,6 @@ def main():
             "Margin %": client_rollup["margin_pct"],
             "Realised Rate": client_rollup["realised_rate"],
             "Jobs": jobs_count,
-            "Quoted Revenue": quoted_revenue,
-            "Quoted Cost": quoted_cost,
-            "Quoted Margin %": quoted_margin_pct,
-            "Quoted Hours": quoted_hours,
         }
         grade = _health_grade(client_rollup["margin_pct"], client_rollup["margin"])
     else:
@@ -355,10 +368,6 @@ def main():
             "Margin %": np.nan,
             "Realised Rate": np.nan,
             "Jobs": 0,
-            "Quoted Revenue": quoted_revenue,
-            "Quoted Cost": quoted_cost,
-            "Quoted Margin %": quoted_margin_pct,
-            "Quoted Hours": quoted_hours,
         }
         grade = "Unknown"
 
@@ -378,7 +387,7 @@ def main():
 
     # SECTION 5 — Driver Forensics
     client_task = compute_client_task_mix(df_client_window)
-    global_task = compute_global_task_median_mix(df_all)
+    global_task = compute_global_task_median_mix(df_all, client_col=CLIENT_COL)
     task_compare = pd.merge(client_task, global_task, on="task_name", how="left")
     task_compare["global_share_pct"] = task_compare["global_share_pct"].fillna(0)
     task_compare["client_share_pct"] = task_compare["share_pct"]
@@ -581,8 +590,8 @@ def main():
     ltv_client = selected_clients[0]
     if len(selected_clients) > 1:
         st.info(f"LTV view reflects the first selected client: {ltv_client}.")
-    ltv = compute_client_ltv(df_all, ltv_client)
-    tenure_months = compute_client_tenure_months(df_all, ltv_client)
+    ltv = compute_client_ltv(df_all, ltv_client, client_col=CLIENT_COL)
+    tenure_months = compute_client_tenure_months(df_all, ltv_client, client_col=CLIENT_COL)
 
     cumulative = ltv.get("cumulative", pd.DataFrame())
     if len(cumulative) > 0:

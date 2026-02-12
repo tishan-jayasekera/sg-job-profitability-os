@@ -1,0 +1,140 @@
+import pandas as pd
+import pytest
+
+from src.metrics.client_group_subsidy import compute_client_group_subsidy_context
+
+
+def _make_df(
+    selected_margin: float,
+    peer_margins: list[float],
+    group_columns: dict | None = None,
+) -> pd.DataFrame:
+    if group_columns is None:
+        group_columns = {
+            "client_group_rev_job_month": "G1",
+            "client_group_rev_job": "G1",
+            "client_group": "G1",
+            "client": "G1",
+        }
+
+    rows = []
+    all_jobs = [("SEL", selected_margin)] + [
+        (f"P{i+1}", margin) for i, margin in enumerate(peer_margins)
+    ]
+
+    for i, (job_no, margin) in enumerate(all_jobs):
+        revenue = float(abs(margin) + 100.0)
+        cost = float(revenue - margin)
+        row = {
+            "job_no": job_no,
+            "job_name": f"Job {job_no}",
+            "department_final": "Tax",
+            "job_category": "Compliance",
+            "work_date": pd.Timestamp("2025-01-01") + pd.DateOffset(days=i),
+            "hours_raw": float(10 + i),
+            "base_cost": cost,
+            "rev_alloc": revenue,
+        }
+        row.update(group_columns)
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _make_jobs_df(job_nos: list[str]) -> pd.DataFrame:
+    rows = []
+    for i, job_no in enumerate(job_nos):
+        rows.append(
+            {
+                "job_no": job_no,
+                "risk_band": "Red" if i == 0 else "Amber",
+                "risk_score": 85 - (i * 10),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def test_full_subsidy_verdict():
+    df = _make_df(selected_margin=-100, peer_margins=[100, 80])
+    jobs_df = _make_jobs_df(["SEL", "P1", "P2"])
+
+    result = compute_client_group_subsidy_context(df, jobs_df, "SEL", lookback_months=12, scope="all")
+
+    assert result["status"] == "ok"
+    assert result["summary"]["verdict"] == "Fully Subsidized"
+    assert result["summary"]["coverage_ratio"] == pytest.approx(1.8)
+
+
+def test_partial_subsidy_verdict():
+    df = _make_df(selected_margin=-200, peer_margins=[140])
+    jobs_df = _make_jobs_df(["SEL", "P1"])
+
+    result = compute_client_group_subsidy_context(df, jobs_df, "SEL", lookback_months=12, scope="all")
+
+    assert result["status"] == "ok"
+    assert result["summary"]["verdict"] == "Partially Subsidized"
+    assert result["summary"]["coverage_ratio"] == pytest.approx(0.7)
+
+
+def test_weak_subsidy_verdict():
+    df = _make_df(selected_margin=-200, peer_margins=[60])
+    jobs_df = _make_jobs_df(["SEL", "P1"])
+
+    result = compute_client_group_subsidy_context(df, jobs_df, "SEL", lookback_months=12, scope="all")
+
+    assert result["status"] == "ok"
+    assert result["summary"]["verdict"] == "Weak Subsidy"
+    assert result["summary"]["coverage_ratio"] == pytest.approx(0.3)
+
+
+def test_not_subsidized_verdict():
+    df = _make_df(selected_margin=-150, peer_margins=[0, -50])
+    jobs_df = _make_jobs_df(["SEL", "P1", "P2"])
+
+    result = compute_client_group_subsidy_context(df, jobs_df, "SEL", lookback_months=12, scope="all")
+
+    assert result["status"] == "ok"
+    assert result["summary"]["verdict"] == "Not Subsidized"
+    assert result["summary"]["positive_peer_margin_pool"] == 0
+
+
+def test_no_subsidy_needed_verdict():
+    df = _make_df(selected_margin=50, peer_margins=[25, -10])
+    jobs_df = _make_jobs_df(["SEL", "P1", "P2"])
+
+    result = compute_client_group_subsidy_context(df, jobs_df, "SEL", lookback_months=12, scope="all")
+
+    assert result["status"] == "ok"
+    assert result["summary"]["verdict"] == "No Subsidy Needed"
+
+
+def test_group_column_fallback_to_client():
+    df = _make_df(
+        selected_margin=-100,
+        peer_margins=[120],
+        group_columns={"client": "ACME"},
+    )
+    jobs_df = _make_jobs_df(["SEL", "P1"])
+
+    result = compute_client_group_subsidy_context(df, jobs_df, "SEL", lookback_months=12, scope="all")
+
+    assert result["status"] == "ok"
+    assert result["group_col"] == "client"
+
+
+def test_active_only_scope_keeps_active_and_forces_selected():
+    df = _make_df(selected_margin=-100, peer_margins=[150, 200])
+    jobs_df = _make_jobs_df(["P1"])  # SEL and P2 are inactive in this context
+
+    result = compute_client_group_subsidy_context(
+        df,
+        jobs_df,
+        "SEL",
+        lookback_months=12,
+        scope="active_only",
+    )
+
+    assert result["status"] == "ok"
+    jobs = set(result["jobs"]["job_no"].tolist())
+    assert jobs == {"SEL", "P1"}
+    assert bool(result["jobs"].loc[result["jobs"]["job_no"] == "SEL", "is_selected"].iloc[0]) is True

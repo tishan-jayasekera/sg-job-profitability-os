@@ -205,6 +205,7 @@ def client_quadrant_scatter(
     title: str = "Client Portfolio Quadrants",
     x_title: str = "Revenue",
     y_title: str = "Profit",
+    client_col: str = "client",
 ) -> go.Figure:
     """
     Scatter with quadrant lines and labels.
@@ -225,7 +226,7 @@ def client_quadrant_scatter(
         size=size_col,
         color="margin_sign",
         symbol=quadrant_col,
-        hover_name="client",
+        hover_name=client_col,
         hover_data=["revenue", "margin", "margin_pct", "hours", "realised_rate"],
         title=title,
         color_discrete_map={

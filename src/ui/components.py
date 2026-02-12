@@ -250,13 +250,13 @@ def render_client_quadrant_scatter(fig):
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
-def render_client_intervention_queue(df: pd.DataFrame, shortlist_size: int):
+def render_client_intervention_queue(df: pd.DataFrame, shortlist_size: int, client_col: str = "client"):
     st.subheader("Section 3 — The Intervention Queue")
     if len(df) == 0:
         st.info("No clients found for the selected quadrant.")
         return
     queue = df.head(shortlist_size).rename(columns={
-        "client": "Client",
+        client_col: "Client",
         "margin": "Profit",
         "margin_pct": "Margin %",
         "revenue": "Revenue",
