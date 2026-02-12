@@ -551,77 +551,62 @@ def render_job_queue(
     with st.container(border=True):
         st.markdown('<div class="dc-kicker">Priority Queue</div>', unsafe_allow_html=True)
 
-        if include_green:
-            display_df = jobs_df
-        else:
-            display_df = jobs_df[jobs_df["risk_band"].isin(["Red", "Amber"])]
+        if "include_green_jobs" not in st.session_state:
+            st.session_state["include_green_jobs"] = include_green
+        include_green_jobs = st.checkbox("Include on-track jobs", key="include_green_jobs")
 
-        sort_col, _ = st.columns([1.15, 1.0])
-        with sort_col:
-            sort_option = st.selectbox(
-                "Sort by",
-                ["Risk Score", "Margin at Risk", "Hours Overrun", "Recent Activity"],
-                key="job_queue_sort",
-                label_visibility="collapsed",
-            )
+        sort_option = st.selectbox(
+            "Sort by",
+            ["Risk Score", "Margin at Risk", "Hours Overrun", "Recent Activity"],
+            key="job_queue_sort",
+            label_visibility="collapsed",
+        )
+
+        display_df = jobs_df if include_green_jobs else jobs_df[jobs_df["risk_band"] != "Green"]
         display_df = _apply_sort(display_df, sort_option)
 
-        if "job_queue_limit" not in st.session_state:
-            st.session_state.job_queue_limit = 10
+        if len(display_df) == 0:
+            st.info("No jobs matching current filters.")
+            return None
 
-        display_df = display_df.head(st.session_state.job_queue_limit)
-        selected_job = None
-        selected_current = st.session_state.get("selected_job")
+        risk_emoji = {"Red": "🔴", "Amber": "🟡", "Green": "🟢"}
+        options: List[str] = []
+        job_nos: List[str] = []
+        for _, row in display_df.iterrows():
+            job_no = str(row["job_no"])
+            job_name = str(job_name_lookup.get(job_no, "") or "")
+            badge = risk_emoji.get(str(row.get("risk_band", "")), "⚪")
+            label = f"{badge} {job_no}"
+            if job_name:
+                label += f" - {job_name}"
+            driver = str(row.get("primary_driver", "") or "")
+            if driver and driver != "Monitor":
+                label += f"  |  {driver}"
+            options.append(label)
+            job_nos.append(job_no)
 
-        with st.container(height=760, border=False):
-            for _, row in display_df.iterrows():
-                job_no = str(row["job_no"])
-                job_name = str(job_name_lookup.get(job_no, job_no))
-                issue = str(_format_primary_issue(row))
-                action = str(row.get("recommended_action", "Review job status"))
-                risk_score = row.get("risk_score", np.nan)
-                risk_meta = _risk_meta(risk_score, str(row.get("risk_band", "Green")))
-                score_text = f"{float(risk_score):.0f}" if pd.notna(risk_score) else "—"
-                runtime_days = row.get("runtime_days", np.nan)
-                runtime_text = f"{int(runtime_days)} days" if pd.notna(runtime_days) else "N/A"
-                margin_pct = row.get("forecast_margin_pct", np.nan)
-                if pd.notna(margin_pct):
-                    fill = int(np.clip(round((float(margin_pct) + 20) / 12), 0, 10))
-                    bar = "█" * fill + "·" * (10 - fill)
-                    bar_text = f"{bar}  {float(margin_pct):+.0f}%"
-                else:
-                    bar_text = "··········  n/a"
-                line1 = f"{risk_meta['dot']}{score_text:>3}  {job_no} — {job_name[:52]}"
-                line2 = f"Runtime: {runtime_text}"
-                line3 = bar_text
-                line4 = issue
-                line5 = f"→ {action[:50]}"
-                card_text = "\n".join([line1, line2, line3, line4, line5])
-                is_selected = selected_current == job_no
+        current_idx = 0
+        current_selected = st.session_state.get("selected_job")
+        current_selected_str = str(current_selected) if current_selected is not None else None
+        if current_selected_str in job_nos:
+            current_idx = job_nos.index(current_selected_str)
+        if "job_queue_radio" in st.session_state:
+            stored_idx = st.session_state.get("job_queue_radio")
+            if not isinstance(stored_idx, int) or stored_idx < 0 or stored_idx >= len(options):
+                st.session_state["job_queue_radio"] = current_idx
 
-                if st.button(
-                    card_text,
-                    key=f"job_card_{job_no}",
-                    use_container_width=True,
-                    type="primary" if is_selected else "secondary",
-                ):
-                    selected_job = job_no
-                    st.session_state.selected_job = job_no
+        selected_idx = st.radio(
+            "Priority Queue",
+            options=list(range(len(options))),
+            format_func=lambda i: options[i],
+            index=current_idx,
+            key="job_queue_radio",
+            label_visibility="collapsed",
+        )
 
-        remaining = len(jobs_df) - st.session_state.job_queue_limit
-        if remaining > 0:
-            spacer_l, more_col, spacer_r = st.columns([1, 1.4, 1])
-            with more_col:
-                if st.button(
-                    f"Show {min(10, remaining)} more",
-                    key="job_queue_more",
-                    type="tertiary",
-                    use_container_width=True,
-                ):
-                    st.session_state.job_queue_limit += 10
-
-        st.toggle("Include Green jobs", key="include_green_jobs")
-        return selected_job or st.session_state.get("selected_job")
+        selected_job = job_nos[selected_idx]
+        st.session_state.selected_job = selected_job
+        return selected_job
 
 
 def render_selected_job_panel(
@@ -639,18 +624,42 @@ def render_selected_job_panel(
     if df_all is None:
         df_all = df
 
-    job_row = jobs_df[jobs_df["job_no"] == job_no].iloc[0]
-    job_name = job_row.get("job_name") or job_name_lookup.get(job_no, job_no)
+    job_mask = jobs_df["job_no"].astype(str) == str(job_no)
+    if not job_mask.any():
+        st.info("Selected job is no longer available in this filtered view.")
+        return
+    job_row = jobs_df.loc[job_mask].iloc[0]
+    selected_job_no = str(job_row["job_no"])
+    job_name = job_row.get("job_name") or job_name_lookup.get(selected_job_no, selected_job_no)
 
     dept = job_row.get("department_final", "")
     cat = job_row.get("job_category", "")
     risk_meta = _risk_meta(job_row.get("risk_score", np.nan), str(job_row.get("risk_band", "Green")))
     risk_label = risk_meta["label"]
     risk_chip_class = risk_meta["chip_class"]
+    risk_band = str(job_row.get("risk_band", "Unknown"))
+    risk_colors = {"Red": "#dc3545", "Amber": "#ffc107", "Green": "#28a745"}
+    band_color = risk_colors.get(risk_band, "#6c757d")
+    primary_driver = str(job_row.get("primary_driver", "Monitor"))
+    st.markdown(
+        f"""
+        <div style="background:{band_color}15; border-left:4px solid {band_color};
+                    padding:12px 16px; border-radius:4px; margin-bottom:16px;">
+            <div style="font-size:1.1em; font-weight:600; color:#1a1a2e;">
+                {escape(selected_job_no)} - {escape(str(job_name) if job_name else "Unnamed")}
+            </div>
+            <div style="font-size:0.85em; color:#555; margin-top:4px;">
+                Risk: <strong style="color:{band_color}">{escape(risk_band)}</strong>
+                &nbsp;|&nbsp; {escape(primary_driver)}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
     st.markdown(
         f"""
         <div class="dc-job-header">
-            <div class="dc-job-id">{escape(str(job_no))}</div>
+            <div class="dc-job-id">{escape(selected_job_no)}</div>
             <div class="dc-job-title">{escape(str(job_name))}</div>
             <div class="dc-tag-row">
                 <span class="dc-chip">Delivery : {escape(str(dept))}</span>
@@ -663,19 +672,20 @@ def render_selected_job_panel(
     )
 
     _render_job_snapshot(job_row)
-    _render_client_group_subsidy_context(df_all, jobs_df, job_no)
+    _render_peer_margin_comparison(job_row, jobs_df)
+    _render_client_group_subsidy_context(df_all, jobs_df, selected_job_no)
 
     drivers = compute_root_cause_drivers(df, job_row)
     _render_why_at_risk(drivers)
     _render_recommended_actions(job_row, drivers)
 
     with st.expander("▼ Expand Full Diagnosis", expanded=True):
-        _render_full_diagnosis(df, job_no, job_row)
+        _render_full_diagnosis(df, selected_job_no, job_row)
 
     with st.expander("Definitions", expanded=False):
         _render_definitions()
 
-    brief_bytes, brief_name = export_action_brief(job_no, job_row, drivers)
+    brief_bytes, brief_name = export_action_brief(selected_job_no, job_row, drivers)
     st.download_button(
         "📤 Export Action Brief",
         data=brief_bytes,
@@ -686,12 +696,14 @@ def render_selected_job_panel(
 
 def _render_job_snapshot(row: pd.Series) -> None:
     """Render compact snapshot box."""
-    quoted = row.get("quoted_hours", 0) or 0
-    actual = row.get("actual_hours", 0) or 0
+    quoted_raw = pd.to_numeric(row.get("quoted_hours"), errors="coerce")
+    actual_raw = pd.to_numeric(row.get("actual_hours"), errors="coerce")
+    quoted = float(quoted_raw) if pd.notna(quoted_raw) else 0.0
+    actual = float(actual_raw) if pd.notna(actual_raw) else 0.0
     variance_pct = (actual - quoted) / quoted * 100 if quoted > 0 else 0
 
-    margin = row.get("forecast_margin_pct", 0)
-    bench = row.get("median_margin_pct", 0)
+    margin = pd.to_numeric(row.get("forecast_margin_pct"), errors="coerce")
+    bench = pd.to_numeric(row.get("median_margin_pct"), errors="coerce")
     delta = margin - bench if pd.notna(margin) and pd.notna(bench) else None
 
     burn_current = row.get("burn_rate_per_day", np.nan)
@@ -702,13 +714,28 @@ def _render_job_snapshot(row: pd.Series) -> None:
         burn_delta = (burn_current - burn_prev) * 7
 
     consumed_pct = (actual / quoted * 100) if quoted > 0 else np.nan
+    consumed_display = f"{consumed_pct:.0f}%" if pd.notna(consumed_pct) else "N/A"
     ring_deg = int(np.clip((consumed_pct if pd.notna(consumed_pct) else 0) * 3.6, 0, 360))
     hours_delta_color = "#DC2626" if variance_pct > 0 else "#16A34A"
     hours_delta_arrow = "↑" if variance_pct > 0 else "↓"
-    margin_delta_label = f"{delta:+.0f}pp vs bench" if delta is not None else "No benchmark"
+    margin_delta_label = f"{delta:+.0f}pp vs peer benchmark" if delta is not None else "No benchmark"
     margin_delta_color = "#16A34A" if (delta is not None and delta >= 0) else "#DC2626"
     burn_delta_label = f"{burn_delta:+.0f} hrs/wk" if burn_delta is not None else "No prior window"
     burn_delta_color = "#DC2626" if (burn_delta is not None and burn_delta < 0) else "#16A34A"
+
+    margin_to_date = pd.to_numeric(row.get("margin_pct_to_date"), errors="coerce")
+    if pd.isna(margin_to_date):
+        actual_revenue = pd.to_numeric(row.get("actual_revenue"), errors="coerce")
+        actual_cost = pd.to_numeric(row.get("actual_cost"), errors="coerce")
+        if pd.notna(actual_revenue) and actual_revenue > 0 and pd.notna(actual_cost):
+            margin_to_date = (actual_revenue - actual_cost) / actual_revenue * 100
+
+    margin_at_risk = pd.to_numeric(row.get("margin_at_risk"), errors="coerce")
+    mar_confidence = str(row.get("margin_at_risk_confidence", "low")).lower()
+    if mar_confidence == "medium":
+        mar_label = "Margin at Risk (est.)"
+    else:
+        mar_label = "Margin at Risk"
 
     with st.container(border=True):
         st.markdown('<div class="dc-kicker">Snapshot</div>', unsafe_allow_html=True)
@@ -722,7 +749,7 @@ def _render_job_snapshot(row: pd.Series) -> None:
                     <div style="display:flex; align-items:center; gap:0.62rem;">
                         <div style="width:54px;height:54px;border-radius:50%;background:conic-gradient(#2563EB {ring_deg}deg, #E5E7EB {ring_deg}deg);display:flex;align-items:center;justify-content:center;">
                             <div style="width:43px;height:43px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#6B7280;font-family:var(--dc-mono);">
-                                {consumed_pct:.0f}%"""
+                                {consumed_display}"""
                 + """
                             </div>
                         </div>
@@ -743,12 +770,13 @@ def _render_job_snapshot(row: pd.Series) -> None:
             )
 
         with c2:
+            margin_display = f"{margin:.0f}%" if pd.notna(margin) else "N/A"
             st.markdown(
                 f"""
                 <div class="dc-block">
-                    <div class="dc-filter-label">Margin</div>
+                    <div class="dc-filter-label">Forecast Margin %</div>
                     <div style="font-size:32px;line-height:1.0;font-weight:760;color:#111827;font-family:var(--dc-mono);">
-                        {margin:.0f}%
+                        {margin_display}
                     </div>
                     <div style="margin-top:0.33rem;font-size:12px;font-weight:700;color:{margin_delta_color};font-family:var(--dc-mono);">
                         {margin_delta_label}
@@ -776,6 +804,23 @@ def _render_job_snapshot(row: pd.Series) -> None:
             )
 
         st.markdown('<div class="dc-section-divider"></div>', unsafe_allow_html=True)
+        m1, m2, m3 = st.columns(3, gap="small")
+        with m1:
+            st.metric(
+                "Margin-to-Date %",
+                f"{margin_to_date:.1f}%" if pd.notna(margin_to_date) else "N/A",
+            )
+        with m2:
+            st.metric(
+                "Peer Benchmark Margin % (completed jobs)",
+                f"{bench:.1f}%" if pd.notna(bench) else "N/A",
+            )
+        with m3:
+            if mar_confidence == "low":
+                st.metric("Margin at Risk", "Insufficient data")
+            else:
+                mar_value = f"${margin_at_risk:,.0f}" if pd.notna(margin_at_risk) else "N/A"
+                st.metric(mar_label, mar_value)
         st.markdown(
             '<div class="dc-footnote">Burn rate = average hours/day over the last 28 days, scaled to weekly hours. Delta compares the prior 28-day window.</div>',
             unsafe_allow_html=True,
@@ -816,6 +861,72 @@ def _fmt_percent(value: float) -> str:
     if pd.isna(value):
         return "—"
     return f"{value:.1f}%"
+
+
+def _render_peer_margin_comparison(job_row: pd.Series, jobs_df: pd.DataFrame) -> None:
+    """Render peer margin comparison using the same formulas as the selected-job snapshot."""
+    dept = job_row.get("department_final")
+    cat = job_row.get("job_category")
+    peers = jobs_df[
+        (jobs_df["department_final"] == dept)
+        & (jobs_df["job_category"] == cat)
+    ].copy()
+
+    with st.container(border=True):
+        st.markdown('<div class="dc-kicker">Peer Margin Comparison</div>', unsafe_allow_html=True)
+
+        peer_count = len(peers)
+        if peer_count <= 1:
+            st.caption("No active peer jobs for comparison in this category.")
+            return
+
+        peer_forecast_margin_median = pd.to_numeric(
+            peers["forecast_margin_pct"], errors="coerce"
+        ).median()
+
+        if {"actual_revenue", "actual_cost"}.issubset(peers.columns):
+            peer_revenue = pd.to_numeric(peers["actual_revenue"], errors="coerce")
+            peer_cost = pd.to_numeric(peers["actual_cost"], errors="coerce")
+            peer_margin_to_date_values = np.where(
+                peer_revenue > 0,
+                ((peer_revenue - peer_cost) / peer_revenue) * 100,
+                np.nan,
+            )
+        else:
+            peer_margin_to_date_values = pd.to_numeric(
+                peers.get("margin_pct_to_date", pd.Series(dtype=float)),
+                errors="coerce",
+            ).to_numpy()
+        peer_margin_to_date_median = (
+            float(np.nanmedian(peer_margin_to_date_values))
+            if np.any(~np.isnan(peer_margin_to_date_values))
+            else np.nan
+        )
+
+        bench_margin = pd.to_numeric(job_row.get("median_margin_pct"), errors="coerce")
+        st.markdown(f"**Active Peer Jobs** ({peer_count} jobs in {dept} / {cat})")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric(
+                "Peer Forecast Margin %",
+                f"{peer_forecast_margin_median:.1f}%"
+                if pd.notna(peer_forecast_margin_median)
+                else "N/A",
+            )
+        with col2:
+            st.metric(
+                "Peer Margin-to-Date %",
+                f"{peer_margin_to_date_median:.1f}%"
+                if pd.notna(peer_margin_to_date_median)
+                else "N/A",
+            )
+        with col3:
+            st.metric(
+                "Historical Benchmark % (completed jobs)",
+                f"{bench_margin:.1f}%"
+                if pd.notna(bench_margin)
+                else "N/A",
+            )
 
 
 def _render_client_group_subsidy_context(
@@ -893,7 +1004,7 @@ def _render_client_group_subsidy_context(
             st.metric("Group Margin ($)", _fmt_signed_currency(summary["group_margin"]))
         with kpi_3:
             group_margin_pct = summary["group_margin_pct"]
-            st.metric("Group Margin % (pp)", f"{group_margin_pct:.1f}pp" if pd.notna(group_margin_pct) else "—")
+            st.metric("Group Margin-to-Date %", f"{group_margin_pct:.1f}%" if pd.notna(group_margin_pct) else "—")
         kpi_4, kpi_5, kpi_6 = st.columns(3)
         with kpi_4:
             coverage_ratio = summary["coverage_ratio"]
@@ -992,7 +1103,7 @@ def _render_client_group_subsidy_context(
                 )
 
         st.markdown("<div class='dc-section-divider'></div>", unsafe_allow_html=True)
-        st.markdown("**Peer Jobs in Selected Client Group**")
+        st.markdown("**Peer Jobs in Selected Client Group (Margin-to-Date actuals)**")
         table_cols = [
             "is_selected",
             "job_no",
@@ -1012,7 +1123,9 @@ def _render_client_group_subsidy_context(
         table_df.loc[table_df["job_name_full"].str.len() > 44, "job_name"] = (
             table_df.loc[table_df["job_name_full"].str.len() > 44, "job_name"] + "…"
         )
-        table_show = table_df.drop(columns=["job_name_full"])
+        table_show = table_df.drop(columns=["job_name_full"]).rename(
+            columns={"margin_pct": "margin_to_date_pct"}
+        )
 
         def _row_bg(row: pd.Series) -> list[str]:
             if row["is_selected"] == "★":
@@ -1029,12 +1142,12 @@ def _render_client_group_subsidy_context(
                 "revenue": "${:,.0f}",
                 "cost": "${:,.0f}",
                 "margin": "${:,.0f}",
-                "margin_pct": "{:.1f}%",
+                "margin_to_date_pct": "{:.1f}%",
                 "contribution_pct_to_group_margin": "{:.1f}%",
             })
             .apply(_row_bg, axis=1)
             .set_properties(
-                subset=["revenue", "cost", "margin", "margin_pct", "contribution_pct_to_group_margin"],
+                subset=["revenue", "cost", "margin", "margin_to_date_pct", "contribution_pct_to_group_margin"],
                 **{"font-family": "var(--dc-mono)", "text-align": "right"},
             )
             .set_properties(subset=["job_no", "job_name", "risk_band"], **{"text-align": "left"})
@@ -1429,7 +1542,7 @@ def _compute_task_staff_contribution(df: pd.DataFrame, job_no: str) -> pd.DataFr
 
 def _render_definitions() -> None:
     st.markdown("**Burn Rate:** Average hours per day over the last 28 days, shown as hours per week.")
-    st.markdown("**Margin at Risk:** Benchmark margin minus forecast margin, applied to forecast revenue.")
+    st.markdown("**Margin at Risk:** Benchmark margin minus forecast margin, applied to forecast revenue (shown once a job is at least 30% consumed).")
     st.markdown("**Scope Creep:** Share of hours on tasks not matched to a quote.")
     st.markdown("**Hours Overrun:** EAC hours minus quoted hours (positive indicates overrun).")
     st.markdown("**Risk Score:** Composite score (0–100) from margin, revenue lag, hours overrun, rate leakage, and runtime.")

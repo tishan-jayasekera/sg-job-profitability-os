@@ -32,19 +32,21 @@ init_state()
 
 
 def _resolve_selected_job(jobs_df) -> Optional[str]:
+    """Return selected job if valid, else first job. Always sets state."""
     if len(jobs_df) == 0:
         return None
 
     selected = st.session_state.get("selected_job")
-    if selected in jobs_df["job_no"].values:
-        return selected
+    selected_str = str(selected) if selected is not None else None
+    job_values = jobs_df["job_no"].astype(str).values
+    if selected_str and selected_str in job_values:
+        return selected_str
 
-    top_job = jobs_df.iloc[0]["job_no"]
-    st.session_state.selected_job = top_job
-    return top_job
+    first_job = str(jobs_df.iloc[0]["job_no"])
+    st.session_state.selected_job = first_job
+    return first_job
 
 
-@st.fragment
 def _render_master_detail(df_scope, df_all, jobs_df, job_name_lookup) -> None:
     left_col, right_col = st.columns([1, 2])
 
@@ -53,8 +55,11 @@ def _render_master_detail(df_scope, df_all, jobs_df, job_name_lookup) -> None:
         selected_job = render_job_queue(jobs_df, job_name_lookup, include_green)
 
     with right_col:
+        if selected_job is None:
+            st.info("← No jobs available for the current queue filter")
+            return
         selected_job = selected_job or _resolve_selected_job(jobs_df)
-        if selected_job and selected_job in jobs_df["job_no"].values:
+        if selected_job and selected_job in jobs_df["job_no"].astype(str).values:
             render_selected_job_panel(
                 df_scope,
                 jobs_df,

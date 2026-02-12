@@ -82,7 +82,10 @@ def compute_delivery_control_view(df: pd.DataFrame, recency_days: int = 28) -> p
     )
 
     jobs_df["hours_variance_pct"] = jobs_df["hours_overrun_pct"].fillna(0)
-    jobs_df["pct_consumed"] = jobs_df.get("pct_quote_consumed", jobs_df.get("pct_consumed"))
+    if "pct_quote_consumed" in jobs_df.columns:
+        jobs_df["pct_consumed"] = jobs_df["pct_quote_consumed"]
+    elif "pct_consumed" not in jobs_df.columns:
+        jobs_df["pct_consumed"] = np.nan
 
     jobs_df["peer_median_runtime_days"] = jobs_df.get("median_runtime_days")
 
@@ -104,11 +107,18 @@ def compute_delivery_control_view(df: pd.DataFrame, recency_days: int = 28) -> p
     jobs_df["primary_driver"] = driver_action["primary_driver"].values
     jobs_df["recommended_action"] = driver_action["recommended_action"].values
 
-    jobs_df["margin_at_risk"] = (
+    raw_margin_at_risk = (
         (jobs_df["median_margin_pct"].fillna(0) - jobs_df["forecast_margin_pct"].fillna(0))
         / 100
         * jobs_df["forecast_revenue"].fillna(0)
     ).clip(lower=0)
+    pct_through = pd.to_numeric(jobs_df["pct_consumed"], errors="coerce").fillna(0)
+    jobs_df["margin_at_risk"] = np.where(pct_through >= 30, raw_margin_at_risk, np.nan)
+    jobs_df["margin_at_risk_confidence"] = np.select(
+        [pct_through >= 75, pct_through >= 30],
+        ["high", "medium"],
+        default="low",
+    )
 
     jobs_df["hours_overrun"] = (
         jobs_df["actual_hours"]
@@ -125,8 +135,11 @@ def compute_delivery_control_view(df: pd.DataFrame, recency_days: int = 28) -> p
         "job_category",
         "quoted_hours",
         "actual_hours",
+        "actual_cost",
+        "actual_revenue",
         "pct_consumed",
         "scope_creep_pct",
+        "margin_pct_to_date",
         "forecast_margin_pct",
         "median_margin_pct",
         "risk_score",
@@ -134,6 +147,7 @@ def compute_delivery_control_view(df: pd.DataFrame, recency_days: int = 28) -> p
         "primary_driver",
         "recommended_action",
         "margin_at_risk",
+        "margin_at_risk_confidence",
         "hours_overrun",
         "hours_variance_pct",
         "rate_variance",
@@ -413,16 +427,57 @@ def _add_forecasts(df: pd.DataFrame, jobs_df: pd.DataFrame) -> pd.DataFrame:
         actual_hours = df_job["hours_raw"].sum() if "hours_raw" in df_job.columns else 0
         quoted_hours = quoted_hours_map.get(job_no, np.nan)
         quoted_amount = quoted_amount_map.get(job_no, np.nan)
-        remaining_hours = max((quoted_hours or 0) - actual_hours, 0) if pd.notna(quoted_hours) else 0
+        quoted_hours_base = quoted_hours if pd.notna(quoted_hours) else 0
 
-        eta_days = remaining_hours / burn_rate_per_day if burn_rate_per_day and burn_rate_per_day > 0 else np.nan
+        if actual_hours >= quoted_hours_base:
+            # Already at/over quote: project two weeks of additional burn.
+            remaining_hours_est = (
+                burn_rate_per_day * 14
+                if pd.notna(burn_rate_per_day) and burn_rate_per_day > 0
+                else 0
+            )
+            remaining_hours = remaining_hours_est
+        else:
+            remaining_hours = quoted_hours_base - actual_hours
+
+        eta_days = (
+            remaining_hours / burn_rate_per_day
+            if pd.notna(burn_rate_per_day) and burn_rate_per_day > 0
+            else np.nan
+        )
         eta_date = last_date + timedelta(days=float(eta_days)) if pd.notna(eta_days) else pd.NaT
 
         revenue_to_date = df_job["rev_alloc"].sum() if "rev_alloc" in df_job.columns else np.nan
         cost_to_date = df_job["base_cost"].sum() if "base_cost" in df_job.columns else np.nan
         avg_cost_per_hour = (cost_to_date / actual_hours) if actual_hours > 0 else np.nan
-        forecast_cost = cost_to_date + (remaining_hours * avg_cost_per_hour) if pd.notna(avg_cost_per_hour) else np.nan
-        forecast_revenue = quoted_amount if pd.notna(quoted_amount) and quoted_amount > 0 else revenue_to_date
+
+        if actual_hours >= quoted_hours_base:
+            forecast_cost = (
+                cost_to_date + (remaining_hours * avg_cost_per_hour)
+                if pd.notna(avg_cost_per_hour)
+                else cost_to_date
+            )
+        else:
+            forecast_cost = (
+                cost_to_date + (remaining_hours * avg_cost_per_hour)
+                if pd.notna(avg_cost_per_hour)
+                else np.nan
+            )
+
+        if pd.notna(quoted_amount) and quoted_amount > 0:
+            forecast_revenue = quoted_amount
+        else:
+            if actual_hours > 0 and pd.notna(burn_rate_per_day) and burn_rate_per_day > 0:
+                revenue_per_hour = revenue_to_date / actual_hours if pd.notna(revenue_to_date) else np.nan
+                total_est_hours = actual_hours + max(remaining_hours, burn_rate_per_day * 14)
+                forecast_revenue = (
+                    revenue_per_hour * total_est_hours
+                    if pd.notna(revenue_per_hour)
+                    else revenue_to_date
+                )
+            else:
+                forecast_revenue = revenue_to_date
+
         forecast_margin_pct = (
             (forecast_revenue - forecast_cost) / forecast_revenue * 100
             if pd.notna(forecast_revenue) and forecast_revenue > 0 and pd.notna(forecast_cost)

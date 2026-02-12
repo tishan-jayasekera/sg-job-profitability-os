@@ -44,6 +44,9 @@ STATE_KEYS = {
     "intervention_shortlist_size": "intervention_shortlist_size",
     "intervention_issue_filter": "intervention_issue_filter",
 
+    # Active Delivery
+    "selected_job": "selected_job",
+
     # Client Profitability & LTV
     "selected_client_quadrant": "selected_client_quadrant",
     "selected_client_name": "selected_client_name",
@@ -81,6 +84,9 @@ DEFAULTS = {
     "intervention_selected_job": None,
     "intervention_shortlist_size": 10,
     "intervention_issue_filter": "All Issues",
+
+    # Active Delivery
+    "selected_job": None,
 
     # Client Profitability & LTV
     "selected_client_quadrant": "Partners",
