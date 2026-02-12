@@ -235,20 +235,14 @@ def main():
         if not client_pool:
             client_pool = sorted(df_window[CLIENT_COL].dropna().unique().tolist())
 
-    prior_clients = st.session_state.get("selected_client_name")
-    if isinstance(prior_clients, str):
-        prior_clients = [prior_clients]
-    elif isinstance(prior_clients, list):
-        prior_clients = prior_clients
-    else:
-        prior_clients = []
-    default_clients = [c for c in prior_clients if c in client_pool]
-    if "selected_client_name" in st.session_state and not isinstance(st.session_state.get("selected_client_name"), list):
-        del st.session_state["selected_client_name"]
+    if not isinstance(st.session_state.get("selected_client_name"), list):
+        st.session_state["selected_client_name"] = []
+    st.session_state["selected_client_name"] = [
+        c for c in st.session_state["selected_client_name"] if c in client_pool
+    ]
     selected_clients = st.multiselect(
         "Select Client(s)",
         options=client_pool,
-        default=default_clients,
         key="selected_client_name",
     )
     if len(selected_clients) == 0:
@@ -256,6 +250,9 @@ def main():
         return
 
     df_client_window = df_window[df_window[CLIENT_COL].isin(selected_clients)].copy()
+    if len(df_client_window) == 0:
+        st.info("No records found for the selected client(s) in the current view.")
+        return
 
     # Canonical drill chain filters
     chain_key_map = {
@@ -383,7 +380,7 @@ def main():
     else:
         dept_fig = charts.horizontal_bar(pd.DataFrame({"margin": [], "department_final": []}), x="margin", y="department_final")
 
-    render_client_deep_dive(", ".join(selected_clients), metrics, grade, ledger, dept_fig)
+    render_client_deep_dive(", ".join(map(str, selected_clients)), metrics, grade, ledger, dept_fig)
 
     # SECTION 5 — Driver Forensics
     client_task = compute_client_task_mix(df_client_window)
