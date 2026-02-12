@@ -458,43 +458,199 @@ def render_selected_job_panel(
 
             task_df = task_df.sort_values("actual_hours", ascending=False)
 
-            # ── Chart: Grouped horizontal bar (Quoted │ Actual │ Benchmark) ──
-            top_tasks = task_df.head(10)  # top 10 by actual hours
-            fig = go.Figure()
-            fig.add_trace(go.Bar(
-                y=top_tasks["task_name"],
-                x=top_tasks["quoted_hours"].fillna(0),
-                name="Quoted",
-                orientation="h",
-                marker_color="#9ecae1",
-            ))
-            fig.add_trace(go.Bar(
-                y=top_tasks["task_name"],
-                x=top_tasks["actual_hours"].fillna(0),
-                name="Actual",
-                orientation="h",
-                marker_color="#3182bd",
-            ))
-            if top_tasks["peer_median_hours"].notna().any():
+            # ── Chart: Task (y) with cost-to-date, stacked actual by staff + quoted target marker ──
+            job_scope_df = df_scope[df_scope["job_no"].astype(str) == str(selected_job)].copy()
+            if len(job_scope_df) == 0 and "job_no" in df_scope.columns:
+                matches = df_scope.loc[
+                    df_scope["job_no"].astype(str) == str(selected_job), "job_no"
+                ]
+                if len(matches) > 0:
+                    job_scope_df = df_scope[df_scope["job_no"] == matches.iloc[0]].copy()
+
+            can_build_staff_task = (
+                len(job_scope_df) > 0
+                and "task_name" in job_scope_df.columns
+                and "hours_raw" in job_scope_df.columns
+            )
+
+            if can_build_staff_task:
+                if "staff_name" not in job_scope_df.columns:
+                    job_scope_df["staff_name"] = "Unassigned"
+                if "base_cost" not in job_scope_df.columns:
+                    job_scope_df["base_cost"] = 0.0
+
+                job_scope_df["task_name"] = job_scope_df["task_name"].astype(str)
+                job_scope_df["staff_name"] = (
+                    job_scope_df["staff_name"]
+                    .fillna("Unassigned")
+                    .astype(str)
+                    .str.strip()
+                    .replace("", "Unassigned")
+                )
+                job_scope_df["hours_raw"] = pd.to_numeric(
+                    job_scope_df["hours_raw"], errors="coerce"
+                ).fillna(0.0)
+                job_scope_df["base_cost"] = pd.to_numeric(
+                    job_scope_df["base_cost"], errors="coerce"
+                ).fillna(0.0)
+
+                task_cost_map = job_scope_df.groupby("task_name")["base_cost"].sum()
+                task_staff = (
+                    job_scope_df.groupby(["task_name", "staff_name"], dropna=False)["hours_raw"]
+                    .sum()
+                    .reset_index(name="actual_hours")
+                )
+
+                top_task_df = task_df.copy()
+                top_task_df["task_name"] = top_task_df["task_name"].astype(str)
+                top_task_df["_display_hours"] = (
+                    top_task_df[["actual_hours", "quoted_hours"]]
+                    .apply(pd.to_numeric, errors="coerce")
+                    .fillna(0.0)
+                    .max(axis=1)
+                )
+                top_task_df = top_task_df.sort_values("_display_hours", ascending=False).head(14)
+                top_task_names = top_task_df["task_name"].tolist()
+
+                if len(top_task_names) > 0 and len(task_staff) > 0:
+                    task_staff["task_name"] = task_staff["task_name"].astype(str)
+                    task_staff["staff_name"] = task_staff["staff_name"].astype(str)
+
+                    staff_pivot = (
+                        task_staff.pivot_table(
+                            index="task_name",
+                            columns="staff_name",
+                            values="actual_hours",
+                            aggfunc="sum",
+                            fill_value=0.0,
+                        )
+                        .reindex(top_task_names, fill_value=0.0)
+                    )
+                    staff_order = staff_pivot.sum(axis=0).sort_values(ascending=False).index.tolist()
+
+                    quote_map = (
+                        top_task_df.set_index("task_name")["quoted_hours"]
+                        .apply(pd.to_numeric, errors="coerce")
+                        .fillna(0.0)
+                    )
+                    quote_values = quote_map.reindex(top_task_names).fillna(0.0).values
+
+                    y_labels = [
+                        f"{task} - {fmt_currency(float(task_cost_map.get(task, 0.0)))}"
+                        for task in top_task_names
+                    ]
+                    palette = [
+                        "#2563eb", "#7db7e8", "#ef4444", "#8b5cf6", "#14b8a6",
+                        "#f59e0b", "#22c55e", "#fb7185", "#94a3b8", "#0ea5e9",
+                        "#eab308", "#f97316", "#10b981", "#a855f7", "#3b82f6",
+                    ]
+
+                    fig = go.Figure()
+                    for i, staff in enumerate(staff_order):
+                        hours_vals = (
+                            pd.to_numeric(staff_pivot[staff], errors="coerce")
+                            .fillna(0.0)
+                            .values
+                        )
+                        if np.nansum(hours_vals) <= 0:
+                            continue
+                        fig.add_trace(
+                            go.Bar(
+                                y=y_labels,
+                                x=hours_vals,
+                                customdata=np.array(top_task_names, dtype=object),
+                                name=staff,
+                                orientation="h",
+                                marker_color=palette[i % len(palette)],
+                                hovertemplate=(
+                                    "Task: %{customdata}<br>"
+                                    f"Staff: {staff}<br>"
+                                    "Actual Hours: %{x:.1f}h<extra></extra>"
+                                ),
+                            )
+                        )
+
+                    fig.add_trace(
+                        go.Scatter(
+                            y=y_labels,
+                            x=quote_values,
+                            customdata=np.array(top_task_names, dtype=object),
+                            mode="markers+text",
+                            name="Quoted Hours (target)",
+                            marker=dict(
+                                symbol="diamond",
+                                size=9,
+                                color="#111827",
+                                line=dict(color="#ffffff", width=1),
+                            ),
+                            text=[f"{v:.0f}h" for v in quote_values],
+                            textposition="middle right",
+                            textfont=dict(size=10, color="#111827"),
+                            hovertemplate=(
+                                "Task: %{customdata}<br>"
+                                "Quoted Target: %{x:.1f}h<extra></extra>"
+                            ),
+                        )
+                    )
+
+                    fig.update_layout(
+                        barmode="stack",
+                        title="Task Execution by Staff (Actual Hours) vs Quoted Target",
+                        xaxis_title="Hours",
+                        yaxis_title="Task - Cost to Date",
+                        template="plotly_white",
+                        height=max(360, len(top_task_names) * 44 + 120),
+                        margin=dict(l=260, r=30, t=50, b=55),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+                        hovermode="y unified",
+                    )
+                    fig.update_yaxes(autorange="reversed")
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption(
+                        "Stacked bars show actual task hours split by staff. "
+                        "Black markers show quoted hour targets. "
+                        "Y-axis labels include task cost-to-date."
+                    )
+                else:
+                    can_build_staff_task = False
+
+            if not can_build_staff_task:
+                top_tasks = task_df.head(10)
+                fig = go.Figure()
                 fig.add_trace(go.Bar(
                     y=top_tasks["task_name"],
-                    x=top_tasks["peer_median_hours"].fillna(0),
-                    name="Peer Benchmark",
+                    x=top_tasks["quoted_hours"].fillna(0),
+                    name="Quoted",
                     orientation="h",
-                    marker_color="#ff7f0e",
+                    marker_color="#9ecae1",
                 ))
-            fig.update_layout(
-                barmode="group",
-                title="Task Hours: Quoted vs Actual vs Peer Benchmark",
-                xaxis_title="Hours",
-                yaxis_title="",
-                template="plotly_white",
-                height=max(300, len(top_tasks) * 40 + 100),
-                margin=dict(l=180, r=30, t=40, b=50),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            )
-            fig.update_yaxes(autorange="reversed")  # top task at top
-            st.plotly_chart(fig, use_container_width=True)
+                fig.add_trace(go.Bar(
+                    y=top_tasks["task_name"],
+                    x=top_tasks["actual_hours"].fillna(0),
+                    name="Actual",
+                    orientation="h",
+                    marker_color="#3182bd",
+                ))
+                if top_tasks["peer_median_hours"].notna().any():
+                    fig.add_trace(go.Bar(
+                        y=top_tasks["task_name"],
+                        x=top_tasks["peer_median_hours"].fillna(0),
+                        name="Peer Benchmark",
+                        orientation="h",
+                        marker_color="#ff7f0e",
+                    ))
+                fig.update_layout(
+                    barmode="group",
+                    title="Task Hours: Quoted vs Actual vs Peer Benchmark",
+                    xaxis_title="Hours",
+                    yaxis_title="",
+                    template="plotly_white",
+                    height=max(300, len(top_tasks) * 40 + 100),
+                    margin=dict(l=180, r=30, t=40, b=50),
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                )
+                fig.update_yaxes(autorange="reversed")
+                st.plotly_chart(fig, use_container_width=True)
 
             # ── Data table ──
             display = task_df.copy()
