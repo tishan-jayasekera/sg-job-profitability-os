@@ -1,539 +1,114 @@
 """
-UI Components for the Active Delivery Command Center.
+Delivery Control Tower UI Components.
+
+Provides the four functions imported by pages/4_Active_Delivery.py:
+- inject_delivery_control_theme()
+- summarize_alerts()
+- render_job_queue()
+- render_selected_job_panel()
 """
 from __future__ import annotations
 
-from datetime import datetime
-from html import escape
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
-import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
 
-from src.config import config
-from src.data.job_lifecycle import get_job_task_attribution
-from src.data.semantic import get_category_col, safe_quote_job_task
-from src.exports import export_action_brief
-from src.metrics.client_group_subsidy import compute_client_group_subsidy_context
+from src.data.job_lifecycle import get_job_staff_attribution, get_job_task_attribution
 from src.metrics.delivery_control import compute_root_cause_drivers
-
-
-RISK_COLORS = {
-    "Red": ("#dc3545", "#fff5f5"),
-    "Amber": ("#ffc107", "#fffbf0"),
-    "Green": ("#28a745", "#f0fff0"),
-}
-RISK_ICONS = {"Red": "🔴", "Amber": "🟡", "Green": "🟢"}
+from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent
 
 
 def inject_delivery_control_theme() -> None:
-    _inject_delivery_control_css()
-
-
-def summarize_alerts(jobs_df: pd.DataFrame) -> Dict[str, float]:
-    red_jobs = jobs_df[jobs_df["risk_band"] == "Red"]
-    amber_jobs = jobs_df[jobs_df["risk_band"] == "Amber"]
-    return {
-        "red_count": float(len(red_jobs)),
-        "amber_count": float(len(amber_jobs)),
-        "margin_at_risk": float(_compute_margin_at_risk(red_jobs)),
-    }
-
-
-def _risk_meta(risk_score: float | None, fallback_band: str = "Green") -> Dict[str, str]:
-    if pd.notna(risk_score):
-        score = float(risk_score)
-        if score >= 80:
-            return {
-                "label": "Critical",
-                "band": "Red",
-                "color": "#EF4444",
-                "chip_class": "dc-chip-risk-red",
-                "dot": "🔴",
-            }
-        if score >= 50:
-            return {
-                "label": "Watch",
-                "band": "Amber",
-                "color": "#F59E0B",
-                "chip_class": "dc-chip-risk-amber",
-                "dot": "🟡",
-            }
-        return {
-            "label": "Healthy",
-            "band": "Green",
-            "color": "#22C55E",
-            "chip_class": "dc-chip-risk-green",
-            "dot": "🟢",
-        }
-
-    normalized = str(fallback_band).strip().lower()
-    if normalized == "red":
-        return {"label": "Critical", "band": "Red", "color": "#EF4444", "chip_class": "dc-chip-risk-red", "dot": "🔴"}
-    if normalized == "amber":
-        return {"label": "Watch", "band": "Amber", "color": "#F59E0B", "chip_class": "dc-chip-risk-amber", "dot": "🟡"}
-    return {"label": "Healthy", "band": "Green", "color": "#22C55E", "chip_class": "dc-chip-risk-green", "dot": "🟢"}
-
-
-def _inject_delivery_control_css() -> None:
-    if st.session_state.get("_dc_css_injected", False):
-        return
-
+    """Inject CSS for the delivery control tower page."""
     st.markdown(
         """
         <style>
-        :root {
-            --dc-bg: #F8F9FB;
-            --dc-card: #FFFFFF;
-            --dc-border: #E5E7EB;
-            --dc-text: #111827;
-            --dc-text-2: #6B7280;
-            --dc-text-muted: #9CA3AF;
-            --dc-primary: #2563EB;
-            --dc-red: #DC2626;
-            --dc-amber: #D97706;
-            --dc-green: #16A34A;
-            --dc-mono: "SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
-            --dc-sans: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-        }
-        .stApp {
-            background: var(--dc-bg);
-            font-family: var(--dc-sans);
-            color: var(--dc-text);
-        }
-        .block-container {
-            padding-top: 0.55rem;
-            padding-bottom: 1.2rem;
-            max-width: 1560px;
-        }
-        h2, h3 {
-            letter-spacing: -0.02em;
-            color: var(--dc-text);
-        }
-        div[data-testid="stMarkdownContainer"] p,
-        label,
-        span {
-            font-family: var(--dc-sans);
-        }
         .dc-page-title {
-            font-size: 28px;
-            font-weight: 760;
-            color: var(--dc-text);
-            letter-spacing: -0.5px;
-            margin: 0.15rem 0 0.75rem 0;
-        }
-        .dc-command-bar {
-            background: #FFFFFF;
-            border: 1px solid var(--dc-border);
-            border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-            padding: 0.7rem 0.8rem 0.5rem 0.8rem;
-            margin-bottom: 0.65rem;
-        }
-        .dc-command-divider {
-            border-bottom: 1px solid var(--dc-border);
-            margin-top: 0.55rem;
+            font-size: 1.6rem;
+            font-weight: 700;
+            color: #1a1a2e;
+            margin-bottom: 0.5rem;
         }
         .dc-filter-label {
-            font-size: 11px;
-            letter-spacing: 0.11em;
-            text-transform: uppercase;
-            color: var(--dc-text-muted);
-            font-weight: 700;
-            margin-bottom: 0.22rem;
+            font-size: 0.78rem;
+            font-weight: 600;
+            color: #555;
+            margin-bottom: 2px;
         }
         .dc-pill {
-            border-radius: 999px;
-            border: 1px solid transparent;
-            padding: 0.45rem 0.75rem;
-            min-height: 60px;
-        }
-        .dc-pill-title {
-            font-size: 10px;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            font-weight: 700;
-            color: var(--dc-text-muted);
-        }
-        .dc-pill-value {
-            font-size: 18px;
-            line-height: 1.15;
-            font-weight: 760;
-            margin-top: 0.12rem;
-            font-variant-numeric: tabular-nums;
-            font-family: var(--dc-mono);
-        }
-        .dc-pill-sub {
-            font-size: 11px;
-            color: var(--dc-text-2);
-            margin-top: 0.12rem;
-            font-variant-numeric: tabular-nums;
-            font-family: var(--dc-mono);
+            padding: 10px 14px;
+            border-radius: 8px;
+            text-align: center;
         }
         .dc-pill-critical {
-            background: #FEF2F2;
-            border-color: #FECACA;
-        }
-        .dc-pill-critical .dc-pill-value {
-            color: var(--dc-red);
+            background: #fce4e4;
+            border: 1px solid #f5a5a5;
         }
         .dc-pill-watch {
-            background: #FFFBEB;
-            border-color: #FDE68A;
+            background: #fff8e1;
+            border: 1px solid #ffe082;
         }
-        .dc-pill-watch .dc-pill-value {
-            color: var(--dc-amber);
-        }
-        .dc-alert-card {
-            border-radius: 8px;
-            border: 1px solid var(--dc-border);
-            padding: 0.6rem 0.75rem;
-            background: #FFFFFF;
-        }
-        .dc-alert-critical {
-            background: #FEF2F2;
-            border-color: #FECACA;
-        }
-        .dc-alert-watch {
-            background: #FFFBEB;
-            border-color: #FDE68A;
-        }
-        .dc-alert-good {
-            background: #F0FDF4;
-            border-color: #BBF7D0;
-        }
-        .dc-alert-value {
-            font-size: 18px;
-            line-height: 1.15;
-            font-weight: 760;
-            margin-top: 0.12rem;
-            font-family: var(--dc-mono);
-        }
-        .dc-alert-sub {
-            font-size: 11px;
-            color: var(--dc-text-2);
-            margin-top: 0.15rem;
-            font-family: var(--dc-mono);
-        }
-        .dc-card-shell {
-            background: var(--dc-card);
-            border: 1px solid var(--dc-border);
-            border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-            padding: 0.45rem 0.6rem 0.6rem 0.6rem;
-        }
-        .dc-kicker {
-            font-size: 11px;
-            letter-spacing: 0.14em;
+        .dc-pill-title {
+            font-size: 0.72rem;
+            font-weight: 600;
             text-transform: uppercase;
-            color: var(--dc-text-muted);
+            letter-spacing: 0.05em;
+            color: #666;
+        }
+        .dc-pill-value {
+            font-size: 1.15rem;
             font-weight: 700;
-            margin-bottom: 0.35rem;
+            color: #1a1a2e;
+        }
+        .dc-pill-sub {
+            font-size: 0.72rem;
+            color: #888;
+        }
+        .dc-command-divider {
+            height: 1px;
+            background: #e0e0e0;
+            margin: 8px 0 0 0;
         }
         .dc-job-header {
-            background: #FFFFFF;
-            border: 1px solid var(--dc-border);
-            border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-            padding: 0.75rem 0.9rem;
-            margin-bottom: 0.85rem;
-        }
-        .dc-job-id {
-            font-size: 11px;
-            letter-spacing: 0.09em;
-            color: var(--dc-text-muted);
-            text-transform: uppercase;
-            font-weight: 700;
-            font-family: var(--dc-mono);
-            margin-bottom: 0.15rem;
-        }
-        .dc-job-title {
-            font-size: 16px;
-            font-weight: 760;
-            color: var(--dc-text);
-            line-height: 1.35;
-        }
-        .dc-tag-row {
-            margin-top: 0.45rem;
-        }
-        .dc-chip {
-            display: inline-block;
-            border-radius: 999px;
-            font-size: 11px;
-            font-weight: 700;
-            padding: 0.18rem 0.5rem;
-            margin-right: 0.32rem;
-            margin-bottom: 0.2rem;
-            border: 1px solid #D1D5DB;
-            background: #F3F4F6;
-            color: #374151;
-            line-height: 1.15;
-        }
-        .dc-chip-risk-red {
-            background: var(--dc-red);
-            border-color: var(--dc-red);
-            color: #FFFFFF;
-        }
-        .dc-chip-risk-amber {
-            background: var(--dc-amber);
-            border-color: var(--dc-amber);
-            color: #FFFFFF;
-        }
-        .dc-chip-risk-green {
-            background: var(--dc-green);
-            border-color: var(--dc-green);
-            color: #FFFFFF;
-        }
-        .dc-queue-shell {
-            background: #FFFFFF;
-            border: 1px solid var(--dc-border);
-            border-radius: 8px;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-            padding: 0.5rem 0.55rem 0.45rem 0.55rem;
-        }
-        .dc-queue-scroll {
-            border-top: 1px solid #F1F5F9;
-            margin-top: 0.45rem;
-            padding-top: 0.45rem;
-        }
-        .dc-queue-foot {
-            margin-top: 0.35rem;
-        }
-        .dc-queue-subtle {
-            color: var(--dc-text-muted);
-            font-size: 11px;
-            letter-spacing: 0.06em;
-            text-transform: uppercase;
-            font-weight: 700;
-            margin-top: 0.2rem;
-        }
-        .dc-risk-dot-red { color: #EF4444; }
-        .dc-risk-dot-amber { color: #F59E0B; }
-        .dc-risk-dot-green { color: #22C55E; }
-        div[data-baseweb="select"] > div {
-            border-color: #D1D5DB !important;
-            min-height: 34px !important;
-            background: #FFFFFF !important;
-            box-shadow: none !important;
-        }
-        div[data-baseweb="select"] svg {
-            color: #6B7280 !important;
-        }
-        div[data-baseweb="radio"] label {
-            font-size: 12px !important;
-            color: #374151 !important;
-        }
-        div[data-testid="stMetric"] {
-            border: 1px solid var(--dc-border);
-            background: #FFFFFF;
-            border-radius: 8px;
-            padding: 0.4rem 0.55rem;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-        }
-        div[data-testid="stMetricLabel"] {
-            font-size: 10px !important;
-            letter-spacing: 0.1em;
-            text-transform: uppercase;
-            color: var(--dc-text-muted);
-            font-weight: 700;
-        }
-        div[data-testid="stMetricValue"] {
-            font-size: 1.6rem !important;
-            color: var(--dc-text);
-            font-weight: 760;
-            font-variant-numeric: tabular-nums;
-            font-family: var(--dc-mono);
-            line-height: 1.05;
-        }
-        div[data-testid="stMetricDelta"] {
-            font-size: 0.8rem !important;
-            font-weight: 700;
-            font-variant-numeric: tabular-nums;
-            font-family: var(--dc-mono);
-        }
-        .dc-lens-caption {
-            margin: 0.25rem 0 0.55rem 0;
-            padding: 0.35rem 0.5rem;
-            border: 1px solid var(--dc-border);
+            padding: 12px 16px;
             border-radius: 6px;
-            background: #F9FAFB;
-            color: #4B5563;
-            font-size: 12px;
+            margin-bottom: 16px;
         }
-        .dc-section-divider {
-            margin: 0.6rem 0 0.6rem 0;
-            border-top: 1px solid var(--dc-border);
-        }
-        .dc-block {
-            border: 1px solid var(--dc-border);
-            border-radius: 8px;
-            background: #FFFFFF;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-            padding: 0.62rem 0.72rem;
-            margin-bottom: 0.6rem;
-        }
-        .dc-footnote {
-            font-size: 10px;
-            color: #9CA3AF;
-            font-style: italic;
-            margin-top: 0.28rem;
-        }
-        [data-testid="stButton"] > button {
-            white-space: pre-line;
-            text-align: left;
-            justify-content: flex-start;
-            line-height: 1.25;
-            font-family: var(--dc-sans);
-            font-size: 12px;
-            border-radius: 8px;
-        }
-        [data-testid="stButton"] > button[kind="secondary"] {
-            background: #FFFFFF;
-            border: 1px solid #E5E7EB;
-            color: #111827;
-            padding: 0.55rem 0.62rem;
-        }
-        [data-testid="stButton"] > button[kind="secondary"]:hover {
-            background: #F9FAFB;
-            border-color: #CBD5E1;
-        }
-        [data-testid="stButton"] > button[kind="primary"] {
-            background: #EFF6FF;
-            border: 1px solid #BFDBFE;
-            color: #111827;
-            box-shadow: inset 3px 0 0 #2563EB;
-            padding: 0.55rem 0.62rem;
-        }
-        [data-testid="stButton"] > button[kind="tertiary"] {
-            border: 1px solid #D1D5DB;
-            background: transparent;
-            color: #374151;
-            justify-content: center;
-            text-align: center;
-            padding: 0.34rem 0.65rem;
+        .dc-job-header-title {
+            font-size: 1.1em;
             font-weight: 600;
+            color: #1a1a2e;
         }
-        [data-testid="stButton"] > button[kind="tertiary"]:hover {
-            border-color: #9CA3AF;
-            background: #F3F4F6;
-        }
-        [data-testid="stExpander"] {
-            border: 1px solid var(--dc-border);
-            border-radius: 8px;
-            background: #FFFFFF;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.06);
-        }
-        [data-testid="stExpander"] summary {
-            font-size: 12px !important;
-            letter-spacing: 0.08em;
-            text-transform: uppercase;
-            color: #6B7280;
-            font-weight: 700;
-        }
-        [data-testid="stCheckbox"] label, [data-testid="stToggle"] label {
-            font-size: 12px;
-            color: #374151;
-        }
-        .dc-table-note {
-            font-size: 11px;
-            color: #9CA3AF;
-            margin-top: -0.2rem;
-            margin-bottom: 0.25rem;
-        }
-        [data-testid="stDataFrame"] [role="gridcell"] {
-            font-size: 12px !important;
-        }
-        [data-testid="stDataFrame"] [role="columnheader"] {
-            font-size: 11px !important;
-            letter-spacing: 0.04em;
-            color: #6B7280 !important;
-            text-transform: uppercase;
-        }
-        [data-testid="stVerticalBlock"] > div[style*="overflow: auto"]::-webkit-scrollbar {
-            width: 8px;
-            height: 8px;
-        }
-        [data-testid="stVerticalBlock"] > div[style*="overflow: auto"]::-webkit-scrollbar-track {
-            background: #F3F4F6;
-            border-radius: 8px;
-        }
-        [data-testid="stVerticalBlock"] > div[style*="overflow: auto"]::-webkit-scrollbar-thumb {
-            background: #D1D5DB;
-            border-radius: 8px;
+        .dc-job-header-sub {
+            font-size: 0.85em;
+            color: #555;
+            margin-top: 4px;
         }
         </style>
         """,
         unsafe_allow_html=True,
     )
-    st.session_state["_dc_css_injected"] = True
 
 
-def render_alert_strip(jobs_df: pd.DataFrame) -> None:
+def summarize_alerts(jobs_df: pd.DataFrame) -> Dict[str, float]:
     """
-    Render compact alert banner showing portfolio status.
+    Summarize alert counts from the jobs dataframe.
 
-    Design: Two-cell layout
-    - Left cell: 🔴 CRITICAL count + $ at risk
-    - Right cell: 🟡 WATCH count
+    Returns dict with keys: red_count, amber_count, margin_at_risk
     """
-    _inject_delivery_control_css()
+    if len(jobs_df) == 0:
+        return {"red_count": 0, "amber_count": 0, "margin_at_risk": 0}
 
-    red_jobs = jobs_df[jobs_df["risk_band"] == "Red"]
-    amber_jobs = jobs_df[jobs_df["risk_band"] == "Amber"]
+    red_count = int((jobs_df["risk_band"] == "Red").sum()) if "risk_band" in jobs_df.columns else 0
+    amber_count = int((jobs_df["risk_band"] == "Amber").sum()) if "risk_band" in jobs_df.columns else 0
+    margin_at_risk = float(jobs_df["margin_at_risk"].sum()) if "margin_at_risk" in jobs_df.columns else 0
 
-    margin_at_risk = _compute_margin_at_risk(red_jobs)
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        if len(red_jobs) > 0:
-            st.markdown(
-                f"""
-                <div class="dc-alert-card dc-alert-critical">
-                    <div class="dc-kicker">Critical Exposure</div>
-                    <div class="dc-alert-value">{len(red_jobs)} Jobs</div>
-                    <div class="dc-alert-sub">${margin_at_risk:,.0f} margin at risk</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                """
-                <div class="dc-alert-card dc-alert-good">
-                    <div class="dc-kicker">Critical Exposure</div>
-                    <div class="dc-alert-value">0 Jobs</div>
-                    <div class="dc-alert-sub">No critical jobs</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-    with col2:
-        if len(amber_jobs) > 0:
-            st.markdown(
-                f"""
-                <div class="dc-alert-card dc-alert-watch">
-                    <div class="dc-kicker">Watchlist</div>
-                    <div class="dc-alert-value">{len(amber_jobs)} Jobs</div>
-                    <div class="dc-alert-sub">Need attention this cycle</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown(
-                """
-                <div class="dc-alert-card dc-alert-good">
-                    <div class="dc-kicker">Watchlist</div>
-                    <div class="dc-alert-value">0 Jobs</div>
-                    <div class="dc-alert-sub">No jobs on watch</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+    return {
+        "red_count": red_count,
+        "amber_count": amber_count,
+        "margin_at_risk": margin_at_risk if pd.notna(margin_at_risk) else 0,
+    }
 
 
 def render_job_queue(
@@ -541,1008 +116,265 @@ def render_job_queue(
     job_name_lookup: Dict[str, str],
     include_green: bool = False,
 ) -> Optional[str]:
-    """
-    Render compact job queue as selectable cards.
+    """Render the left-panel priority queue and return selected job_no."""
+    if len(jobs_df) == 0:
+        st.info("No jobs matching current filters.")
+        return None
 
-    Returns selected job_no.
-    """
-    _inject_delivery_control_css()
+    if "include_green_jobs" not in st.session_state:
+        st.session_state["include_green_jobs"] = include_green
+    include_green_jobs = st.checkbox("Include on-track jobs", key="include_green_jobs")
 
-    with st.container(border=True):
-        st.markdown('<div class="dc-kicker">Priority Queue</div>', unsafe_allow_html=True)
+    display_df = jobs_df if include_green_jobs else jobs_df[jobs_df["risk_band"] != "Green"]
+    if len(display_df) == 0:
+        st.info("No jobs matching current filters.")
+        return None
 
-        if "include_green_jobs" not in st.session_state:
-            st.session_state["include_green_jobs"] = include_green
-        include_green_jobs = st.checkbox("Include on-track jobs", key="include_green_jobs")
+    risk_emoji = {"Red": "🔴", "Amber": "🟡", "Green": "🟢"}
+    options = []
+    job_nos = []
+    for _, row in display_df.iterrows():
+        job_no = str(row.get("job_no", ""))
+        name = str(job_name_lookup.get(job_no, "") or "")
+        badge = risk_emoji.get(str(row.get("risk_band", "")), "⚪")
+        label = f"{badge} {job_no}"
+        if name:
+            label += f" - {name}"
+        driver = str(row.get("primary_driver", "") or "")
+        if driver and driver != "Monitor":
+            label += f"  |  {driver}"
+        options.append(label)
+        job_nos.append(job_no)
 
-        sort_option = st.selectbox(
-            "Sort by",
-            ["Risk Score", "Margin at Risk", "Hours Overrun", "Recent Activity"],
-            key="job_queue_sort",
-            label_visibility="collapsed",
-        )
+    current_idx = 0
+    current_selected = st.session_state.get("selected_job")
+    current_selected_str = str(current_selected) if current_selected is not None else None
+    if current_selected_str in job_nos:
+        current_idx = job_nos.index(current_selected_str)
 
-        display_df = jobs_df if include_green_jobs else jobs_df[jobs_df["risk_band"] != "Green"]
-        display_df = _apply_sort(display_df, sort_option)
+    if "job_queue_radio" in st.session_state:
+        stored_idx = st.session_state.get("job_queue_radio")
+        if not isinstance(stored_idx, int) or stored_idx < 0 or stored_idx >= len(options):
+            st.session_state["job_queue_radio"] = current_idx
 
-        if len(display_df) == 0:
-            st.info("No jobs matching current filters.")
-            return None
+    selected_idx = st.radio(
+        "Priority Queue",
+        options=list(range(len(options))),
+        format_func=lambda i: options[i],
+        index=current_idx,
+        key="job_queue_radio",
+        label_visibility="collapsed",
+    )
 
-        risk_emoji = {"Red": "🔴", "Amber": "🟡", "Green": "🟢"}
-        options: List[str] = []
-        job_nos: List[str] = []
-        for _, row in display_df.iterrows():
-            job_no = str(row["job_no"])
-            job_name = str(job_name_lookup.get(job_no, "") or "")
-            badge = risk_emoji.get(str(row.get("risk_band", "")), "⚪")
-            label = f"{badge} {job_no}"
-            if job_name:
-                label += f" - {job_name}"
-            driver = str(row.get("primary_driver", "") or "")
-            if driver and driver != "Monitor":
-                label += f"  |  {driver}"
-            options.append(label)
-            job_nos.append(job_no)
-
-        current_idx = 0
-        current_selected = st.session_state.get("selected_job")
-        current_selected_str = str(current_selected) if current_selected is not None else None
-        if current_selected_str in job_nos:
-            current_idx = job_nos.index(current_selected_str)
-        if "job_queue_radio" in st.session_state:
-            stored_idx = st.session_state.get("job_queue_radio")
-            if not isinstance(stored_idx, int) or stored_idx < 0 or stored_idx >= len(options):
-                st.session_state["job_queue_radio"] = current_idx
-
-        selected_idx = st.radio(
-            "Priority Queue",
-            options=list(range(len(options))),
-            format_func=lambda i: options[i],
-            index=current_idx,
-            key="job_queue_radio",
-            label_visibility="collapsed",
-        )
-
-        selected_job = job_nos[selected_idx]
-        st.session_state.selected_job = selected_job
-        return selected_job
+    selected_job = str(job_nos[selected_idx])
+    st.session_state.selected_job = selected_job
+    return selected_job
 
 
 def render_selected_job_panel(
-    df: pd.DataFrame,
+    df_scope: pd.DataFrame,
     jobs_df: pd.DataFrame,
-    job_no: str,
+    selected_job: str,
     job_name_lookup: Dict[str, str],
     df_all: Optional[pd.DataFrame] = None,
 ) -> None:
-    """
-    Render the selected job detail panel.
-    """
-    _inject_delivery_control_css()
+    """Render the right-panel details for the selected job."""
+    _ = df_all
 
-    if df_all is None:
-        df_all = df
-
-    job_mask = jobs_df["job_no"].astype(str) == str(job_no)
-    if not job_mask.any():
-        st.info("Selected job is no longer available in this filtered view.")
+    job_row = jobs_df[jobs_df["job_no"].astype(str) == str(selected_job)]
+    if len(job_row) == 0:
+        st.warning(f"Job {selected_job} not found in current dataset.")
         return
-    job_row = jobs_df.loc[job_mask].iloc[0]
-    selected_job_no = str(job_row["job_no"])
-    job_name = job_row.get("job_name") or job_name_lookup.get(selected_job_no, selected_job_no)
+    job_row = job_row.iloc[0]
 
-    dept = job_row.get("department_final", "")
-    cat = job_row.get("job_category", "")
-    risk_meta = _risk_meta(job_row.get("risk_score", np.nan), str(job_row.get("risk_band", "Green")))
-    risk_label = risk_meta["label"]
-    risk_chip_class = risk_meta["chip_class"]
+    job_name = job_name_lookup.get(str(selected_job), "")
     risk_band = str(job_row.get("risk_band", "Unknown"))
     risk_colors = {"Red": "#dc3545", "Amber": "#ffc107", "Green": "#28a745"}
     band_color = risk_colors.get(risk_band, "#6c757d")
-    primary_driver = str(job_row.get("primary_driver", "Monitor"))
+
     st.markdown(
-        f"""
-        <div style="background:{band_color}15; border-left:4px solid {band_color};
-                    padding:12px 16px; border-radius:4px; margin-bottom:16px;">
-            <div style="font-size:1.1em; font-weight:600; color:#1a1a2e;">
-                {escape(selected_job_no)} - {escape(str(job_name) if job_name else "Unnamed")}
-            </div>
-            <div style="font-size:0.85em; color:#555; margin-top:4px;">
-                Risk: <strong style="color:{band_color}">{escape(risk_band)}</strong>
-                &nbsp;|&nbsp; {escape(primary_driver)}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown(
-        f"""
-        <div class="dc-job-header">
-            <div class="dc-job-id">{escape(selected_job_no)}</div>
-            <div class="dc-job-title">{escape(str(job_name))}</div>
-            <div class="dc-tag-row">
-                <span class="dc-chip">Delivery : {escape(str(dept))}</span>
-                <span class="dc-chip">{escape(str(cat))}</span>
-                <span class="dc-chip {risk_chip_class}">{escape(str(risk_label))}</span>
-            </div>
-        </div>
-        """,
+        f'<div class="dc-job-header" style="background:{band_color}15; border-left:4px solid {band_color};">'
+        f'<div class="dc-job-header-title">{selected_job} — {job_name if job_name else "Unnamed"}</div>'
+        f'<div class="dc-job-header-sub">Risk: <strong style="color:{band_color}">{risk_band}</strong>'
+        f' &nbsp;|&nbsp; {job_row.get("primary_driver", "Monitor")}'
+        f' &nbsp;|&nbsp; {job_row.get("recommended_action", "")}</div>'
+        f"</div>",
         unsafe_allow_html=True,
     )
 
-    _render_job_snapshot(job_row)
-    _render_peer_margin_comparison(job_row, jobs_df)
-    _render_client_group_subsidy_context(df_all, jobs_df, selected_job_no)
+    margin_to_date = pd.to_numeric(job_row.get("margin_pct_to_date"), errors="coerce")
+    pct_consumed = pd.to_numeric(job_row.get("pct_consumed"), errors="coerce")
+    hours_overrun = pd.to_numeric(job_row.get("hours_overrun"), errors="coerce")
+    margin_at_risk = pd.to_numeric(job_row.get("margin_at_risk"), errors="coerce")
+    mar_confidence = str(job_row.get("margin_at_risk_confidence", "")).lower()
 
-    drivers = compute_root_cause_drivers(df, job_row)
-    _render_why_at_risk(drivers)
-    _render_recommended_actions(job_row, drivers)
-
-    with st.expander("▼ Expand Full Diagnosis", expanded=True):
-        _render_full_diagnosis(df, selected_job_no, job_row)
-
-    with st.expander("Definitions", expanded=False):
-        _render_definitions()
-
-    brief_bytes, brief_name = export_action_brief(selected_job_no, job_row, drivers)
-    st.download_button(
-        "📤 Export Action Brief",
-        data=brief_bytes,
-        file_name=brief_name,
-        mime="text/markdown",
-    )
-
-
-def _render_job_snapshot(row: pd.Series) -> None:
-    """Render compact snapshot box."""
-    quoted_raw = pd.to_numeric(row.get("quoted_hours"), errors="coerce")
-    actual_raw = pd.to_numeric(row.get("actual_hours"), errors="coerce")
-    quoted = float(quoted_raw) if pd.notna(quoted_raw) else 0.0
-    actual = float(actual_raw) if pd.notna(actual_raw) else 0.0
-    variance_pct = (actual - quoted) / quoted * 100 if quoted > 0 else 0
-
-    margin = pd.to_numeric(row.get("forecast_margin_pct"), errors="coerce")
-    bench = pd.to_numeric(row.get("median_margin_pct"), errors="coerce")
-    delta = margin - bench if pd.notna(margin) and pd.notna(bench) else None
-
-    burn_current = row.get("burn_rate_per_day", np.nan)
-    burn_prev = row.get("burn_rate_prev_per_day", np.nan)
-    burn_weekly = burn_current * 7 if pd.notna(burn_current) else np.nan
-    burn_delta = None
-    if pd.notna(burn_current) and pd.notna(burn_prev):
-        burn_delta = (burn_current - burn_prev) * 7
-
-    consumed_pct = (actual / quoted * 100) if quoted > 0 else np.nan
-    consumed_display = f"{consumed_pct:.0f}%" if pd.notna(consumed_pct) else "N/A"
-    ring_deg = int(np.clip((consumed_pct if pd.notna(consumed_pct) else 0) * 3.6, 0, 360))
-    hours_delta_color = "#DC2626" if variance_pct > 0 else "#16A34A"
-    hours_delta_arrow = "↑" if variance_pct > 0 else "↓"
-    margin_delta_label = f"{delta:+.0f}pp vs peer benchmark" if delta is not None else "No benchmark"
-    margin_delta_color = "#16A34A" if (delta is not None and delta >= 0) else "#DC2626"
-    burn_delta_label = f"{burn_delta:+.0f} hrs/wk" if burn_delta is not None else "No prior window"
-    burn_delta_color = "#DC2626" if (burn_delta is not None and burn_delta < 0) else "#16A34A"
-
-    margin_to_date = pd.to_numeric(row.get("margin_pct_to_date"), errors="coerce")
-    if pd.isna(margin_to_date):
-        actual_revenue = pd.to_numeric(row.get("actual_revenue"), errors="coerce")
-        actual_cost = pd.to_numeric(row.get("actual_cost"), errors="coerce")
-        if pd.notna(actual_revenue) and actual_revenue > 0 and pd.notna(actual_cost):
-            margin_to_date = (actual_revenue - actual_cost) / actual_revenue * 100
-
-    margin_at_risk = pd.to_numeric(row.get("margin_at_risk"), errors="coerce")
-    mar_confidence = str(row.get("margin_at_risk_confidence", "low")).lower()
-    if mar_confidence == "medium":
-        mar_label = "Margin at Risk (est.)"
-    else:
-        mar_label = "Margin at Risk"
-
-    with st.container(border=True):
-        st.markdown('<div class="dc-kicker">Snapshot</div>', unsafe_allow_html=True)
-        c1, c2, c3 = st.columns(3, gap="small")
-
-        with c1:
-            st.markdown(
-                f"""
-                <div class="dc-block">
-                    <div class="dc-filter-label">Hours</div>
-                    <div style="display:flex; align-items:center; gap:0.62rem;">
-                        <div style="width:54px;height:54px;border-radius:50%;background:conic-gradient(#2563EB {ring_deg}deg, #E5E7EB {ring_deg}deg);display:flex;align-items:center;justify-content:center;">
-                            <div style="width:43px;height:43px;border-radius:50%;background:#fff;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;color:#6B7280;font-family:var(--dc-mono);">
-                                {consumed_display}"""
-                + """
-                            </div>
-                        </div>
-                        <div style="font-size:30px;line-height:1.0;font-weight:760;color:#111827;font-family:var(--dc-mono);">
-                            """
-                + f"{actual:.0f} / {quoted:.0f}"
-                + """
-                        </div>
-                    </div>
-                    <div style="margin-top:0.3rem;font-size:12px;font-weight:700;color:"""
-                + hours_delta_color
-                + """;font-family:var(--dc-mono);">"""
-                + f"{hours_delta_arrow} {variance_pct:+.0f}%"
-                + """</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        with c2:
-            margin_display = f"{margin:.0f}%" if pd.notna(margin) else "N/A"
-            st.markdown(
-                f"""
-                <div class="dc-block">
-                    <div class="dc-filter-label">Forecast Margin %</div>
-                    <div style="font-size:32px;line-height:1.0;font-weight:760;color:#111827;font-family:var(--dc-mono);">
-                        {margin_display}
-                    </div>
-                    <div style="margin-top:0.33rem;font-size:12px;font-weight:700;color:{margin_delta_color};font-family:var(--dc-mono);">
-                        {margin_delta_label}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        with c3:
-            burn_label = f"{burn_weekly:.0f} hrs/wk" if pd.notna(burn_weekly) else "—"
-            st.markdown(
-                f"""
-                <div class="dc-block">
-                    <div class="dc-filter-label">Burn Rate</div>
-                    <div style="font-size:32px;line-height:1.0;font-weight:760;color:#111827;font-family:var(--dc-mono);">
-                        {burn_label}
-                    </div>
-                    <div style="margin-top:0.33rem;font-size:12px;font-weight:700;color:{burn_delta_color};font-family:var(--dc-mono);">
-                        {burn_delta_label}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        st.markdown('<div class="dc-section-divider"></div>', unsafe_allow_html=True)
-        m1, m2, m3 = st.columns(3, gap="small")
-        with m1:
-            st.metric(
-                "Margin-to-Date %",
-                f"{margin_to_date:.1f}%" if pd.notna(margin_to_date) else "N/A",
-            )
-        with m2:
-            st.metric(
-                "Peer Benchmark Margin % (completed jobs)",
-                f"{bench:.1f}%" if pd.notna(bench) else "N/A",
-            )
-        with m3:
-            if mar_confidence == "low":
-                st.metric("Margin at Risk", "Insufficient data")
-            else:
-                mar_value = f"${margin_at_risk:,.0f}" if pd.notna(margin_at_risk) else "N/A"
-                st.metric(mar_label, mar_value)
-        st.markdown(
-            '<div class="dc-footnote">Burn rate = average hours/day over the last 28 days, scaled to weekly hours. Delta compares the prior 28-day window.</div>',
-            unsafe_allow_html=True,
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric(
+            "Margin-to-Date %",
+            f"{margin_to_date:.1f}%" if pd.notna(margin_to_date) else "—",
+            help="Actual (revenue - cost) / revenue to date",
+        )
+    with k2:
+        st.metric(
+            "Quote Consumed",
+            f"{pct_consumed:.0f}%" if pd.notna(pct_consumed) else "—",
+            help="Actual hours / quoted hours",
+        )
+    with k3:
+        st.metric(
+            "Hours Overrun",
+            f"{hours_overrun:.0f} hrs" if pd.notna(hours_overrun) else "—",
+            help="Hours over quote (0 if under)",
+        )
+    with k4:
+        if mar_confidence == "low":
+            mar_display = "N/A (early stage)"
+        elif pd.notna(margin_at_risk):
+            mar_display = f"${margin_at_risk:,.0f}"
+            if mar_confidence == "medium":
+                mar_display += " (est.)"
+        else:
+            mar_display = "—"
+        st.metric(
+            "Margin at Risk",
+            mar_display,
+            help="Estimated margin gap vs peer benchmark",
         )
 
+    burn_rate = pd.to_numeric(job_row.get("burn_rate_per_day"), errors="coerce")
+    burn_prev = pd.to_numeric(job_row.get("burn_rate_prev_per_day"), errors="coerce")
+    burn_delta = burn_rate - burn_prev if pd.notna(burn_rate) and pd.notna(burn_prev) else None
 
-@st.cache_data(show_spinner=False)
-def _compute_subsidy_context_cached(
-    df_all: pd.DataFrame,
-    jobs_df: pd.DataFrame,
-    selected_job_no: str,
-    lookback_months: Optional[int],
-    scope: str,
-) -> Dict:
-    return compute_client_group_subsidy_context(
-        df_all=df_all,
-        jobs_df=jobs_df,
-        selected_job_no=selected_job_no,
-        lookback_months=lookback_months,
-        scope=scope,
-    )
+    runtime_days = pd.to_numeric(job_row.get("runtime_days"), errors="coerce")
+    runtime_delta = pd.to_numeric(job_row.get("runtime_delta_days"), errors="coerce")
 
+    last_activity = pd.to_datetime(job_row.get("last_activity"), errors="coerce")
+    last_activity_str = last_activity.strftime("%Y-%m-%d") if pd.notna(last_activity) else "—"
 
-def _fmt_signed_currency(value: float) -> str:
-    if pd.isna(value):
-        return "—"
-    sign = "-" if value < 0 else ""
-    return f"{sign}${abs(value):,.0f}"
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.metric(
+            "Burn Rate",
+            f"{burn_rate:.1f} hrs/day" if pd.notna(burn_rate) else "—",
+            delta=f"{burn_delta:+.1f} hrs/day" if burn_delta is not None else None,
+            delta_color="inverse",
+        )
+    with d2:
+        st.metric(
+            "Runtime",
+            f"{runtime_days:.0f} days" if pd.notna(runtime_days) else "—",
+            delta=f"{runtime_delta:+.0f} days vs peer median" if pd.notna(runtime_delta) else None,
+        )
+    with d3:
+        st.metric("Last Activity", last_activity_str)
 
-
-def _fmt_currency(value: float) -> str:
-    if pd.isna(value):
-        return "—"
-    return f"${value:,.0f}"
-
-
-def _fmt_percent(value: float) -> str:
-    if pd.isna(value):
-        return "—"
-    return f"{value:.1f}%"
-
-
-def _render_peer_margin_comparison(job_row: pd.Series, jobs_df: pd.DataFrame) -> None:
-    """Render peer margin comparison using the same formulas as the selected-job snapshot."""
     dept = job_row.get("department_final")
     cat = job_row.get("job_category")
     peers = jobs_df[
         (jobs_df["department_final"] == dept)
         & (jobs_df["job_category"] == cat)
     ].copy()
+    peer_count = len(peers)
 
-    with st.container(border=True):
-        st.markdown('<div class="dc-kicker">Peer Margin Comparison</div>', unsafe_allow_html=True)
+    st.markdown(f"### Active Peers ({peer_count} jobs in {dept} / {cat})")
+    if peer_count < 2:
+        st.caption("Insufficient active peers for comparison in this category.")
+    else:
+        peers_other = peers[peers["job_no"].astype(str) != str(selected_job)]
+        active_peer_median = pd.to_numeric(peers_other["margin_pct_to_date"], errors="coerce").median()
+        historical_benchmark = pd.to_numeric(job_row.get("median_margin_pct"), errors="coerce")
 
-        peer_count = len(peers)
-        if peer_count <= 1:
-            st.caption("No active peer jobs for comparison in this category.")
-            return
-
-        peer_forecast_margin_median = pd.to_numeric(
-            peers["forecast_margin_pct"], errors="coerce"
-        ).median()
-
-        if {"actual_revenue", "actual_cost"}.issubset(peers.columns):
-            peer_revenue = pd.to_numeric(peers["actual_revenue"], errors="coerce")
-            peer_cost = pd.to_numeric(peers["actual_cost"], errors="coerce")
-            peer_margin_to_date_values = np.where(
-                peer_revenue > 0,
-                ((peer_revenue - peer_cost) / peer_revenue) * 100,
-                np.nan,
+        p1, p2, p3 = st.columns(3)
+        with p1:
+            st.metric(
+                "This Job Margin %",
+                f"{margin_to_date:.1f}%" if pd.notna(margin_to_date) else "—",
+                help="Actual margin to date for this job",
             )
+        with p2:
+            st.metric(
+                "Active Peer Median %",
+                f"{active_peer_median:.1f}%" if pd.notna(active_peer_median) else "—",
+                help="Median margin across active peers in same category",
+            )
+        with p3:
+            st.metric(
+                "Historical Benchmark %",
+                f"{historical_benchmark:.1f}%" if pd.notna(historical_benchmark) else "—",
+                help="Median final margin of completed jobs in same category",
+            )
+
+    with st.expander("Root Cause Analysis", expanded=False):
+        drivers = compute_root_cause_drivers(df_scope, job_row)
+        if drivers:
+            for driver in drivers:
+                c1, c2 = st.columns([3, 1])
+                with c1:
+                    st.markdown(f"**{driver['driver_name']}** — {driver.get('evidence_detail', '')}")
+                    st.caption(
+                        f"{driver['evidence_metric']}: {driver['evidence_value']} "
+                        f"(benchmark: {driver['benchmark_value']})"
+                    )
+                with c2:
+                    st.markdown(f"**Action:** {driver['recommendation']}")
         else:
-            peer_margin_to_date_values = pd.to_numeric(
-                peers.get("margin_pct_to_date", pd.Series(dtype=float)),
-                errors="coerce",
-            ).to_numpy()
-        peer_margin_to_date_median = (
-            float(np.nanmedian(peer_margin_to_date_values))
-            if np.any(~np.isnan(peer_margin_to_date_values))
-            else np.nan
-        )
+            st.info("No significant risk drivers detected.")
 
-        bench_margin = pd.to_numeric(job_row.get("median_margin_pct"), errors="coerce")
-        st.markdown(f"**Active Peer Jobs** ({peer_count} jobs in {dept} / {cat})")
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric(
-                "Peer Forecast Margin %",
-                f"{peer_forecast_margin_median:.1f}%"
-                if pd.notna(peer_forecast_margin_median)
-                else "N/A",
-            )
-        with col2:
-            st.metric(
-                "Peer Margin-to-Date %",
-                f"{peer_margin_to_date_median:.1f}%"
-                if pd.notna(peer_margin_to_date_median)
-                else "N/A",
-            )
-        with col3:
-            st.metric(
-                "Historical Benchmark % (completed jobs)",
-                f"{bench_margin:.1f}%"
-                if pd.notna(bench_margin)
-                else "N/A",
-            )
+    tab_task, tab_staff = st.tabs(["Task Breakdown", "Staff Attribution"])
 
+    with tab_task:
+        task_df = get_job_task_attribution(df_scope, selected_job)
+        if len(task_df) == 0 and "job_no" in df_scope.columns:
+            matches = df_scope.loc[df_scope["job_no"].astype(str) == str(selected_job), "job_no"]
+            if len(matches) > 0:
+                task_df = get_job_task_attribution(df_scope, matches.iloc[0])
 
-def _render_client_group_subsidy_context(
-    df_all: pd.DataFrame,
-    jobs_df: pd.DataFrame,
-    selected_job_no: str,
-) -> None:
-    with st.container(border=True):
-        st.markdown('<div class="dc-kicker">Client Group Subsidy Lens</div>', unsafe_allow_html=True)
-
-        controls_left, controls_right = st.columns([1, 2])
-        with controls_left:
-            st.markdown('<div class="dc-filter-label">Window</div>', unsafe_allow_html=True)
-            window_label = st.selectbox(
-                "Window",
-                options=["3m", "6m", "12m", "All"],
-                index=2,
-                key="dc_subsidy_window",
-                label_visibility="collapsed",
-            )
-        with controls_right:
-            st.markdown('<div class="dc-filter-label">Scope</div>', unsafe_allow_html=True)
-            scope_label = st.radio(
-                "Scope",
-                options=["All jobs", "Active jobs only"],
-                horizontal=True,
-                key="dc_subsidy_scope",
-                label_visibility="collapsed",
-            )
-
-        window_map = {"3m": 3, "6m": 6, "12m": 12, "All": None}
-        scope_map = {"All jobs": "all", "Active jobs only": "active_only"}
-
-        context = _compute_subsidy_context_cached(
-            df_all=df_all,
-            jobs_df=jobs_df,
-            selected_job_no=selected_job_no,
-            lookback_months=window_map[window_label],
-            scope=scope_map[scope_label],
-        )
-
-        status = context.get("status")
-        if status == "missing_group_column":
-            st.info(
-                "Client group field not found (checked: client_group_rev_job_month, client_group_rev_job, client_group, client)."
-            )
-            return
-        if status == "missing_group_value":
-            st.warning("Selected job has no usable client-group value in the selected window.")
-            return
-        if status == "empty_group":
-            st.info("No peer jobs available for subsidy analysis in this scope/window.")
-            return
-        if status != "ok":
-            st.info("No peer jobs available for subsidy analysis in this scope/window.")
-            return
-
-        summary = context["summary"]
-        group_value = context["group_value"]
-        group_col = context["group_col"]
-
-        st.markdown(
-            (
-                "<div class='dc-lens-caption'>"
-                f"Group: {group_value}  • Field: {group_col}  • Scope: {scope_label}  • Window: {window_label}"
-                "</div>"
-            ),
-            unsafe_allow_html=True,
-        )
-
-        kpi_1, kpi_2, kpi_3 = st.columns(3)
-        with kpi_1:
-            st.metric("Selected Job Margin ($)", _fmt_signed_currency(summary["selected_margin"]))
-        with kpi_2:
-            st.metric("Group Margin ($)", _fmt_signed_currency(summary["group_margin"]))
-        with kpi_3:
-            group_margin_pct = summary["group_margin_pct"]
-            st.metric("Group Margin-to-Date %", f"{group_margin_pct:.1f}%" if pd.notna(group_margin_pct) else "—")
-        kpi_4, kpi_5, kpi_6 = st.columns(3)
-        with kpi_4:
-            coverage_ratio = summary["coverage_ratio"]
-            st.metric("Subsidy Coverage (x)", f"{coverage_ratio:.2f}x" if pd.notna(coverage_ratio) else "—")
-        with kpi_5:
-            st.metric("Subsidizer Jobs (#)", f"{int(summary['subsidizer_job_count'])}")
-        with kpi_6:
-            st.metric("Active Red/Amber (#)", f"{int(summary['red_job_count'])}/{int(summary['amber_job_count'])}")
-
-        verdict = summary["verdict"]
-        selected_loss_abs = summary["selected_loss_abs"]
-        positive_pool = summary["positive_peer_margin_pool"]
-        coverage_ratio = summary["coverage_ratio"]
-        buffer_after_subsidy = summary["buffer_after_subsidy"]
-
-        coverage_text = f"{coverage_ratio:.2f}x" if pd.notna(coverage_ratio) else "—"
-        banner_text = (
-            f"Selected job loss: {_fmt_currency(selected_loss_abs)}  •  "
-            f"Peer margin buffer: {_fmt_currency(positive_pool)}  •  "
-            f"Coverage: {coverage_text}  •  "
-            f"Net buffer after coverage: {_fmt_signed_currency(buffer_after_subsidy)}"
-        )
-
-        if verdict == "No Subsidy Needed":
-            st.success(f"✅ **{verdict}**  \n{banner_text}")
-        elif verdict == "Fully Subsidized":
-            st.success(f"✅ **{verdict}**  \n{banner_text}")
-        elif verdict in ["Partially Subsidized", "Weak Subsidy"]:
-            st.warning(f"⚠️ **{verdict}**  \n{banner_text}")
+        if len(task_df) == 0:
+            st.info("No task attribution data available for this job.")
         else:
-            st.error(f"⚠️ **{verdict}**  \n{banner_text}")
-
-        jobs_table = context["jobs"].copy()
-        if len(jobs_table) == 0:
-            st.info("No peer jobs available for subsidy analysis in this scope/window.")
-            return
-
-        plot_df = jobs_table.copy()
-        plot_df["job_name"] = plot_df["job_name"].fillna(plot_df["job_no"])
-        plot_df["job_name_short"] = plot_df["job_name"].astype(str).str.slice(0, 36)
-        plot_df["label"] = np.where(
-            plot_df["is_selected"],
-            plot_df["job_no"].astype(str) + " — " + plot_df["job_name_short"] + " (Selected)",
-            plot_df["job_no"].astype(str) + " — " + plot_df["job_name_short"],
-        )
-        plot_df = plot_df.sort_values("margin", ascending=True)
-
-        bar_colors = np.where(plot_df["margin"] >= 0, "#16A34A", "#DC2626")
-        line_widths = np.where(plot_df["is_selected"], 3, 0.5)
-        line_colors = np.where(plot_df["is_selected"], "#111827", "rgba(17,24,39,0.25)")
-
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            y=plot_df["label"],
-            x=plot_df["margin"],
-            orientation="h",
-            marker=dict(
-                color=bar_colors,
-                line=dict(color=line_colors, width=line_widths),
-            ),
-            customdata=np.stack([plot_df["revenue"].values, plot_df["cost"].values], axis=1),
-            hovertemplate=(
-                "%{y}<br>"
-                "Margin: %{x:$,.0f}<br>"
-                "Revenue: %{customdata[0]:$,.0f}<br>"
-                "Cost: %{customdata[1]:$,.0f}"
-                "<extra></extra>"
-            ),
-        ))
-        fig.update_layout(
-            title="Margin Contribution by Job (Client Group)",
-            xaxis_title="Margin",
-            yaxis_title="",
-            height=max(320, 28 * len(plot_df)),
-            showlegend=False,
-            template="plotly_white",
-            margin=dict(l=0, r=6, t=55, b=12),
-        )
-        fig.update_xaxes(showgrid=True, gridcolor="rgba(148, 163, 184, 0.25)", zeroline=True, zerolinewidth=1)
-        fig.update_yaxes(automargin=True)
-        st.plotly_chart(fig, use_container_width=True)
-
-        with st.expander("Interpretation", expanded=False):
-            if pd.notna(coverage_ratio) and coverage_ratio >= 1:
-                st.markdown("- Coverage ratio is at least 1.0x: low immediate economic risk but watch concentration.")
-            elif pd.notna(coverage_ratio) and 0 < coverage_ratio < 1:
-                st.markdown("- Coverage ratio is between 0 and 1.0x: partially offset, still value-destructive.")
-            elif pd.notna(coverage_ratio) and np.isclose(coverage_ratio, 0.0):
-                st.markdown("- Coverage ratio is 0.0x: no portfolio offset.")
-            else:
-                st.markdown("- Selected job is not currently loss-making in this window, so subsidy is not required.")
-
-            if positive_pool > 0 and pd.notna(summary["subsidy_concentration_pct"]):
-                st.markdown(
-                    f"- Subsidy concentration: top subsidizer contributes {summary['subsidy_concentration_pct']:.1f}% of the positive margin pool."
-                )
-
-        st.markdown("<div class='dc-section-divider'></div>", unsafe_allow_html=True)
-        st.markdown("**Peer Jobs in Selected Client Group (Margin-to-Date actuals)**")
-        table_cols = [
-            "is_selected",
-            "job_no",
-            "job_name",
-            "risk_band",
-            "revenue",
-            "cost",
-            "margin",
-            "margin_pct",
-            "contribution_pct_to_group_margin",
-        ]
-        table_df = jobs_table[table_cols].sort_values("margin", ascending=False).copy()
-        table_df["is_selected"] = np.where(table_df["is_selected"], "★", "")
-        table_df["job_name"] = table_df["job_name"].fillna("").astype(str)
-        table_df["job_name_full"] = table_df["job_name"]
-        table_df["job_name"] = table_df["job_name"].str.slice(0, 44)
-        table_df.loc[table_df["job_name_full"].str.len() > 44, "job_name"] = (
-            table_df.loc[table_df["job_name_full"].str.len() > 44, "job_name"] + "…"
-        )
-        table_show = table_df.drop(columns=["job_name_full"]).rename(
-            columns={"margin_pct": "margin_to_date_pct"}
-        )
-
-        def _row_bg(row: pd.Series) -> list[str]:
-            if row["is_selected"] == "★":
-                bg = "#EFF6FF"
-            elif row.name % 2 == 0:
-                bg = "#FFFFFF"
-            else:
-                bg = "#F9FAFB"
-            return [f"background-color: {bg}"] * len(row)
-
-        styled = (
-            table_show.style
-            .format({
-                "revenue": "${:,.0f}",
-                "cost": "${:,.0f}",
-                "margin": "${:,.0f}",
-                "margin_to_date_pct": "{:.1f}%",
-                "contribution_pct_to_group_margin": "{:.1f}%",
-            })
-            .apply(_row_bg, axis=1)
-            .set_properties(
-                subset=["revenue", "cost", "margin", "margin_to_date_pct", "contribution_pct_to_group_margin"],
-                **{"font-family": "var(--dc-mono)", "text-align": "right"},
+            display = task_df.sort_values("variance", ascending=False).copy()
+            display = display.rename(
+                columns={
+                    "task_name": "Task",
+                    "quoted_hours": "Quoted Hrs",
+                    "actual_hours": "Actual Hrs",
+                    "variance": "Variance",
+                    "variance_pct": "Variance %",
+                }
             )
-            .set_properties(subset=["job_no", "job_name", "risk_band"], **{"text-align": "left"})
-        )
-        st.dataframe(styled, use_container_width=True, hide_index=True)
-        st.markdown('<div class="dc-table-note">Selected row is highlighted in blue.</div>', unsafe_allow_html=True)
+            for col in ["Quoted Hrs", "Actual Hrs", "Variance"]:
+                if col in display.columns:
+                    display[col] = display[col].apply(fmt_hours)
+            if "Variance %" in display.columns:
+                display["Variance %"] = display["Variance %"].apply(fmt_percent)
 
+            show_cols = [c for c in ["Task", "Quoted Hrs", "Actual Hrs", "Variance", "Variance %"] if c in display.columns]
+            st.dataframe(display[show_cols], use_container_width=True, hide_index=True)
 
-def _render_why_at_risk(drivers: List[Dict]) -> None:
-    """Render ranked risk drivers."""
-    with st.container(border=True):
-        st.markdown('<div class="dc-kicker">Why At Risk</div>', unsafe_allow_html=True)
+    with tab_staff:
+        staff_df = get_job_staff_attribution(df_scope, selected_job)
+        if len(staff_df) == 0 and "job_no" in df_scope.columns:
+            matches = df_scope.loc[df_scope["job_no"].astype(str) == str(selected_job), "job_no"]
+            if len(matches) > 0:
+                staff_df = get_job_staff_attribution(df_scope, matches.iloc[0])
 
-        if not drivers:
-            st.success("No significant risk drivers")
-            return
-
-        for i, driver in enumerate(drivers[:3], 1):
-            name = str(driver["driver_name"])
-            evidence = str(driver.get("evidence_detail", driver.get("evidence_value", "")))
-            evidence_value = str(driver.get("evidence_value", ""))
-            severity_dot = "🔴" if i == 1 else ("🟡" if i == 2 else "🟢")
-            st.markdown(
-                f"""
-                <div class="dc-block">
-                    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:0.6rem;">
-                        <div style="font-weight:760; color:#111827; margin-bottom:0.15rem;">
-                            {severity_dot} {i}. {escape(name)}
-                        </div>
-                        <div style="font-weight:760; color:#DC2626; font-family:var(--dc-mono);">
-                            {escape(evidence_value)}
-                        </div>
-                    </div>
-                    <div style="font-size:12px; color:#4B5563;">{escape(evidence)}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
+        if len(staff_df) == 0:
+            st.info("No staff attribution data available for this job.")
+        else:
+            display = staff_df.sort_values("hours", ascending=False).copy()
+            display = display.rename(
+                columns={
+                    "staff_name": "Staff",
+                    "hours": "Hours",
+                    "cost": "Cost",
+                    "tasks_worked": "Tasks Worked",
+                }
             )
+            if "Hours" in display.columns:
+                display["Hours"] = display["Hours"].apply(fmt_hours)
+            if "Cost" in display.columns:
+                display["Cost"] = display["Cost"].apply(fmt_currency)
 
-
-def _render_recommended_actions(row: pd.Series, drivers: List[Dict]) -> None:
-    """Render checkable action items."""
-    with st.container(border=True):
-        st.markdown('<div class="dc-kicker">Recommended Actions</div>', unsafe_allow_html=True)
-
-        actions = []
-        for driver in drivers[:3]:
-            action = driver.get("recommendation", "")
-            if action:
-                actions.append(action)
-
-        if not actions:
-            actions.append("Review job status with PM")
-
-        for i, action in enumerate(actions):
-            st.markdown('<div class="dc-block" style="margin-bottom:0.45rem;">', unsafe_allow_html=True)
-            st.checkbox(f"🛠 {action}", key=f"action_{row['job_no']}_{i}")
-            st.markdown("</div>", unsafe_allow_html=True)
-
-
-def _render_full_diagnosis(df: pd.DataFrame, job_no: str, job_row: pd.Series) -> None:
-    """
-    Render full diagnosis panel (expandable).
-
-    Includes:
-    - Task consumption vs quote with benchmark overlay
-    - Staff contribution by task with margin-erosion context
-    """
-    st.markdown('<div class="dc-kicker">Task Consumption vs Quote</div>', unsafe_allow_html=True)
-    task_df = get_job_task_attribution(df, job_no)
-    if len(task_df) > 0:
-        task_df = task_df.sort_values("variance", ascending=False)
-        task_plot = task_df.head(10).copy()
-
-        bench = _compute_task_benchmarks(df, job_row)
-        task_plot = task_plot.merge(bench, on="task_name", how="left")
-        fte = _compute_task_fte_equiv(df, job_no)
-        task_plot = task_plot.merge(fte, on="task_name", how="left")
-
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            name="Quoted",
-            y=task_plot["task_name"],
-            x=task_plot["quoted_hours"],
-            orientation="h",
-            marker_color="#6c757d",
-        ))
-        fte_labels = [
-            f"{value:.1f} FTE" if pd.notna(value) and value > 0 else ""
-            for value in task_plot.get("fte_equiv", pd.Series(dtype=float))
-        ]
-        fig.add_trace(go.Bar(
-            name="Actual",
-            y=task_plot["task_name"],
-            x=task_plot["actual_hours"],
-            orientation="h",
-            marker_color=[
-                "#dc3545" if a > q else "#28a745"
-                for a, q in zip(task_plot["actual_hours"], task_plot["quoted_hours"])
-            ],
-            text=fte_labels,
-            textposition="inside",
-            textfont=dict(color="white"),
-        ))
-
-        bench_points = pd.DataFrame()
-        if "bench_actual_hours" in task_plot.columns:
-            bench_points = task_plot[task_plot["bench_actual_hours"].notna()]
-        if len(bench_points) > 0:
-            fig.add_trace(go.Scatter(
-                name="Benchmark (median completed)",
-                y=bench_points["task_name"],
-                x=bench_points["bench_actual_hours"],
-                mode="markers",
-                marker=dict(color="#111827", size=8),
-            ))
-
-        fig.update_layout(
-            barmode="group",
-            height=max(260, len(task_plot) * 30),
-            xaxis_title="Hours",
-            yaxis_title="",
-            template="plotly_white",
-            legend=dict(orientation="h", y=1.12, x=0, font=dict(size=11)),
-            margin=dict(l=0, r=8, t=10, b=10),
-            plot_bgcolor="#FFFFFF",
-            paper_bgcolor="#FFFFFF",
-            font=dict(color="#374151"),
-        )
-        fig.update_xaxes(showgrid=False, tickfont=dict(size=12, color="#6B7280"), title_font=dict(size=12, color="#6B7280"))
-        fig.update_yaxes(showgrid=False, tickfont=dict(size=12, color="#6B7280"))
-        st.plotly_chart(fig, use_container_width=True)
-        st.caption(
-            "Red bars indicate tasks running over quoted hours. Benchmarks reflect median actual hours on completed "
-            "jobs in the same department/category. Labels on actual bars show FTE-equivalent effort."
-        )
-    else:
-        st.caption("No task data available.")
-
-    st.markdown('<div class="dc-kicker">Task Contribution by Staff (Overrun Focus)</div>', unsafe_allow_html=True)
-    staff_task_df = _compute_task_staff_contribution(df, job_no)
-    if len(staff_task_df) > 0:
-        total_erosion = staff_task_df["erosion_value"].sum()
-        staff_task_df["erosion_pct_total"] = (
-            staff_task_df["erosion_value"] / total_erosion * 100 if total_erosion > 0 else 0
-        )
-
-        def _top_contributors(group: pd.DataFrame) -> pd.DataFrame:
-            group = group.sort_values("actual_hours", ascending=False).copy()
-            group["cum_share"] = group["task_share"].cumsum()
-            keep = group["cum_share"] <= 0.8
-            if len(group) > 0 and not keep.any():
-                keep.iloc[0] = True
-            if len(group) > 0 and keep.any():
-                first_over = group.index[group["cum_share"] > 0.8]
-                if len(first_over) > 0:
-                    keep.loc[first_over[0]] = True
-            return group[keep]
-
-        focused = staff_task_df.groupby("task_name", group_keys=False).apply(_top_contributors)
-
-        task_meta = staff_task_df.groupby("task_name").agg(
-            task_cost=("task_cost", "sum"),
-            quoted_hours=("task_quoted_hours", "first"),
-        ).reset_index()
-        task_meta = task_meta.set_index("task_name")
-
-        task_labels = {
-            task: (
-                f"{task} • ${task_meta.loc[task, 'task_cost']:,.0f}"
-                if task in task_meta.index and pd.notna(task_meta.loc[task, "task_cost"])
-                else task
-            )
-            for task in focused["task_name"].unique()
-        }
-        focused["task_label"] = focused["task_name"].map(task_labels)
-
-        fig_task = go.Figure()
-        for staff_name in focused["staff_name"].unique():
-            subset = focused[focused["staff_name"] == staff_name]
-            text_labels = [
-                f"{staff_name} ({share:.0f}%)" if share >= 10 else ""
-                for share in subset["task_share"] * 100
-            ]
-            fig_task.add_trace(go.Bar(
-                name=staff_name,
-                y=subset["task_label"],
-                x=subset["actual_hours"],
-                orientation="h",
-                text=text_labels,
-                textposition="inside",
-                textfont=dict(color="white"),
-                customdata=subset["erosion_pct_total"],
-                hovertemplate=(
-                    "%{y}<br>%{fullData.name}<br>"
-                    "Hours: %{x:.0f}<br>"
-                    "Task Share: %{customdata:.1f}% of total erosion"
-                    "<extra></extra>"
-                ),
-            ))
-
-        quoted_points = task_meta.reset_index()
-        if "quoted_hours" in quoted_points.columns:
-            quoted_points["task_label"] = quoted_points["task_name"].map(task_labels)
-            fig_task.add_trace(go.Scatter(
-                name="Quoted Hours (target)",
-                y=quoted_points["task_label"],
-                x=quoted_points["quoted_hours"],
-                mode="markers+text",
-                marker=dict(color="#111827", size=11, symbol="diamond", line=dict(color="white", width=1)),
-                text=[f"{val:.0f}h" if pd.notna(val) else "" for val in quoted_points["quoted_hours"]],
-                textposition="middle right",
-                textfont=dict(color="#111827", size=10),
-            ))
-
-        fig_task.update_layout(
-            barmode="stack",
-            height=max(260, len(task_meta) * 30),
-            xaxis_title="Hours",
-            yaxis_title="",
-            template="plotly_white",
-            legend=dict(orientation="h", y=1.12, x=0, font=dict(size=11)),
-            margin=dict(l=0, r=8, t=10, b=10),
-            plot_bgcolor="#FFFFFF",
-            paper_bgcolor="#FFFFFF",
-            font=dict(color="#374151"),
-        )
-        fig_task.update_xaxes(showgrid=False, tickfont=dict(size=12, color="#6B7280"), title_font=dict(size=12, color="#6B7280"))
-        fig_task.update_yaxes(showgrid=False, tickfont=dict(size=12, color="#6B7280"))
-        st.plotly_chart(fig_task, use_container_width=True)
-        st.caption(
-            "Each task shows the staff who contribute to at least ~80% of its hours. "
-            "Quoted hours are marked with an X, and task labels include total cost."
-        )
-    else:
-        st.caption("No staff-task contribution data available.")
-
-
-
-def _compute_margin_at_risk(df: pd.DataFrame) -> float:
-    if len(df) == 0:
-        return 0.0
-    return df.get("margin_at_risk", pd.Series(dtype=float)).fillna(0).sum()
-
-
-def _apply_sort(df: pd.DataFrame, sort_option: str) -> pd.DataFrame:
-    if len(df) == 0:
-        return df
-
-    if sort_option == "Margin at Risk":
-        return df.sort_values("margin_at_risk", ascending=False)
-    if sort_option == "Hours Overrun":
-        return df.sort_values("hours_overrun", ascending=False)
-    if sort_option == "Recent Activity":
-        if "last_activity" in df.columns:
-            return df.sort_values("last_activity", ascending=False)
-        return df
-
-    return df.sort_values("risk_score", ascending=False)
-
-
-def _format_primary_issue(row: pd.Series) -> str:
-    """Format primary issue with specific numbers."""
-    driver = row.get("primary_driver", "")
-
-    if "scope" in driver.lower() or "hours overrun" in driver.lower():
-        pct = row.get("scope_creep_pct")
-        if pd.isna(pct):
-            pct = row.get("hours_variance_pct", 0)
-        return f"Scope/hours +{pct:.0f}% over quote"
-
-    if "rate" in driver.lower():
-        rate_var = row.get("rate_variance", 0)
-        return f"Rate leakage ${rate_var:.0f}/hr"
-
-    if "margin" in driver.lower():
-        margin = row.get("forecast_margin_pct", 0)
-        bench = row.get("median_margin_pct", 0)
-        return f"Margin {margin:.0f}% (bench: {bench:.0f}%)"
-
-    if "running" in driver.lower() or "runtime" in driver.lower():
-        delta = row.get("runtime_delta_days", 0)
-        return f"Running {delta:.0f} days over benchmark"
-
-    return driver or "Monitor"
-
-
-def _compute_task_benchmarks(df: pd.DataFrame, job_row: pd.Series) -> pd.DataFrame:
-    category_col = get_category_col(df)
-    dept = job_row.get("department_final")
-    cat = job_row.get("job_category")
-
-    df_completed = df.copy()
-    if "job_completed_date" in df_completed.columns:
-        df_completed = df_completed[df_completed["job_completed_date"].notna()]
-    elif "job_status" in df_completed.columns:
-        df_completed = df_completed[df_completed["job_status"].str.lower().str.contains("completed", na=False)]
-    else:
-        df_completed = df_completed.iloc[0:0]
-
-    if dept:
-        df_completed = df_completed[df_completed["department_final"] == dept]
-    if cat and category_col in df_completed.columns:
-        df_completed = df_completed[df_completed[category_col] == cat]
-
-    if len(df_completed) == 0:
-        return pd.DataFrame(columns=["task_name", "bench_actual_hours"])
-
-    actuals = df_completed.groupby(["job_no", "task_name"])["hours_raw"].sum().reset_index()
-    bench_actual = actuals.groupby("task_name")["hours_raw"].median().reset_index()
-    bench_actual = bench_actual.rename(columns={"hours_raw": "bench_actual_hours"})
-
-    return bench_actual
-
-
-def _compute_task_fte_equiv(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
-    job_df = df[df["job_no"] == job_no].copy()
-    if len(job_df) == 0:
-        return pd.DataFrame(columns=["task_name", "fte_equiv"])
-
-    if "fte_hours_scaling" in job_df.columns:
-        scaling = job_df["fte_hours_scaling"].fillna(config.DEFAULT_FTE_SCALING)
-    else:
-        scaling = config.DEFAULT_FTE_SCALING
-
-    denom = config.CAPACITY_HOURS_PER_WEEK * scaling
-    denom = denom.replace(0, np.nan) if isinstance(denom, pd.Series) else denom
-    job_df["fte_equiv"] = job_df["hours_raw"] / denom
-    job_df["fte_equiv"] = job_df["fte_equiv"].replace([np.inf, -np.inf], np.nan)
-
-    fte_by_task = job_df.groupby("task_name")["fte_equiv"].sum().reset_index()
-    return fte_by_task
-
-
-def _compute_task_staff_contribution(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
-    job_df = df[df["job_no"] == job_no].copy()
-    if len(job_df) == 0:
-        return pd.DataFrame()
-
-    staff_task = job_df.groupby(["task_name", "staff_name"]).agg(
-        actual_hours=("hours_raw", "sum"),
-        task_cost=("base_cost", "sum") if "base_cost" in job_df.columns else ("hours_raw", "sum"),
-    ).reset_index()
-    staff_task["task_total_hours"] = staff_task.groupby("task_name")["actual_hours"].transform("sum")
-    staff_task["task_share"] = np.where(
-        staff_task["task_total_hours"] > 0,
-        staff_task["actual_hours"] / staff_task["task_total_hours"],
-        0,
-    )
-
-    job_task_quote = safe_quote_job_task(job_df)
-    if len(job_task_quote) == 0 or "quoted_time_total" not in job_task_quote.columns:
-        staff_task["task_quoted_hours"] = 0.0
-        staff_task["quoted_alloc"] = 0.0
-        staff_task["overrun_hours"] = staff_task["actual_hours"]
-        staff_task["quote_rate"] = 0.0
-    else:
-        task_totals = job_df.groupby("task_name")["hours_raw"].sum().reset_index()
-        task_totals = task_totals.rename(columns={"hours_raw": "task_actual_hours"})
-        staff_task = staff_task.merge(task_totals, on="task_name", how="left")
-        quote_cols = ["task_name", "quoted_time_total"]
-        if "quoted_amount_total" in job_task_quote.columns:
-            quote_cols.append("quoted_amount_total")
-        staff_task = staff_task.merge(
-            job_task_quote[quote_cols],
-            on="task_name",
-            how="left",
-        )
-        staff_task["quoted_time_total"] = staff_task["quoted_time_total"].fillna(0)
-        if "quoted_amount_total" not in staff_task.columns:
-            staff_task["quoted_amount_total"] = 0
-        staff_task["quoted_amount_total"] = staff_task["quoted_amount_total"].fillna(0)
-        staff_task["task_actual_hours"] = staff_task["task_actual_hours"].replace(0, np.nan)
-        staff_task["quoted_alloc"] = (
-            staff_task["actual_hours"] / staff_task["task_actual_hours"]
-        ) * staff_task["quoted_time_total"]
-        staff_task["quoted_alloc"] = staff_task["quoted_alloc"].fillna(0)
-        staff_task["overrun_hours"] = staff_task["actual_hours"] - staff_task["quoted_alloc"]
-        staff_task["task_quoted_hours"] = staff_task["quoted_time_total"]
-        staff_task["quote_rate"] = np.where(
-            staff_task["quoted_time_total"] > 0,
-            staff_task["quoted_amount_total"] / staff_task["quoted_time_total"],
-            0,
-        )
-
-    staff_task["erosion_value"] = (
-        staff_task["overrun_hours"].clip(lower=0) * staff_task["quote_rate"]
-    )
-
-    return staff_task
-
-
-def _render_definitions() -> None:
-    st.markdown("**Burn Rate:** Average hours per day over the last 28 days, shown as hours per week.")
-    st.markdown("**Margin at Risk:** Benchmark margin minus forecast margin, applied to forecast revenue (shown once a job is at least 30% consumed).")
-    st.markdown("**Scope Creep:** Share of hours on tasks not matched to a quote.")
-    st.markdown("**Hours Overrun:** EAC hours minus quoted hours (positive indicates overrun).")
-    st.markdown("**Risk Score:** Composite score (0–100) from margin, revenue lag, hours overrun, rate leakage, and runtime.")
+            show_cols = [c for c in ["Staff", "Hours", "Cost", "Tasks Worked"] if c in display.columns]
+            st.dataframe(display[show_cols], use_container_width=True, hide_index=True)
