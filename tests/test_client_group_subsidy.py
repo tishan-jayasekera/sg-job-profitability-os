@@ -138,3 +138,85 @@ def test_active_only_scope_keeps_active_and_forces_selected():
     jobs = set(result["jobs"]["job_no"].tolist())
     assert jobs == {"SEL", "P1"}
     assert bool(result["jobs"].loc[result["jobs"]["job_no"] == "SEL", "is_selected"].iloc[0]) is True
+
+
+def test_group_membership_is_job_level_and_keeps_full_history_margin():
+    rows = [
+        # Selected job: older row has no group tag, newer row does.
+        {
+            "job_no": "SEL",
+            "job_name": "Job SEL",
+            "department_final": "Tax",
+            "job_category": "Compliance",
+            "work_date": pd.Timestamp("2024-01-15"),
+            "hours_raw": 8.0,
+            "base_cost": 220.0,
+            "rev_alloc": 100.0,
+            "client_group_rev_job_month": None,
+        },
+        {
+            "job_no": "SEL",
+            "job_name": "Job SEL",
+            "department_final": "Tax",
+            "job_category": "Compliance",
+            "work_date": pd.Timestamp("2025-12-15"),
+            "hours_raw": 6.0,
+            "base_cost": 40.0,
+            "rev_alloc": 100.0,
+            "client_group_rev_job_month": "G1",
+        },
+        # Peer in same current group.
+        {
+            "job_no": "P1",
+            "job_name": "Job P1",
+            "department_final": "Tax",
+            "job_category": "Compliance",
+            "work_date": pd.Timestamp("2024-02-01"),
+            "hours_raw": 7.0,
+            "base_cost": 30.0,
+            "rev_alloc": 50.0,
+            "client_group_rev_job_month": None,
+        },
+        {
+            "job_no": "P1",
+            "job_name": "Job P1",
+            "department_final": "Tax",
+            "job_category": "Compliance",
+            "work_date": pd.Timestamp("2025-12-10"),
+            "hours_raw": 7.0,
+            "base_cost": 20.0,
+            "rev_alloc": 50.0,
+            "client_group_rev_job_month": "G1",
+        },
+        # Stale job: same group but no activity in lookback window.
+        {
+            "job_no": "STALE",
+            "job_name": "Job STALE",
+            "department_final": "Tax",
+            "job_category": "Compliance",
+            "work_date": pd.Timestamp("2023-06-01"),
+            "hours_raw": 5.0,
+            "base_cost": 20.0,
+            "rev_alloc": 80.0,
+            "client_group_rev_job_month": "G1",
+        },
+    ]
+    df = pd.DataFrame(rows)
+    jobs_df = _make_jobs_df(["SEL", "P1"])
+
+    result = compute_client_group_subsidy_context(
+        df,
+        jobs_df,
+        "SEL",
+        lookback_months=12,
+        scope="all",
+    )
+
+    assert result["status"] == "ok"
+    # SEL full-history margin% = (200 - 260) / 200 * 100 = -30%
+    assert result["summary"]["selected_margin_pct"] == pytest.approx(-30.0)
+
+    jobs = result["jobs"].set_index("job_no")
+    assert jobs.loc["SEL", "margin_pct"] == pytest.approx(-30.0)
+    assert jobs.loc["P1", "margin_pct"] == pytest.approx(50.0)
+    assert "STALE" not in set(result["jobs"]["job_no"].tolist())

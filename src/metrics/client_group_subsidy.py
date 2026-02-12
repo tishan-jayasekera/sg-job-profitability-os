@@ -152,6 +152,46 @@ def get_selected_group_value(df: pd.DataFrame, selected_job_no: str, group_col: 
     return None
 
 
+def resolve_job_group_values(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """
+    Resolve one group value per job using the most recent non-empty group entry.
+
+    Returns DataFrame with columns: job_no, group_value.
+    """
+    if (
+        not isinstance(df, pd.DataFrame)
+        or len(df) == 0
+        or "job_no" not in df.columns
+        or group_col not in df.columns
+    ):
+        return pd.DataFrame(columns=["job_no", "group_value"])
+
+    valid_group_mask = _non_empty_mask(df[group_col])
+    if not valid_group_mask.any():
+        return pd.DataFrame(columns=["job_no", "group_value"])
+
+    row_order = pd.Series(np.arange(len(df), dtype=int), index=df.index)
+    _, date_series = _resolve_date_series(df)
+
+    work = df.loc[valid_group_mask, ["job_no", group_col]].copy()
+    work["job_no"] = work["job_no"].astype(str)
+    work["group_value"] = work[group_col].astype(str).str.strip()
+    work["_row_order"] = row_order.loc[work.index].values
+    if date_series is None:
+        work["_recency"] = pd.NaT
+    else:
+        work["_recency"] = date_series.loc[work.index]
+    work["_has_recency"] = work["_recency"].notna()
+
+    work = work.sort_values(
+        ["job_no", "_has_recency", "_recency", "_row_order"],
+        ascending=[True, False, False, False],
+        na_position="last",
+    )
+    latest = work.drop_duplicates("job_no", keep="first")
+    return latest[["job_no", "group_value"]]
+
+
 def build_job_rollup(df: pd.DataFrame) -> pd.DataFrame:
     """
     Aggregate to job-level with columns:
@@ -254,25 +294,39 @@ def compute_client_group_subsidy_context(
         if date_series is not None and date_series.notna().any():
             latest = date_series.max()
             cutoff = latest - pd.DateOffset(months=lookback_months)
-            window_df = window_df[date_series >= cutoff].copy()
+            # Use lookback window to identify WHICH JOBS had recent activity,
+            # but keep ALL rows for those jobs so margin is computed on full
+            # job history (matching margin_pct_to_date in delivery_control).
+            recent_jobs = set(
+                window_df.loc[date_series >= cutoff, "job_no"].dropna().unique()
+            )
+            window_df = window_df[window_df["job_no"].isin(recent_jobs)].copy()
 
-    group_value = get_selected_group_value(window_df, selected_job_no, group_col)
-    result["group_value"] = group_value
-    if group_value is None:
+    selected_job_key = str(selected_job_no)
+    job_groups = resolve_job_group_values(window_df, group_col)
+    if len(job_groups) == 0:
         result["status"] = "missing_group_value"
         return result
 
-    group_match = (
-        _non_empty_mask(window_df[group_col])
-        & window_df[group_col].astype(str).str.strip().eq(str(group_value).strip())
+    selected_group_rows = job_groups[job_groups["job_no"] == selected_job_key]
+    if len(selected_group_rows) == 0:
+        result["status"] = "missing_group_value"
+        return result
+
+    group_value = str(selected_group_rows.iloc[0]["group_value"]).strip()
+    result["group_value"] = group_value
+
+    group_jobs = set(
+        job_groups.loc[
+            job_groups["group_value"].astype(str).str.strip().eq(group_value),
+            "job_no",
+        ].tolist()
     )
-    group_df = window_df[group_match].copy()
+    group_df = window_df[window_df["job_no"].astype(str).isin(group_jobs)].copy()
 
     rollup = build_job_rollup(group_df)
     if len(rollup) == 0:
         return result
-
-    selected_job_key = str(selected_job_no)
 
     active_meta = pd.DataFrame(columns=["job_no", "risk_band", "risk_score"])
     active_set: set[str] = set()
