@@ -34,6 +34,12 @@ def inject_delivery_control_theme() -> None:
     st.markdown(
         """
         <style>
+        :root {
+            --dc-border: #e4e7ec;
+            --dc-muted: #667085;
+            --dc-ink: #1f2937;
+            --dc-selected: #2563eb;
+        }
         .dc-page-title {
             font-size: 1.6rem;
             font-weight: 700;
@@ -95,6 +101,69 @@ def inject_delivery_control_theme() -> None:
             color: #555;
             margin-top: 4px;
         }
+
+        /* KPI sizing: reduce oversized metric numerals and improve hierarchy */
+        div[data-testid="metric-container"] {
+            border: 1px solid var(--dc-border);
+            border-radius: 10px;
+            padding: 0.55rem 0.7rem;
+            background: #fff;
+        }
+        div[data-testid="metric-container"] > label {
+            font-size: 0.74rem !important;
+            letter-spacing: 0.01em;
+            color: var(--dc-muted) !important;
+            font-weight: 600;
+        }
+        div[data-testid="stMetricValue"] {
+            font-size: 1.95rem !important;
+            line-height: 1.08 !important;
+            color: var(--dc-ink);
+            font-weight: 650;
+        }
+        div[data-testid="stMetricDelta"] {
+            font-size: 0.88rem !important;
+        }
+
+        /* Queue readability and selected-item emphasis */
+        .dc-queue-title {
+            font-size: 0.8rem;
+            color: var(--dc-muted);
+            font-weight: 600;
+            letter-spacing: 0.02em;
+            margin: 0.1rem 0 0.35rem 0;
+        }
+        div[data-testid="stRadio"] > div[role="radiogroup"] {
+            gap: 0.38rem;
+        }
+        div[data-testid="stRadio"] label[data-baseweb="radio"] {
+            margin: 0 !important;
+            padding: 0.48rem 0.58rem;
+            border: 1px solid var(--dc-border);
+            border-radius: 10px;
+            background: #fff;
+            align-items: flex-start;
+            transition: background 0.16s ease, border-color 0.16s ease, box-shadow 0.16s ease;
+        }
+        div[data-testid="stRadio"] label[data-baseweb="radio"] > div:last-child {
+            font-size: 0.91rem;
+            line-height: 1.35;
+            color: var(--dc-ink);
+            font-weight: 500;
+        }
+        div[data-testid="stRadio"] label[data-baseweb="radio"]:hover {
+            border-color: #c9d3e2;
+            background: #f9fbff;
+        }
+        div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked) {
+            border-color: var(--dc-selected);
+            background: #eef5ff;
+            box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.18);
+        }
+        div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked) > div:last-child {
+            color: #0f172a;
+            font-weight: 650;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -140,25 +209,49 @@ def render_job_queue(
         st.info("No jobs matching current filters.")
         return None
 
+    st.markdown(
+        f'<div class="dc-queue-title">Priority Queue ({len(display_df)} jobs)</div>',
+        unsafe_allow_html=True,
+    )
+
+    def _truncate_text(value: str, max_len: int = 72) -> str:
+        text = " ".join(str(value).split())
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 1].rstrip() + "…"
+
+    current_idx = 0
+    current_selected = st.session_state.get("selected_job")
+    current_selected_str = str(current_selected) if current_selected is not None else None
+
     risk_emoji = {"Red": "🔴", "Amber": "🟡", "Green": "🟢"}
     options = []
     job_nos = []
     for _, row in display_df.iterrows():
         job_no = str(row.get("job_no", ""))
-        name = str(job_name_lookup.get(job_no, "") or "")
-        badge = risk_emoji.get(str(row.get("risk_band", "")), "⚪")
-        label = f"{badge} {job_no}"
+        risk_band = str(row.get("risk_band", "") or "")
+        name = _truncate_text(str(job_name_lookup.get(job_no, "") or ""), max_len=64)
+        badge = risk_emoji.get(risk_band, "⚪")
+        label = f"{badge} {job_no} [{risk_band}]"
         if name:
-            label += f" - {name}"
+            label += f" — {name}"
+
+        meta_parts = []
         driver = str(row.get("primary_driver", "") or "")
         if driver and driver != "Monitor":
-            label += f"  |  {driver}"
+            meta_parts.append(_truncate_text(driver, max_len=40))
+        margin_to_date = pd.to_numeric(row.get("margin_pct_to_date"), errors="coerce")
+        if pd.notna(margin_to_date):
+            meta_parts.append(f"MTD {margin_to_date:.1f}%")
+        if meta_parts:
+            label += f"  ·  {' | '.join(meta_parts[:2])}"
+
+        if current_selected_str == job_no:
+            label = f"→ {label}"
+
         options.append(label)
         job_nos.append(job_no)
 
-    current_idx = 0
-    current_selected = st.session_state.get("selected_job")
-    current_selected_str = str(current_selected) if current_selected is not None else None
     if current_selected_str in job_nos:
         current_idx = job_nos.index(current_selected_str)
 
