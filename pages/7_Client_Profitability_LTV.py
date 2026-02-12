@@ -38,7 +38,7 @@ from src.ui.components import (
     render_client_ltv_methodology_expander,
 )
 from src.ui import charts as charts
-from src.ui.state import init_state, get_state, set_state
+from src.ui.state import init_state, get_state
 from src.ui.formatting import build_job_name_lookup, format_job_label
 
 
@@ -48,6 +48,246 @@ def _get_client_col(df: pd.DataFrame) -> str:
     if "client_group_rev_job" in df.columns and df["client_group_rev_job"].notna().any():
         return "client_group_rev_job"
     return "client"
+
+
+def inject_client_ltv_theme() -> None:
+    """Inject page styling aligned with the app's control-tower design system."""
+    st.markdown(
+        """
+        <style>
+        :root {
+            --cltv-border: #e4e7ec;
+            --cltv-muted: #667085;
+            --cltv-ink: #0f172a;
+            --cltv-selected: #2563eb;
+            --cltv-surface: #f8fafc;
+        }
+        .stApp {
+            font-family: "Avenir Next", "Segoe UI", "Helvetica Neue", sans-serif;
+        }
+        .block-container {
+            padding-top: 1.2rem;
+            padding-bottom: 2rem;
+        }
+        .cltv-hero {
+            background: linear-gradient(135deg, #eff6ff 0%, #f8fbff 45%, #f8fafc 100%);
+            border: 1px solid #d8e4f4;
+            border-radius: 14px;
+            padding: 18px 20px;
+            margin: 0.1rem 0 1rem 0;
+            box-shadow: 0 6px 16px rgba(15, 23, 42, 0.05);
+        }
+        .cltv-eyebrow {
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: #1d4ed8;
+            margin-bottom: 0.24rem;
+        }
+        .cltv-title {
+            font-size: clamp(1.65rem, 2.25vw, 2.45rem);
+            line-height: 1.1;
+            font-weight: 760;
+            letter-spacing: -0.02em;
+            color: var(--cltv-ink);
+            margin: 0 0 0.4rem 0;
+        }
+        .cltv-subtitle {
+            font-size: 0.95rem;
+            color: #334155;
+            margin: 0 0 0.75rem 0;
+        }
+        .cltv-chip-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.42rem;
+        }
+        .cltv-chip {
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            padding: 0.2rem 0.58rem;
+            border: 1px solid #cbd5e1;
+            background: rgba(255, 255, 255, 0.85);
+            color: #334155;
+            font-size: 0.73rem;
+            font-weight: 650;
+        }
+        .cltv-chip-ready {
+            background: #ecfdf3;
+            border-color: #86efac;
+            color: #166534;
+        }
+        .cltv-chip-alert {
+            background: #fff1f2;
+            border-color: #fecdd3;
+            color: #9f1239;
+        }
+        .cltv-section-divider {
+            height: 1px;
+            margin: 0.45rem 0 0.9rem 0;
+            background: linear-gradient(90deg, #d7e1ef 0%, rgba(215, 225, 239, 0.18) 100%);
+        }
+        .cltv-section-kicker {
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            color: var(--cltv-muted);
+            margin-bottom: 0.12rem;
+        }
+        .cltv-section-title {
+            font-size: 1.2rem;
+            line-height: 1.2;
+            font-weight: 700;
+            color: #111827;
+            margin-bottom: 0.14rem;
+        }
+        .cltv-section-sub {
+            font-size: 0.84rem;
+            color: var(--cltv-muted);
+            margin-bottom: 0.6rem;
+        }
+        .cltv-filter-label {
+            font-size: 0.76rem;
+            font-weight: 680;
+            color: #475467;
+            margin-bottom: 0.25rem;
+            letter-spacing: 0.01em;
+        }
+        div[data-testid="metric-container"] {
+            border: 1px solid var(--cltv-border);
+            border-radius: 10px;
+            padding: 0.55rem 0.72rem;
+            background: #ffffff;
+        }
+        div[data-testid="metric-container"] > label {
+            font-size: 0.73rem !important;
+            letter-spacing: 0.01em;
+            color: var(--cltv-muted) !important;
+            font-weight: 600;
+        }
+        div[data-testid="stMetricValue"] {
+            font-size: 1.9rem !important;
+            line-height: 1.08 !important;
+            color: var(--cltv-ink);
+            font-weight: 680;
+        }
+        div[data-testid="stDataFrame"] {
+            border: 1px solid var(--cltv-border);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        details[data-testid="stExpander"] {
+            border: 1px solid var(--cltv-border);
+            border-radius: 10px;
+            background: #ffffff;
+            overflow: hidden;
+        }
+        details[data-testid="stExpander"] > summary {
+            background: var(--cltv-surface);
+        }
+        div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+            gap: 0.3rem;
+            border-bottom: 1px solid var(--cltv-border);
+            margin-bottom: 0.5rem;
+        }
+        div[data-testid="stTabs"] [data-baseweb="tab"] {
+            height: 34px;
+            padding: 0 0.95rem;
+            border-radius: 8px 8px 0 0;
+            color: var(--cltv-muted);
+            font-weight: 620;
+        }
+        div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
+            color: #1d4ed8;
+            background: #eff6ff;
+        }
+        div[data-testid="stRadio"] > div[role="radiogroup"] {
+            gap: 0.35rem;
+        }
+        div[data-testid="stRadio"] label[data-baseweb="radio"] {
+            margin: 0 !important;
+            padding: 0.44rem 0.54rem;
+            border: 1px solid var(--cltv-border);
+            border-radius: 10px;
+            background: #ffffff;
+            transition: background 0.15s ease, border-color 0.15s ease;
+        }
+        div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked) {
+            border-color: var(--cltv-selected);
+            background: #eef5ff;
+            box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.18);
+        }
+        div[data-baseweb="select"] > div {
+            border-color: #d0d9e6;
+            border-radius: 10px;
+        }
+        @media (max-width: 900px) {
+            .cltv-hero {
+                padding: 14px 15px;
+            }
+            .cltv-title {
+                font-size: 2rem;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _safe_sum(df: pd.DataFrame, col: str) -> float:
+    """Return a NaN-safe numeric sum for a column."""
+    if col not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df[col], errors="coerce").fillna(0).sum())
+
+
+def _render_page_hero(
+    df_window: pd.DataFrame,
+    client_col: str,
+    time_window_label: str,
+    selected_state: str,
+) -> None:
+    clients_in_scope = int(df_window[client_col].dropna().nunique()) if client_col in df_window.columns else 0
+    jobs_in_scope = int(df_window["job_no"].dropna().nunique()) if "job_no" in df_window.columns else 0
+    scope_revenue = _safe_sum(df_window, "rev_alloc")
+    scope_cost = _safe_sum(df_window, "base_cost")
+    scope_profit = scope_revenue - scope_cost
+    profitability_chip_class = "cltv-chip-ready" if scope_profit >= 0 else "cltv-chip-alert"
+    profitability_label = "Portfolio in Profit" if scope_profit >= 0 else "Portfolio Underwater"
+
+    st.markdown(
+        f"""
+        <div class="cltv-hero">
+            <div class="cltv-eyebrow">Control Tower</div>
+            <div class="cltv-title">Client Profitability & LTV Control Tower</div>
+            <div class="cltv-subtitle">Segment clients by economic value, isolate margin leakage, and drill to execution drivers.</div>
+            <div class="cltv-chip-row">
+                <span class="cltv-chip">{time_window_label}</span>
+                <span class="cltv-chip">Job State: {selected_state}</span>
+                <span class="cltv-chip">Clients in Scope: {clients_in_scope:,}</span>
+                <span class="cltv-chip">Jobs in Scope: {jobs_in_scope:,}</span>
+                <span class="cltv-chip {profitability_chip_class}">{profitability_label}: ${scope_profit:,.0f}</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_section_intro(step: str, title: str, subtitle: str) -> None:
+    """Render a small section header above each analysis module."""
+    st.markdown(
+        f"""
+        <div class="cltv-section-kicker">{step}</div>
+        <div class="cltv-section-title">{title}</div>
+        <div class="cltv-section-sub">{subtitle}</div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 st.set_page_config(page_title="Client Profitability & LTV", page_icon="📈", layout="wide")
@@ -156,8 +396,7 @@ def _render_intervention_queue_fragment(
 
 
 def main():
-    st.title("Client Profitability & LTV Control Tower")
-    st.caption("Segment clients by economic value, diagnose margin leakage, and drill to task/FTE drivers.")
+    inject_client_ltv_theme()
 
     df_all = load_fact_timesheet()
     if len(df_all) == 0:
@@ -206,19 +445,40 @@ def main():
         st.warning("Client field missing from dataset.")
         return
     time_window_label = f"Last {time_window}" if time_window != "all" else "All Time"
-    st.caption(f"Current View: {time_window_label} | Job Status: {selected_state}")
 
-    # SECTION 1 — Executive Portfolio Health
-    summary = compute_client_portfolio_summary(df_window, client_col=CLIENT_COL)
-    render_client_portfolio_health(summary)
+    _render_page_hero(df_window, CLIENT_COL, time_window_label, selected_state)
+    st.markdown('<div class="cltv-section-divider"></div>', unsafe_allow_html=True)
 
-    # SECTION 2 — Portfolio Quadrant Scatter
-    y_mode, quadrant_df, selected_quadrant = _render_quadrant_and_focus_fragment(df_window)
+    with st.container(border=True):
+        _render_section_intro(
+            "Section 1",
+            "Executive Portfolio Health",
+            "Macro view of client economics, concentration, and downside exposure.",
+        )
+        summary = compute_client_portfolio_summary(df_window, client_col=CLIENT_COL)
+        render_client_portfolio_health(summary)
 
-    # SECTION 3 — Intervention Queue
-    _render_intervention_queue_fragment(df_window, selected_quadrant, y_mode)
+    with st.container(border=True):
+        _render_section_intro(
+            "Section 2",
+            "Portfolio Quadrant Mapping",
+            "Classify clients by revenue scale and profitability to prioritize account strategy.",
+        )
+        y_mode, quadrant_df, selected_quadrant = _render_quadrant_and_focus_fragment(df_window)
 
-    # SECTION 4 — Selected Client Deep-Dive
+    with st.container(border=True):
+        _render_section_intro(
+            "Section 3",
+            "Intervention Queue",
+            "Ranked account worklist by quadrant, intervention mode, and shortlist depth.",
+        )
+        _render_intervention_queue_fragment(df_window, selected_quadrant, y_mode)
+
+    _render_section_intro(
+        "Section 4",
+        "Client Deep Dive",
+        "Select clients and slice across job, department, category, task, and FTE to isolate issues.",
+    )
     override_quadrant = st.checkbox(
         "Show all clients (override quadrant filter)",
         value=False,
@@ -274,6 +534,7 @@ def main():
         for downstream in order[start:]:
             st.session_state[chain_key_map[downstream]] = "All"
 
+    st.markdown('<div class="cltv-filter-label">Drill-Chain Filters</div>', unsafe_allow_html=True)
     chain_cols = st.columns(5)
     with chain_cols[0]:
         job_name_lookup = build_job_name_lookup(df_client_window)
@@ -572,16 +833,22 @@ def main():
                 "margin": "Margin",
             })
 
-    render_client_driver_forensics(
-        task_compare,
-        staffing,
-        senior_flag,
-        task_time_fig=task_time_fig,
-        staff_cost_time_fig=staff_cost_time_fig,
-        task_benchmark_fig=task_benchmark_fig,
-        delivery_burn_fig=delivery_burn_fig,
-        erosion_table=erosion_table,
-    )
+    with st.container(border=True):
+        _render_section_intro(
+            "Section 5",
+            "Driver Forensics",
+            "Identify whether leakage is driven by task mix, staffing profile, or quote-to-delivery burn behavior.",
+        )
+        render_client_driver_forensics(
+            task_compare,
+            staffing,
+            senior_flag,
+            task_time_fig=task_time_fig,
+            staff_cost_time_fig=staff_cost_time_fig,
+            task_benchmark_fig=task_benchmark_fig,
+            delivery_burn_fig=delivery_burn_fig,
+            erosion_table=erosion_table,
+        )
 
     # SECTION 6 — LTV & Trends (unfiltered data)
     ltv_client = selected_clients[0]
@@ -604,8 +871,14 @@ def main():
     monthly = ltv.get("monthly", pd.DataFrame())
     margin_fig = _build_margin_trend(monthly)
 
-    render_client_ltv_section(cumulative_fig, margin_fig, tenure_months)
-    render_client_ltv_methodology_expander()
+    with st.container(border=True):
+        _render_section_intro(
+            "Section 6",
+            "Empirical LTV & Trendline",
+            "View lifetime profit accumulation and trailing margin dynamics for the selected account.",
+        )
+        render_client_ltv_section(cumulative_fig, margin_fig, tenure_months)
+        render_client_ltv_methodology_expander()
 
 
 if __name__ == "__main__":

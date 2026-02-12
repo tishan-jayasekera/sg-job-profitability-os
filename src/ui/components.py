@@ -223,7 +223,7 @@ def filter_chips(filters: Dict[str, Any]):
 # =============================================================================
 
 def render_client_portfolio_health(summary: Dict[str, float]):
-    st.subheader("Section 1 — Executive Portfolio Health")
+    st.subheader("Executive Portfolio Health")
     metrics = {
         "Total Clients": summary.get("total_clients"),
         "Portfolio Revenue": summary.get("portfolio_revenue"),
@@ -246,12 +246,12 @@ def render_client_portfolio_health(summary: Dict[str, float]):
 
 
 def render_client_quadrant_scatter(fig):
-    st.subheader("Section 2 — Portfolio Quadrant Scatter")
+    st.subheader("Portfolio Quadrant Scatter")
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 
 def render_client_intervention_queue(df: pd.DataFrame, shortlist_size: int, client_col: str = "client"):
-    st.subheader("Section 3 — The Intervention Queue")
+    st.subheader("Intervention Queue")
     if len(df) == 0:
         st.info("No clients found for the selected quadrant.")
         return
@@ -278,7 +278,7 @@ def render_client_intervention_queue(df: pd.DataFrame, shortlist_size: int, clie
 
 def render_client_deep_dive(client_name: str, metrics: Dict[str, float], grade: str,
                             ledger: pd.DataFrame, dept_fig):
-    st.subheader("Section 4 — Selected Client Deep‑Dive")
+    st.subheader("Selected Client Deep-Dive")
     st.markdown(f"**Client:** {client_name}")
     metrics = metrics.copy()
     metrics["Health Grade"] = grade
@@ -337,7 +337,7 @@ def render_client_driver_forensics(task_table: pd.DataFrame, staffing_table: pd.
                                    staff_cost_time_fig=None,
                                    task_benchmark_fig=None, delivery_burn_fig=None,
                                    erosion_table: Optional[pd.DataFrame] = None):
-    st.subheader("Section 5 — Driver Forensics")
+    st.subheader("Driver Forensics")
     summary_lines = []
     if task_table is not None and len(task_table) > 0:
         top_task = task_table.iloc[0]
@@ -431,7 +431,7 @@ def render_client_driver_forensics(task_table: pd.DataFrame, staffing_table: pd.
 
 
 def render_client_ltv_section(cumulative_fig, margin_fig, tenure_months: int):
-    st.subheader("Section 6 — Empirical LTV & Trends")
+    st.subheader("Empirical LTV & Trends")
     st.metric("Client Lifetime (months)", tenure_months)
     st.plotly_chart(cumulative_fig, use_container_width=True)
     st.plotly_chart(margin_fig, use_container_width=True)
