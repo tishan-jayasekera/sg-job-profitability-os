@@ -101,6 +101,54 @@ def inject_delivery_control_theme() -> None:
             color: #555;
             margin-top: 4px;
         }
+        .dc-section-label {
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 0.06em;
+            text-transform: uppercase;
+            color: var(--dc-muted);
+            margin: 0.2rem 0 0.45rem 0;
+        }
+        .dc-section-title {
+            font-size: 0.95rem;
+            font-weight: 650;
+            color: #111827;
+            margin: 0 0 0.5rem 0;
+        }
+        .dc-soft-divider {
+            height: 1px;
+            background: linear-gradient(90deg, #e2e8f0 0%, rgba(226, 232, 240, 0.25) 100%);
+            margin: 0.7rem 0;
+        }
+        .dc-queue-stats {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.32rem;
+            margin: 0 0 0.45rem 0;
+        }
+        .dc-chip {
+            display: inline-block;
+            border-radius: 999px;
+            padding: 0.15rem 0.5rem;
+            font-size: 0.72rem;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+        }
+        .dc-chip-red {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #fecaca;
+        }
+        .dc-chip-amber {
+            background: #fef3c7;
+            color: #92400e;
+            border: 1px solid #fde68a;
+        }
+        .dc-chip-green {
+            background: #dcfce7;
+            color: #166534;
+            border: 1px solid #bbf7d0;
+        }
 
         /* KPI sizing: reduce oversized metric numerals and improve hierarchy */
         div[data-testid="metric-container"] {
@@ -164,6 +212,31 @@ def inject_delivery_control_theme() -> None:
             color: #0f172a;
             font-weight: 650;
         }
+        details[data-testid="stExpander"] {
+            border: 1px solid var(--dc-border);
+            border-radius: 10px;
+            background: #fff;
+            overflow: hidden;
+        }
+        details[data-testid="stExpander"] > summary {
+            background: #f8fafc;
+        }
+        div[data-testid="stTabs"] [data-baseweb="tab-list"] {
+            gap: 0.3rem;
+            border-bottom: 1px solid var(--dc-border);
+            margin-bottom: 0.4rem;
+        }
+        div[data-testid="stTabs"] [data-baseweb="tab"] {
+            height: 34px;
+            padding: 0 0.9rem;
+            border-radius: 8px 8px 0 0;
+            color: var(--dc-muted);
+            font-weight: 600;
+        }
+        div[data-testid="stTabs"] [data-baseweb="tab"][aria-selected="true"] {
+            color: #1d4ed8;
+            background: #eff6ff;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -211,6 +284,15 @@ def render_job_queue(
 
     st.markdown(
         f'<div class="dc-queue-title">Priority Queue ({len(display_df)} jobs)</div>',
+        unsafe_allow_html=True,
+    )
+    risk_counts = display_df["risk_band"].astype(str).value_counts()
+    st.markdown(
+        "<div class=\"dc-queue-stats\">"
+        f"<span class=\"dc-chip dc-chip-red\">{int(risk_counts.get('Red', 0))} Red</span>"
+        f"<span class=\"dc-chip dc-chip-amber\">{int(risk_counts.get('Amber', 0))} Amber</span>"
+        f"<span class=\"dc-chip dc-chip-green\">{int(risk_counts.get('Green', 0))} Green</span>"
+        "</div>",
         unsafe_allow_html=True,
     )
 
@@ -311,6 +393,7 @@ def render_selected_job_panel(
     margin_at_risk = pd.to_numeric(job_row.get("margin_at_risk"), errors="coerce")
     mar_confidence = str(job_row.get("margin_at_risk_confidence", "")).lower()
 
+    st.markdown('<div class="dc-section-label">Job Health Snapshot</div>', unsafe_allow_html=True)
     k1, k2, k3, k4 = st.columns(4)
     with k1:
         st.metric(
@@ -380,7 +463,12 @@ def render_selected_job_panel(
     ].copy()
     peer_count = len(peers)
 
-    st.markdown(f"### Active Peers ({peer_count} jobs in {dept} / {cat})")
+    st.markdown('<div class="dc-soft-divider"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="dc-section-label">Peer Benchmarking</div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="dc-section-title">Active Peers ({peer_count} jobs in {dept} / {cat})</div>',
+        unsafe_allow_html=True,
+    )
     if peer_count < 2:
         st.caption("Insufficient active peers for comparison in this category.")
     else:
@@ -408,6 +496,8 @@ def render_selected_job_panel(
                 help="Median final margin of completed jobs in same category",
             )
 
+    st.markdown('<div class="dc-soft-divider"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="dc-section-label">Diagnosis</div>', unsafe_allow_html=True)
     with st.expander("Root Cause Analysis", expanded=False):
         drivers = compute_root_cause_drivers(df_scope, job_row)
         if drivers:
@@ -424,6 +514,8 @@ def render_selected_job_panel(
         else:
             st.info("No significant risk drivers detected.")
 
+    st.markdown('<div class="dc-soft-divider"></div>', unsafe_allow_html=True)
+    st.markdown('<div class="dc-section-label">Execution Breakdown</div>', unsafe_allow_html=True)
     tab_task, tab_staff = st.tabs(["Task Breakdown", "Staff Attribution"])
 
     with tab_task:
@@ -781,7 +873,7 @@ def _render_client_subsidy_section(
 ) -> None:
     """Render client group subsidization analysis for the selected job."""
     st.markdown("---")
-    st.markdown("### Client Group Context")
+    st.markdown('<div class="dc-section-label">Client Group Context</div>', unsafe_allow_html=True)
 
     group_col = resolve_group_column(df_all)
     if group_col is None:
