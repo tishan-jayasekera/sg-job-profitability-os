@@ -11,12 +11,22 @@ from __future__ import annotations
 
 from typing import Dict, Optional
 
+import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
-from src.data.job_lifecycle import get_job_staff_attribution, get_job_task_attribution
+from src.data.job_lifecycle import (
+    compute_task_level_benchmarks,
+    get_job_staff_attribution,
+    get_job_task_attribution,
+)
+from src.metrics.client_group_subsidy import (
+    compute_client_group_subsidy_context,
+    resolve_group_column,
+)
 from src.metrics.delivery_control import compute_root_cause_drivers
-from src.ui.formatting import fmt_currency, fmt_hours, fmt_percent
+from src.ui.formatting import fmt_count, fmt_currency, fmt_hours, fmt_percent, fmt_rate
 
 
 def inject_delivery_control_theme() -> None:
@@ -179,7 +189,7 @@ def render_selected_job_panel(
     df_all: Optional[pd.DataFrame] = None,
 ) -> None:
     """Render the right-panel details for the selected job."""
-    _ = df_all
+    base_df = df_all if df_all is not None else df_scope
 
     job_row = jobs_df[jobs_df["job_no"].astype(str) == str(selected_job)]
     if len(job_row) == 0:
@@ -325,56 +335,337 @@ def render_selected_job_panel(
 
     with tab_task:
         task_df = get_job_task_attribution(df_scope, selected_job)
+        # fallback for type mismatch
         if len(task_df) == 0 and "job_no" in df_scope.columns:
-            matches = df_scope.loc[df_scope["job_no"].astype(str) == str(selected_job), "job_no"]
+            matches = df_scope.loc[
+                df_scope["job_no"].astype(str) == str(selected_job), "job_no"
+            ]
             if len(matches) > 0:
                 task_df = get_job_task_attribution(df_scope, matches.iloc[0])
 
         if len(task_df) == 0:
             st.info("No task attribution data available for this job.")
         else:
-            display = task_df.sort_values("variance", ascending=False).copy()
-            display = display.rename(
-                columns={
-                    "task_name": "Task",
-                    "quoted_hours": "Quoted Hrs",
-                    "actual_hours": "Actual Hrs",
-                    "variance": "Variance",
-                    "variance_pct": "Variance %",
-                }
+            # Get peer benchmarks for the same dept+category
+            dept = job_row.get("department_final", "")
+            cat = job_row.get("job_category", "")
+            bench_df = compute_task_level_benchmarks(
+                base_df,
+                str(selected_job),
+                dept,
+                cat,
             )
-            for col in ["Quoted Hrs", "Actual Hrs", "Variance"]:
+
+            # Merge benchmark into task data
+            if len(bench_df) > 0:
+                task_df = task_df.merge(bench_df, on="task_name", how="left")
+            else:
+                task_df["peer_median_hours"] = np.nan
+                task_df["peer_job_count"] = 0
+
+            task_df = task_df.sort_values("actual_hours", ascending=False)
+
+            # ── Chart: Grouped horizontal bar (Quoted │ Actual │ Benchmark) ──
+            top_tasks = task_df.head(10)  # top 10 by actual hours
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                y=top_tasks["task_name"],
+                x=top_tasks["quoted_hours"].fillna(0),
+                name="Quoted",
+                orientation="h",
+                marker_color="#9ecae1",
+            ))
+            fig.add_trace(go.Bar(
+                y=top_tasks["task_name"],
+                x=top_tasks["actual_hours"].fillna(0),
+                name="Actual",
+                orientation="h",
+                marker_color="#3182bd",
+            ))
+            if top_tasks["peer_median_hours"].notna().any():
+                fig.add_trace(go.Bar(
+                    y=top_tasks["task_name"],
+                    x=top_tasks["peer_median_hours"].fillna(0),
+                    name="Peer Benchmark",
+                    orientation="h",
+                    marker_color="#ff7f0e",
+                ))
+            fig.update_layout(
+                barmode="group",
+                title="Task Hours: Quoted vs Actual vs Peer Benchmark",
+                xaxis_title="Hours",
+                yaxis_title="",
+                template="plotly_white",
+                height=max(300, len(top_tasks) * 40 + 100),
+                margin=dict(l=180, r=30, t=40, b=50),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            fig.update_yaxes(autorange="reversed")  # top task at top
+            st.plotly_chart(fig, use_container_width=True)
+
+            # ── Data table ──
+            display = task_df.copy()
+            col_map = {
+                "task_name": "Task",
+                "quoted_hours": "Quoted Hrs",
+                "actual_hours": "Actual Hrs",
+                "peer_median_hours": "Peer Benchmark Hrs",
+                "variance": "Variance",
+                "variance_pct": "Variance %",
+            }
+            display = display.rename(columns=col_map)
+            for col in ["Quoted Hrs", "Actual Hrs", "Peer Benchmark Hrs", "Variance"]:
                 if col in display.columns:
                     display[col] = display[col].apply(fmt_hours)
             if "Variance %" in display.columns:
                 display["Variance %"] = display["Variance %"].apply(fmt_percent)
 
-            show_cols = [c for c in ["Task", "Quoted Hrs", "Actual Hrs", "Variance", "Variance %"] if c in display.columns]
+            show_cols = [
+                c for c in [
+                    "Task", "Quoted Hrs", "Actual Hrs",
+                    "Peer Benchmark Hrs", "Variance", "Variance %",
+                ] if c in display.columns
+            ]
             st.dataframe(display[show_cols], use_container_width=True, hide_index=True)
 
     with tab_staff:
         staff_df = get_job_staff_attribution(df_scope, selected_job)
         if len(staff_df) == 0 and "job_no" in df_scope.columns:
-            matches = df_scope.loc[df_scope["job_no"].astype(str) == str(selected_job), "job_no"]
+            matches = df_scope.loc[
+                df_scope["job_no"].astype(str) == str(selected_job), "job_no"
+            ]
             if len(matches) > 0:
                 staff_df = get_job_staff_attribution(df_scope, matches.iloc[0])
 
         if len(staff_df) == 0:
             st.info("No staff attribution data available for this job.")
         else:
-            display = staff_df.sort_values("hours", ascending=False).copy()
-            display = display.rename(
-                columns={
-                    "staff_name": "Staff",
-                    "hours": "Hours",
-                    "cost": "Cost",
-                    "tasks_worked": "Tasks Worked",
-                }
+            staff_df = staff_df.sort_values("hours", ascending=False)
+
+            # Quoted rate for reference
+            quoted_rate = pd.to_numeric(job_row.get("quote_rate", np.nan), errors="coerce")
+
+            # ── Chart: Staff cost rate vs quoted rate ──
+            top_staff = staff_df.head(10)
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                y=top_staff["staff_name"],
+                x=top_staff["effective_cost_rate"].fillna(0),
+                name="Effective Cost Rate",
+                orientation="h",
+                marker_color="#3182bd",
+            ))
+            if "effective_rev_rate" in top_staff.columns:
+                fig.add_trace(go.Bar(
+                    y=top_staff["staff_name"],
+                    x=top_staff["effective_rev_rate"].fillna(0),
+                    name="Revenue Rate",
+                    orientation="h",
+                    marker_color="#2ca02c",
+                ))
+            if pd.notna(quoted_rate) and quoted_rate > 0:
+                fig.add_vline(
+                    x=quoted_rate,
+                    line_dash="dash",
+                    line_color="#dc3545",
+                    annotation_text=f"Quoted: {fmt_rate(quoted_rate)}",
+                    annotation_position="top right",
+                )
+            fig.update_layout(
+                barmode="group",
+                title="Staff Rate Analysis (Cost Rate vs Revenue Rate)",
+                xaxis_title="$/hr",
+                yaxis_title="",
+                template="plotly_white",
+                height=max(300, len(top_staff) * 40 + 100),
+                margin=dict(l=180, r=30, t=40, b=50),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
             )
+            fig.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig, use_container_width=True)
+
+            # ── Data table with enriched columns ──
+            display = staff_df.copy()
+            display["margin_contribution"] = display["revenue"].fillna(0) - display["cost"].fillna(0)
+            col_map = {
+                "staff_name": "Staff",
+                "hours": "Hours",
+                "cost": "Cost",
+                "revenue": "Revenue",
+                "effective_cost_rate": "Cost Rate",
+                "effective_rev_rate": "Rev Rate",
+                "margin_contribution": "Margin $",
+                "tasks_worked": "Tasks",
+            }
+            display = display.rename(columns=col_map)
             if "Hours" in display.columns:
                 display["Hours"] = display["Hours"].apply(fmt_hours)
-            if "Cost" in display.columns:
-                display["Cost"] = display["Cost"].apply(fmt_currency)
+            for col in ["Cost", "Revenue", "Margin $"]:
+                if col in display.columns:
+                    display[col] = display[col].apply(fmt_currency)
+            for col in ["Cost Rate", "Rev Rate"]:
+                if col in display.columns:
+                    display[col] = display[col].apply(fmt_rate)
 
-            show_cols = [c for c in ["Staff", "Hours", "Cost", "Tasks Worked"] if c in display.columns]
+            show_cols = [
+                c for c in [
+                    "Staff", "Hours", "Cost Rate", "Rev Rate",
+                    "Cost", "Revenue", "Margin $", "Tasks",
+                ] if c in display.columns
+            ]
             st.dataframe(display[show_cols], use_container_width=True, hide_index=True)
+
+    # ── Section G: Client Group Subsidization ──────────────────────────
+    _render_client_subsidy_section(
+        df_all if df_all is not None else df_scope,
+        jobs_df,
+        str(selected_job),
+        job_name_lookup,
+    )
+
+
+def _render_client_subsidy_section(
+    df_all: pd.DataFrame,
+    jobs_df: pd.DataFrame,
+    selected_job: str,
+    job_name_lookup: Dict[str, str],
+) -> None:
+    """Render client group subsidization analysis for the selected job."""
+    st.markdown("---")
+    st.markdown("### Client Group Context")
+
+    group_col = resolve_group_column(df_all)
+    if group_col is None:
+        st.caption("No client group column available in dataset.")
+        return
+
+    ctx = compute_client_group_subsidy_context(
+        df_all,
+        jobs_df,
+        selected_job,
+        lookback_months=12,
+        scope="all",
+    )
+
+    if ctx["status"] != "ok":
+        st.caption(f"Unable to compute client group context (status: {ctx['status']}).")
+        return
+
+    summary = ctx["summary"]
+    group_value = ctx["group_value"]
+    peer_jobs = ctx["jobs"]
+
+    # ── Verdict banner ──
+    verdict = summary["verdict"]
+    verdict_colors = {
+        "Fully Subsidized": ("#28a745", "This job's losses are fully covered by profitable sibling jobs."),
+        "Partially Subsidized": ("#ffc107", "Profitable siblings cover some, but not all, of this job's losses."),
+        "Weak Subsidy": ("#dc3545", "Very limited coverage from sibling jobs — group margin under pressure."),
+        "Not Subsidized": ("#dc3545", "No profitable sibling jobs to offset this job's losses."),
+        "No Subsidy Needed": ("#28a745", "This job is profitable — no subsidy required."),
+    }
+    vcolor, vdesc = verdict_colors.get(verdict, ("#6c757d", ""))
+
+    st.markdown(
+        f'<div style="padding:10px 16px;border-radius:6px;background:{vcolor}15;'
+        f'border-left:4px solid {vcolor};margin-bottom:12px;">'
+        f'<strong style="color:{vcolor}">{verdict}</strong>'
+        f' &nbsp;—&nbsp; Client Group: <strong>{group_value}</strong>'
+        f'<br><span style="font-size:0.85em;color:#555">{vdesc}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── KPI strip ──
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric(
+            "Group Margin",
+            fmt_currency(summary["group_margin"]),
+            help="Total margin across all jobs in this client group",
+        )
+    with k2:
+        gm_pct = summary["group_margin_pct"]
+        st.metric(
+            "Group Margin %",
+            f"{gm_pct:.1f}%" if pd.notna(gm_pct) else "—",
+            help="Group-level margin percentage",
+        )
+    with k3:
+        cr = summary["coverage_ratio"]
+        st.metric(
+            "Coverage Ratio",
+            f"{cr:.1f}x" if pd.notna(cr) else "N/A",
+            help="How many times peer profit covers this job's loss (>1 = fully covered)",
+        )
+    with k4:
+        st.metric(
+            "Buffer After Subsidy",
+            fmt_currency(summary["buffer_after_subsidy"]),
+            help="Remaining peer margin after absorbing this job's loss",
+        )
+
+    # ── Additional context metrics ──
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Jobs in Group", fmt_count(summary["job_count"]))
+    with c2:
+        st.metric("Active Jobs", fmt_count(summary["active_job_count"]))
+    with c3:
+        st.metric("Loss-Making Jobs", fmt_count(summary["loss_job_count"]))
+    with c4:
+        sc = summary["subsidy_concentration_pct"]
+        st.metric(
+            "Top Subsidizer Share",
+            f"{sc:.0f}%" if pd.notna(sc) else "—",
+            help="% of positive peer margin from single largest contributor (high = concentrated risk)",
+        )
+
+    # ── Peer jobs table ──
+    if len(peer_jobs) > 0:
+        st.markdown("#### Jobs Under This Client Group")
+
+        display = peer_jobs.copy()
+        display["job_label"] = display["job_no"].apply(
+            lambda j: f"→ {j}" if str(j) == str(selected_job) else str(j)
+        )
+        display["job_name"] = display["job_no"].apply(
+            lambda j: job_name_lookup.get(str(j), "")
+        )
+
+        # Format columns
+        col_map = {
+            "job_label": "Job",
+            "job_name": "Name",
+            "risk_band": "Risk",
+            "revenue": "Revenue",
+            "cost": "Cost",
+            "margin": "Margin",
+            "margin_pct": "Margin %",
+            "contribution_pct_to_group_margin": "Contribution %",
+        }
+        display = display.rename(columns=col_map)
+        for col in ["Revenue", "Cost", "Margin"]:
+            if col in display.columns:
+                display[col] = display[col].apply(fmt_currency)
+        if "Margin %" in display.columns:
+            display["Margin %"] = display["Margin %"].apply(fmt_percent)
+        if "Contribution %" in display.columns:
+            display["Contribution %"] = display["Contribution %"].apply(
+                lambda v: f"{v:.1f}%" if pd.notna(v) else "—"
+            )
+
+        show_cols = [
+            c for c in [
+                "Job", "Name", "Risk", "Revenue",
+                "Margin", "Margin %", "Contribution %",
+            ] if c in display.columns
+        ]
+
+        sort_col = "is_selected" if "is_selected" in display.columns else "Job"
+        st.dataframe(
+            display.sort_values(sort_col, ascending=False)[show_cols],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.caption("No peer jobs found under this client group.")

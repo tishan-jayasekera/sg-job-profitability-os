@@ -313,18 +313,90 @@ def get_job_task_attribution(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
 def get_job_staff_attribution(df: pd.DataFrame, job_no: str) -> pd.DataFrame:
     """
     Get staff-level attribution for a job.
-    
-    Returns DataFrame with staff_name, hours, cost, tasks_worked
+
+    Returns DataFrame with: staff_name, hours, cost, revenue, tasks_worked,
+                            effective_cost_rate, effective_rev_rate
     """
     job_df = df[df["job_no"] == job_no].copy()
-    
+
     if len(job_df) == 0:
         return pd.DataFrame()
-    
-    result = job_df.groupby("staff_name").agg(
-        hours=("hours_raw", "sum"),
-        cost=("base_cost", "sum"),
-        tasks_worked=("task_name", "nunique"),
-    ).reset_index()
-    
+
+    agg_dict = {
+        "hours": ("hours_raw", "sum"),
+        "cost": ("base_cost", "sum"),
+        "tasks_worked": ("task_name", "nunique"),
+    }
+
+    if "rev_alloc" in job_df.columns:
+        agg_dict["revenue"] = ("rev_alloc", "sum")
+
+    result = job_df.groupby("staff_name").agg(**agg_dict).reset_index()
+
+    if "revenue" not in result.columns:
+        result["revenue"] = np.nan
+
+    result["effective_cost_rate"] = np.where(
+        result["hours"] > 0,
+        result["cost"] / result["hours"],
+        np.nan,
+    )
+    result["effective_rev_rate"] = np.where(
+        result["hours"] > 0,
+        result["revenue"] / result["hours"],
+        np.nan,
+    )
+
     return result.sort_values("hours", ascending=False)
+
+
+def compute_task_level_benchmarks(
+    df: pd.DataFrame,
+    job_no: str,
+    department: str,
+    category: str,
+) -> pd.DataFrame:
+    """
+    Compute task-level median hours from COMPLETED peer jobs in same dept+category.
+
+    Returns DataFrame with columns: task_name, peer_median_hours, peer_job_count
+    """
+    from src.data.semantic import get_category_col, safe_quote_job_task
+
+    if len(df) == 0 or "job_no" not in df.columns:
+        return pd.DataFrame(columns=["task_name", "peer_median_hours", "peer_job_count"])
+
+    cat_col = get_category_col(df)
+
+    # Identify completed jobs
+    if "job_status" in df.columns:
+        completed_mask = df["job_status"].str.lower().str.contains("completed", na=False)
+    elif "job_completed_date" in df.columns:
+        completed_mask = df["job_completed_date"].notna()
+    else:
+        return pd.DataFrame(columns=["task_name", "peer_median_hours", "peer_job_count"])
+
+    completed_jobs = set(
+        df.loc[completed_mask, "job_no"].unique()
+    ) - {job_no}  # exclude selected job
+
+    # Filter to same dept+category
+    peer_df = df[
+        (df["job_no"].isin(completed_jobs))
+        & (df["department_final"] == department)
+        & (df[cat_col] == category)
+    ].copy()
+
+    if len(peer_df) == 0:
+        return pd.DataFrame(columns=["task_name", "peer_median_hours", "peer_job_count"])
+
+    # Get actual hours per job per task for peer jobs
+    task_hours = peer_df.groupby(["job_no", "task_name"])["hours_raw"].sum().reset_index()
+
+    # Compute median hours per task across peer jobs
+    benchmarks = task_hours.groupby("task_name").agg(
+        peer_median_hours=("hours_raw", "median"),
+        peer_job_count=("job_no", "nunique"),
+    ).reset_index()
+
+    return benchmarks
