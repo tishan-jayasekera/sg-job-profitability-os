@@ -198,43 +198,21 @@ def _peer_overlay_summary(peer_band: pd.DataFrame, current_deciles: pd.DataFrame
 
 def _default_forecast_task_scope(selected_df: pd.DataFrame) -> tuple[list[str], str, bool]:
     """
-    Build default forecast task scope from latest job activity date.
+    Build default forecast task scope from all executed tasks to date.
 
     Returns:
-        (task_list, date_label, used_fallback_all_tasks)
+        (task_list, scope_label, used_fallback)
     """
     if len(selected_df) == 0:
-        return [], "latest activity", True
+        return [], "executed to date", True
 
     scope_df = selected_df.copy()
     scope_df["task_name"] = scope_df.get("task_name", "Unspecified").fillna("Unspecified").astype(str)
     scope_df["hours_raw"] = pd.to_numeric(scope_df.get("hours_raw"), errors="coerce").fillna(0.0)
-    date_col = _resolve_date_col(scope_df)
-
     all_executed = sorted(scope_df.loc[scope_df["hours_raw"] > 0, "task_name"].dropna().unique().tolist())
-    if date_col is None:
-        return all_executed, "all history", True
-
-    scope_df[date_col] = pd.to_datetime(scope_df[date_col], errors="coerce")
-    scope_df = scope_df[scope_df[date_col].notna()].copy()
-    if len(scope_df) == 0:
-        return all_executed, "all history", True
-
-    latest_date = scope_df[date_col].max()
-    if date_col == "work_date":
-        latest_mask = scope_df[date_col].dt.normalize() == latest_date.normalize()
-        label = latest_date.strftime("%Y-%m-%d")
-    else:
-        latest_mask = scope_df[date_col] == latest_date
-        label = latest_date.strftime("%Y-%m")
-
-    latest_tasks = sorted(
-        scope_df.loc[latest_mask & (scope_df["hours_raw"] > 0), "task_name"].dropna().unique().tolist()
-    )
-    if len(latest_tasks) > 0:
-        return latest_tasks, label, False
-
-    return all_executed, label, True
+    if len(all_executed) > 0:
+        return all_executed, "executed to date", False
+    return [], "executed to date", True
 
 
 def render_completion_forecast_section(
@@ -460,17 +438,14 @@ def render_completion_forecast_section(
             "How to read: dark bar = actual hours, light extension = expected remaining (P50), whiskers = P25-P75 range."
         )
 
-        default_scope_tasks, scope_date_label, used_scope_fallback = _default_forecast_task_scope(selected_df)
+        default_scope_tasks, _scope_label, used_scope_fallback = _default_forecast_task_scope(selected_df)
         peer_only_tasks = sorted(
             set(task_summary_df["task_name"].astype(str).tolist()) - set(default_scope_tasks)
         ) if len(task_summary_df) > 0 else []
 
-        st.caption(
-            "Default task scope uses tasks executed on the latest job activity date "
-            f"({scope_date_label})."
-        )
+        st.caption("Default task scope uses all tasks executed on this job to date.")
         if used_scope_fallback:
-            st.caption("No positive-hour tasks found on that date; using all executed tasks to date.")
+            st.caption("No executed tasks found yet for this job.")
 
         selected_peer_tasks = st.multiselect(
             "Add peer tasks not yet executed on this job",
