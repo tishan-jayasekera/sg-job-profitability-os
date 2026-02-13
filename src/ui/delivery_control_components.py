@@ -26,6 +26,7 @@ from src.metrics.client_group_subsidy import (
     resolve_group_column,
 )
 from src.metrics.delivery_control import compute_root_cause_drivers
+from src.ui.completion_forecast_components import render_completion_forecast_section
 from src.ui.formatting import fmt_count, fmt_currency, fmt_hours, fmt_percent, fmt_rate
 
 
@@ -862,6 +863,15 @@ def render_selected_job_panel(
         jobs_df,
         str(selected_job),
         job_name_lookup,
+    )
+
+    # ── Section H: Completion Forecast ──────────────────────────
+    render_completion_forecast_section(
+        df_all=df_all if df_all is not None else df_scope,
+        df_scope=df_scope,
+        jobs_df=jobs_df,
+        selected_job=str(selected_job),
+        job_name_lookup=job_name_lookup,
     )
 
 
