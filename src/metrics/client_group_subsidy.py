@@ -246,6 +246,11 @@ def build_job_rollup(df: pd.DataFrame) -> pd.DataFrame:
         rollup["margin"] / rollup["revenue"] * 100,
         np.nan,
     )
+    rollup["job_name"] = rollup["job_name"].where(
+        rollup["job_name"].astype(str).str.strip().ne(""),
+        rollup["job_no"],
+    )
+    rollup["job_name"] = rollup["job_name"].fillna(rollup["job_no"])
 
     return rollup[ROLLUP_COLUMNS]
 
@@ -256,6 +261,7 @@ def compute_client_group_subsidy_context(
     selected_job_no: str,
     lookback_months: int | None = 12,
     scope: str = "all",  # "all" | "active_only"
+    preferred_group_col: str | None = None,
 ) -> dict:
     """
     Return dict with stable contract below.
@@ -282,7 +288,10 @@ def compute_client_group_subsidy_context(
     if not required_cols.issubset(df_all.columns):
         return result
 
-    group_col = resolve_group_column(df_all)
+    if preferred_group_col is not None:
+        group_col = resolve_group_column(df_all, preferred=preferred_group_col)
+    else:
+        group_col = resolve_group_column(df_all)
     result["group_col"] = group_col
     if group_col is None:
         result["status"] = "missing_group_column"
@@ -340,8 +349,50 @@ def compute_client_group_subsidy_context(
             active_meta["risk_score"] = np.nan
         active_meta = active_meta[["job_no", "risk_band", "risk_score"]].drop_duplicates("job_no")
 
+    # Determine active jobs. Prefer jobs_df membership (authoritative active-page set)
+    # and fall back to status/completion inference only when jobs_df is unavailable.
+    active_by_status: set[str] = set()
+    completed_by_status: set[str] = set()
+    if "job_completed_date" in group_df.columns or "job_status" in group_df.columns:
+        job_meta = group_df[["job_no"]].copy()
+        job_meta["job_no"] = job_meta["job_no"].astype(str)
+        if "job_completed_date" in group_df.columns:
+            job_meta["job_completed_date"] = pd.to_datetime(
+                group_df["job_completed_date"], errors="coerce"
+            )
+        else:
+            job_meta["job_completed_date"] = pd.NaT
+        if "job_status" in group_df.columns:
+            job_meta["job_status"] = group_df["job_status"].astype(str)
+        else:
+            job_meta["job_status"] = ""
+        job_meta["has_completed_status"] = job_meta["job_status"].str.lower().str.contains(
+            "completed", na=False
+        )
+
+        status_rollup = job_meta.groupby("job_no", as_index=False).agg(
+            has_completed_date=("job_completed_date", lambda s: s.notna().any()),
+            has_completed_status=("has_completed_status", "any"),
+        )
+        completed_mask = (
+            status_rollup["has_completed_date"] | status_rollup["has_completed_status"]
+        )
+        completed_by_status = set(
+            status_rollup.loc[completed_mask, "job_no"].astype(str).tolist()
+        )
+        active_by_status = set(
+            status_rollup.loc[~completed_mask, "job_no"].astype(str).tolist()
+        )
+    if len(active_set) > 0:
+        # Keep active-page membership, but let explicit completion signals veto.
+        base_active_set = set(active_set) - completed_by_status
+    else:
+        base_active_set = active_by_status
+
     if normalized_scope == "active_only":
-        keep_jobs = active_set | {selected_job_key}
+        # Keep only active jobs (plus the selected job for context continuity).
+        # jobs_df membership is authoritative when available.
+        keep_jobs = base_active_set | {selected_job_key}
         rollup = rollup[rollup["job_no"].isin(keep_jobs)].copy()
         if len(rollup) == 0:
             return result
@@ -422,7 +473,7 @@ def compute_client_group_subsidy_context(
         "group_margin": group_margin,
         "group_margin_pct": group_margin_pct,
         "job_count": int(len(rollup)),
-        "active_job_count": int(rollup["job_no"].isin(active_set).sum()),
+        "active_job_count": int(rollup["job_no"].isin(base_active_set).sum()),
         "loss_job_count": int((rollup["margin"] < 0).sum()),
         "red_job_count": int((rollup["risk_band"] == "Red").sum()),
         "amber_job_count": int((rollup["risk_band"] == "Amber").sum()),

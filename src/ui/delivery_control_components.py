@@ -9,6 +9,7 @@ Provides the four functions imported by pages/4_Active_Delivery.py:
 """
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Dict, Optional
 
 import numpy as np
@@ -264,6 +265,90 @@ def summarize_alerts(jobs_df: pd.DataFrame) -> Dict[str, float]:
     }
 
 
+def _build_queue_action_export(
+    display_df: pd.DataFrame,
+    job_name_lookup: Dict[str, str],
+) -> pd.DataFrame:
+    """Build an export-ready diagnosis/action list for the visible queue jobs."""
+    if len(display_df) == 0:
+        return pd.DataFrame(
+            columns=[
+                "job_no",
+                "job_name",
+                "risk_band",
+                "risk_score",
+                "diagnosis",
+                "action_list",
+                "recommended_action",
+                "margin_to_date_pct",
+                "forecast_margin_pct",
+                "quote_consumed_pct",
+                "hours_overrun",
+                "burn_rate_per_day",
+                "runtime_days",
+            ]
+        )
+
+    export = display_df.copy()
+    export["job_no"] = export["job_no"].astype(str)
+    export["job_name"] = export["job_no"].map(lambda j: job_name_lookup.get(str(j), "")).fillna("")
+    if "risk_band" not in export.columns:
+        export["risk_band"] = "Unknown"
+    export["risk_band"] = export["risk_band"].astype(str)
+    export["risk_score"] = pd.to_numeric(export.get("risk_score"), errors="coerce")
+    export["primary_driver"] = export.get("primary_driver", "").fillna("").astype(str)
+    export["recommended_action"] = export.get("recommended_action", "").fillna("").astype(str)
+
+    export["diagnosis"] = np.where(
+        export["primary_driver"].str.strip().ne(""),
+        export["primary_driver"],
+        "Monitor",
+    )
+
+    def _action_steps(row: pd.Series) -> str:
+        base = str(row.get("recommended_action", "") or "").strip()
+        band = str(row.get("risk_band", "Unknown"))
+        if band == "Red":
+            suffix = "Triage today; assign owner + due date; track daily."
+        elif band == "Amber":
+            suffix = "Review this week; lock remediation plan; track twice weekly."
+        else:
+            suffix = "Continue standard review cadence."
+        return f"{base} {suffix}".strip()
+
+    export["action_list"] = export.apply(_action_steps, axis=1)
+
+    export["margin_to_date_pct"] = pd.to_numeric(export.get("margin_pct_to_date"), errors="coerce").round(1)
+    export["forecast_margin_pct"] = pd.to_numeric(export.get("forecast_margin_pct"), errors="coerce").round(1)
+    export["quote_consumed_pct"] = pd.to_numeric(export.get("pct_consumed"), errors="coerce").round(1)
+    export["hours_overrun"] = pd.to_numeric(export.get("hours_overrun"), errors="coerce").round(1)
+    export["burn_rate_per_day"] = pd.to_numeric(export.get("burn_rate_per_day"), errors="coerce").round(2)
+    export["runtime_days"] = pd.to_numeric(export.get("runtime_days"), errors="coerce").round(0)
+
+    risk_order = {"Red": 0, "Amber": 1, "Green": 2}
+    export["_risk_rank"] = export["risk_band"].map(risk_order).fillna(99)
+
+    columns = [
+        "job_no",
+        "job_name",
+        "risk_band",
+        "risk_score",
+        "diagnosis",
+        "action_list",
+        "recommended_action",
+        "margin_to_date_pct",
+        "forecast_margin_pct",
+        "quote_consumed_pct",
+        "hours_overrun",
+        "burn_rate_per_day",
+        "runtime_days",
+    ]
+    keep = [c for c in columns if c in export.columns]
+    export = export.sort_values(["_risk_rank", "risk_score"], ascending=[True, False], na_position="last")
+    export = export[keep]
+    return export
+
+
 def render_job_queue(
     jobs_df: pd.DataFrame,
     job_name_lookup: Dict[str, str],
@@ -296,6 +381,19 @@ def render_job_queue(
         "</div>",
         unsafe_allow_html=True,
     )
+
+    action_export_df = _build_queue_action_export(display_df, job_name_lookup)
+    if len(action_export_df) > 0:
+        csv_bytes = action_export_df.to_csv(index=False).encode("utf-8")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        st.download_button(
+            "Export Action List (CSV)",
+            data=csv_bytes,
+            file_name=f"active_delivery_action_list_{timestamp}.csv",
+            mime="text/csv",
+            use_container_width=True,
+            help="Exports diagnosis and action steps for all jobs currently shown in this queue view.",
+        )
 
     def _truncate_text(value: str, max_len: int = 72) -> str:
         text = " ".join(str(value).split())
@@ -885,7 +983,25 @@ def _render_client_subsidy_section(
     st.markdown("---")
     st.markdown('<div class="dc-section-label">Client Group Context</div>', unsafe_allow_html=True)
 
-    group_col = resolve_group_column(df_all)
+    show_client_ltv = st.toggle(
+        "Show Client LTV (all jobs)",
+        value=False,
+        key=f"dc_client_ltv_{selected_job}",
+        help="Switch to client-level grouping and include all jobs for lifetime-value context.",
+    )
+    preferred_group_col = "client" if show_client_ltv else None
+    selected_scope = "all" if show_client_ltv else "active_only"
+    selected_lookback = None
+
+    if show_client_ltv:
+        st.caption("LTV view: client-level grouping across all jobs and full history.")
+    else:
+        st.caption("Default view shows active jobs under this client group with lifetime margin metrics.")
+
+    if preferred_group_col is not None:
+        group_col = resolve_group_column(df_all, preferred=preferred_group_col)
+    else:
+        group_col = resolve_group_column(df_all)
     if group_col is None:
         st.caption("No client group column available in dataset.")
         return
@@ -894,8 +1010,9 @@ def _render_client_subsidy_section(
         df_all,
         jobs_df,
         selected_job,
-        lookback_months=12,
-        scope="all",
+        lookback_months=selected_lookback,
+        scope=selected_scope,
+        preferred_group_col=preferred_group_col,
     )
 
     if ctx["status"] != "ok":
@@ -905,6 +1022,7 @@ def _render_client_subsidy_section(
     summary = ctx["summary"]
     group_value = ctx["group_value"]
     peer_jobs = ctx["jobs"]
+    group_label = "Client" if ctx["group_col"] == "client" else "Client Group"
 
     # ── Verdict banner ──
     verdict = summary["verdict"]
@@ -921,7 +1039,7 @@ def _render_client_subsidy_section(
         f'<div style="padding:10px 16px;border-radius:6px;background:{vcolor}15;'
         f'border-left:4px solid {vcolor};margin-bottom:12px;">'
         f'<strong style="color:{vcolor}">{verdict}</strong>'
-        f' &nbsp;—&nbsp; Client Group: <strong>{group_value}</strong>'
+        f' &nbsp;—&nbsp; {group_label}: <strong>{group_value}</strong>'
         f'<br><span style="font-size:0.85em;color:#555">{vdesc}</span></div>',
         unsafe_allow_html=True,
     )
@@ -973,14 +1091,26 @@ def _render_client_subsidy_section(
 
     # ── Peer jobs table ──
     if len(peer_jobs) > 0:
-        st.markdown("#### Jobs Under This Client Group")
+        if group_label == "Client":
+            st.markdown("#### Jobs Under This Client")
+        else:
+            st.markdown("#### Jobs Under This Client Group")
 
         display = peer_jobs.copy()
         display["job_label"] = display["job_no"].apply(
             lambda j: f"→ {j}" if str(j) == str(selected_job) else str(j)
         )
-        display["job_name"] = display["job_no"].apply(
-            lambda j: job_name_lookup.get(str(j), "")
+        lookup_names = display["job_no"].astype(str).map(job_name_lookup)
+        existing_names = display.get("job_name", pd.Series(index=display.index, dtype=object))
+        lookup_mask = lookup_names.notna() & lookup_names.astype(str).str.strip().ne("")
+        display["job_name"] = lookup_names.where(
+            lookup_mask,
+            existing_names,
+        )
+        existing_mask = display["job_name"].notna() & display["job_name"].astype(str).str.strip().ne("")
+        display["job_name"] = display["job_name"].where(
+            existing_mask,
+            display["job_no"].astype(str),
         )
 
         # Format columns
