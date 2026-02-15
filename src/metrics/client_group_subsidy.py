@@ -379,12 +379,15 @@ def compute_client_group_subsidy_context(
 
     peer_df = rollup[~rollup["is_selected"]].copy()
     peer_positive = peer_df["margin"].clip(lower=0)
+    peer_margin_total = float(peer_df["margin"].sum())
     positive_pool = float(peer_positive.sum())
     selected_loss_abs = float(max(-selected_margin, 0.0))
     coverage_ratio = (
         float(positive_pool / selected_loss_abs) if selected_loss_abs > 0 else np.nan
     )
-    buffer_after_subsidy = float(positive_pool - selected_loss_abs)
+    # Net peer buffer after covering selected job loss.
+    # This includes both profitable and loss-making peers.
+    buffer_after_subsidy = float(peer_margin_total - selected_loss_abs)
     subsidizer_job_count = int((peer_df["margin"] > 0).sum())
 
     if positive_pool > 0:

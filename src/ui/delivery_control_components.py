@@ -952,7 +952,7 @@ def _render_client_subsidy_section(
         st.metric(
             "Buffer After Subsidy",
             fmt_currency(summary["buffer_after_subsidy"]),
-            help="Remaining peer margin after absorbing this job's loss",
+            help="Net peer margin after absorbing this job's loss (includes profitable and loss-making peers)",
         )
 
     # ── Additional context metrics ──

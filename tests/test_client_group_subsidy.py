@@ -63,6 +63,7 @@ def test_full_subsidy_verdict():
     assert result["status"] == "ok"
     assert result["summary"]["verdict"] == "Fully Subsidized"
     assert result["summary"]["coverage_ratio"] == pytest.approx(1.8)
+    assert result["summary"]["buffer_after_subsidy"] == pytest.approx(80.0)
 
 
 def test_partial_subsidy_verdict():
@@ -75,6 +76,7 @@ def test_partial_subsidy_verdict():
     # Guardrail: when the overall group is still loss-making, do not label as subsidized.
     assert result["summary"]["verdict"] == "Weak Subsidy"
     assert result["summary"]["coverage_ratio"] == pytest.approx(0.7)
+    assert result["summary"]["buffer_after_subsidy"] == pytest.approx(-60.0)
 
 
 def test_weak_subsidy_verdict():
@@ -119,6 +121,7 @@ def test_group_negative_prevents_fully_subsidized_label():
     assert result["summary"]["group_margin"] < 0
     assert result["summary"]["coverage_ratio"] > 1.0
     assert result["summary"]["verdict"] == "Weak Subsidy"
+    assert result["summary"]["buffer_after_subsidy"] == pytest.approx(-20.0)
 
 
 def test_group_column_fallback_to_client():
