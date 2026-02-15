@@ -196,6 +196,97 @@ def _peer_overlay_summary(peer_band: pd.DataFrame, current_deciles: pd.DataFrame
     )
 
 
+def _timeline_summary(timeline_df: pd.DataFrame) -> str:
+    """Return a plain-language interpretation of timeline momentum and concentration."""
+    if len(timeline_df) == 0:
+        return "Not enough timeline data to infer trend or concentration."
+
+    period = (
+        timeline_df.groupby("period_start", as_index=False)
+        .agg(hours=("hours", "sum"), cumulative_cost=("cumulative_cost", "max"))
+        .sort_values("period_start")
+    )
+    task_share = (
+        timeline_df.groupby("task_name")["hours"].sum().sort_values(ascending=False)
+    )
+
+    if len(period) == 0 or task_share.sum() <= 0:
+        return "Not enough timeline data to infer trend or concentration."
+
+    top_task = str(task_share.index[0])
+    top_share_pct = float(task_share.iloc[0] / task_share.sum() * 100)
+
+    if len(period) >= 2:
+        latest = float(period["hours"].iloc[-1])
+        prev = float(period["hours"].iloc[-2])
+        if prev <= 0 and latest > 0:
+            trend = "Effort has resumed after a low-activity period."
+        elif prev > 0:
+            change = (latest - prev) / prev * 100
+            if change >= 20:
+                trend = "Delivery effort is accelerating in the latest period."
+            elif change <= -20:
+                trend = "Delivery effort has slowed in the latest period."
+            else:
+                trend = "Delivery effort is relatively stable period over period."
+        else:
+            trend = "Delivery effort is relatively stable period over period."
+    else:
+        trend = "Only one period is available; trend direction is not yet reliable."
+
+    return (
+        f"{trend} The largest workload driver so far is '{top_task}' "
+        f"({top_share_pct:.0f}% of total tracked hours), with cumulative cost rising as expected."
+    )
+
+
+def _remaining_work_summary(work_df: pd.DataFrame) -> str:
+    """Return a plain-language interpretation of remaining-work concentration and risk signals."""
+    if len(work_df) == 0:
+        return "Not enough task-level data to interpret remaining work."
+
+    total_remaining = float(pd.to_numeric(work_df["remaining_hours_median"], errors="coerce").fillna(0.0).sum())
+    total_actual = float(pd.to_numeric(work_df["actual_hours"], errors="coerce").fillna(0.0).sum())
+    total_expected = total_actual + total_remaining
+
+    outlier_count = int(work_df["outlier_flag"].fillna(False).sum())
+    unmodeled_count = int(work_df["unmodeled_flag"].fillna(False).sum())
+
+    rem_by_task = (
+        work_df[["task_name", "remaining_hours_median"]]
+        .copy()
+    )
+    rem_by_task["remaining_hours_median"] = pd.to_numeric(
+        rem_by_task["remaining_hours_median"], errors="coerce"
+    ).fillna(0.0)
+    rem_by_task = rem_by_task.sort_values("remaining_hours_median", ascending=False)
+
+    if len(rem_by_task) > 0 and rem_by_task["remaining_hours_median"].iloc[0] > 0 and total_remaining > 0:
+        top_task = str(rem_by_task["task_name"].iloc[0])
+        top_hours = float(rem_by_task["remaining_hours_median"].iloc[0])
+        top_pct = (top_hours / total_remaining) * 100
+        concentration = (
+            f"The largest remaining block is '{top_task}' ({top_hours:.1f}h, {top_pct:.0f}% of remaining work)."
+        )
+    else:
+        concentration = "No material modeled remaining hours are currently forecast."
+
+    completion_note = (
+        f"Based on scoped tasks, modeled completion is {((total_actual / total_expected) * 100):.0f}%."
+        if total_expected > 0
+        else "Completion ratio is not yet computable from scoped task totals."
+    )
+
+    risk_flags = []
+    if outlier_count > 0:
+        risk_flags.append(f"{outlier_count} outlier task(s) flagged")
+    if unmodeled_count > 0:
+        risk_flags.append(f"{unmodeled_count} unmodeled task(s) present")
+    risk_text = "; ".join(risk_flags) if risk_flags else "no task-level exception flags"
+
+    return f"{concentration} {completion_note} Current exceptions: {risk_text}."
+
+
 def _default_forecast_task_scope(selected_df: pd.DataFrame) -> tuple[list[str], str, bool]:
     """
     Build default forecast task scope from all executed tasks to date.
@@ -335,6 +426,7 @@ def render_completion_forecast_section(
             legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
         )
         st.plotly_chart(timeline_fig, use_container_width=True)
+        st.info(_timeline_summary(timeline_df))
 
         # Sub-section B: Peer lifecycle overlay
         st.markdown('<div class="dc-soft-divider"></div>', unsafe_allow_html=True)
@@ -463,6 +555,7 @@ def render_completion_forecast_section(
             return
 
         st.caption(f"Forecast task scope ({len(scoped_tasks)}): {', '.join(scoped_tasks)}")
+        st.caption("Forecast Summary calculations below are based on this selected task scope.")
 
         remaining_df, remaining_summary = estimate_remaining_work(
             df_all=df_all,
@@ -533,6 +626,7 @@ def render_completion_forecast_section(
         remaining_fig.update_yaxes(autorange="reversed")
         st.plotly_chart(remaining_fig, use_container_width=True)
         st.caption("⚠️ = outlier task. ℹ️ = unmodeled task with no peer equivalent.")
+        st.info(_remaining_work_summary(work_df))
 
         table_df = work_df.copy()
         table_df["Status"] = table_df.apply(_status_for_task, axis=1)
@@ -559,6 +653,10 @@ def render_completion_forecast_section(
         st.caption(
             "Why this section: translates estimated remaining work into completion date, total cost, and margin outcomes "
             "across optimistic/expected/conservative scenarios."
+        )
+        st.caption(
+            "Forecast Margin % at Completion = (Forecast Revenue at completion - Forecast Total Cost at completion) "
+            "/ Forecast Revenue at completion."
         )
 
         forecast = forecast_completion(
@@ -641,7 +739,7 @@ def render_completion_forecast_section(
 
                 st.metric("Forecast Total Cost", fmt_currency(scen.get("forecast_total_cost")))
                 margin_pct = pd.to_numeric(scen.get("forecast_margin_pct"), errors="coerce")
-                st.metric("Forecast Margin %", fmt_percent(margin_pct))
+                st.metric("Forecast Margin % at Completion", fmt_percent(margin_pct))
 
                 color = _margin_color(margin_pct, benchmark_margin)
                 st.markdown(

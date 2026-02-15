@@ -397,6 +397,11 @@ def compute_client_group_subsidy_context(
         verdict = "No Subsidy Needed"
     elif positive_pool <= 0:
         verdict = "Not Subsidized"
+    elif group_margin <= 0:
+        # If the overall group is loss-making, do not present this as
+        # partially/fully subsidized even when the selected-loss coverage
+        # ratio is high; the group has no net surplus capacity.
+        verdict = "Weak Subsidy"
     elif coverage_ratio < 0.5:
         verdict = "Weak Subsidy"
     elif coverage_ratio < 1.0:

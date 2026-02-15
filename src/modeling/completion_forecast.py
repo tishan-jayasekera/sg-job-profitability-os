@@ -495,6 +495,12 @@ def estimate_remaining_work(
         "lifecycle_expected_completion_pct": np.nan,
         "actual_completion_pct": np.nan,
         "task_scope_count": 0,
+        "included_tasks": tuple(),
+        "scoped_actual_hours": np.nan,
+        "scoped_actual_cost": np.nan,
+        "scoped_actual_revenue": np.nan,
+        "scoped_quoted_amount": np.nan,
+        "scope_is_full_job": False,
     }
 
     if len(df_all) == 0 or "job_no" not in df_all.columns:
@@ -520,6 +526,16 @@ def estimate_remaining_work(
         actual_task_hours_all.index.astype(str).isin(include_set)
     ]
     total_actual = float(actual_task_hours.sum())
+    summary["included_tasks"] = tuple(sorted(include_set))
+    all_job_tasks = set(job_df["task_name"].astype(str).dropna().unique().tolist())
+    summary["scope_is_full_job"] = bool(len(all_job_tasks) > 0 and include_set == all_job_tasks)
+
+    scoped_job_df = job_df[job_df["task_name"].isin(include_set)].copy()
+    scoped_job_df["base_cost"] = pd.to_numeric(scoped_job_df.get("base_cost"), errors="coerce").fillna(0.0)
+    scoped_job_df["rev_alloc"] = pd.to_numeric(scoped_job_df.get("rev_alloc"), errors="coerce").fillna(0.0)
+    summary["scoped_actual_hours"] = float(total_actual)
+    summary["scoped_actual_cost"] = float(scoped_job_df["base_cost"].sum())
+    summary["scoped_actual_revenue"] = float(scoped_job_df["rev_alloc"].sum())
 
     peers_df = _peer_scope(df_all, department, category, str(job_no))
     _lifecycle_df, task_summary_df_all = build_peer_lifecycle_profiles(
@@ -551,6 +567,13 @@ def estimate_remaining_work(
         q["task_name"] = q["task_name"].astype(str)
         q = q[q["task_name"].isin(include_set)]
         quote_scope_hours = pd.to_numeric(q["quoted_time_total"], errors="coerce").fillna(0.0).sum()
+    if len(job_task_quotes) > 0 and "quoted_amount_total" in job_task_quotes.columns:
+        qa = job_task_quotes.copy()
+        qa["task_name"] = qa["task_name"].astype(str)
+        qa = qa[qa["task_name"].isin(include_set)]
+        summary["scoped_quoted_amount"] = float(
+            pd.to_numeric(qa["quoted_amount_total"], errors="coerce").fillna(0.0).sum()
+        )
 
     peer_scope_hours = (
         float(pd.to_numeric(task_summary_df["peer_median_total_hours"], errors="coerce").fillna(0.0).sum())
@@ -713,6 +736,8 @@ def estimate_remaining_work(
                 "lifecycle_expected_completion_pct": lifecycle_expected_completion_pct,
                 "actual_completion_pct": actual_completion_pct,
                 "task_scope_count": len(include_set),
+                "included_tasks": tuple(sorted(include_set)),
+                "scope_is_full_job": bool(summary["scope_is_full_job"]),
             }
         )
         return _empty_remaining_df(), summary
@@ -738,6 +763,8 @@ def estimate_remaining_work(
             "lifecycle_expected_completion_pct": lifecycle_expected_completion_pct,
             "actual_completion_pct": actual_completion_pct,
             "task_scope_count": len(include_set),
+            "included_tasks": tuple(sorted(include_set)),
+            "scope_is_full_job": bool(summary["scope_is_full_job"]),
         }
     )
 
@@ -755,30 +782,53 @@ def forecast_completion(
     Forecast completion date and margin for optimistic/expected/conservative scenarios.
 
     Algorithm:
-    1. Use job burn-rate from `job_row`; fallback to trailing 28-day burn from fact rows.
-    2. For each remaining-hours scenario, compute days to complete, end date, cost, revenue.
-    3. Compute margin and margin percentage with stall handling when burn-rate is zero.
+    1. Use job burn-rate from `job_row`; fallback to trailing 28-day burn from scoped fact rows.
+    2. Use scoped actual/quote values from `remaining_summary` when available.
+    3. For each remaining-hours scenario, compute days to complete, end date, cost, revenue.
+    4. Compute margin and margin percentage with stall handling when burn-rate is zero.
 
     Returns:
         Dictionary with burn-rate, last activity date, scenario metrics, and stall flag.
     """
-    job_df = df_all[df_all["job_no"].astype(str) == str(job_no)].copy() if len(df_all) > 0 and "job_no" in df_all.columns else pd.DataFrame()
+    job_df = (
+        df_all[df_all["job_no"].astype(str) == str(job_no)].copy()
+        if len(df_all) > 0 and "job_no" in df_all.columns
+        else pd.DataFrame()
+    )
+    scope_tasks = tuple(str(t) for t in remaining_summary.get("included_tasks", tuple()) if str(t).strip())
+    scope_set = set(scope_tasks)
 
-    date_col = _resolve_date_col(job_df) if len(job_df) > 0 else None
+    scoped_df = job_df.copy()
+    if len(scoped_df) > 0 and len(scope_set) > 0 and "task_name" in scoped_df.columns:
+        scoped_df["task_name"] = scoped_df["task_name"].fillna("Unspecified").astype(str)
+        scoped_df = scoped_df[scoped_df["task_name"].isin(scope_set)].copy()
+        if len(scoped_df) == 0:
+            scoped_df = job_df.copy()
+
+    date_col = _resolve_date_col(scoped_df) if len(scoped_df) > 0 else _resolve_date_col(job_df)
     if date_col is not None:
-        job_df[date_col] = pd.to_datetime(job_df[date_col], errors="coerce")
-        job_df = job_df[job_df[date_col].notna()].copy()
+        if len(scoped_df) > 0 and date_col in scoped_df.columns:
+            scoped_df[date_col] = pd.to_datetime(scoped_df[date_col], errors="coerce")
+            scoped_df = scoped_df[scoped_df[date_col].notna()].copy()
+        if len(job_df) > 0 and date_col in job_df.columns:
+            job_df[date_col] = pd.to_datetime(job_df[date_col], errors="coerce")
+            job_df = job_df[job_df[date_col].notna()].copy()
 
-    last_activity = job_df[date_col].max() if date_col is not None and len(job_df) > 0 else pd.NaT
+    last_activity = (
+        scoped_df[date_col].max()
+        if date_col is not None and len(scoped_df) > 0 and date_col in scoped_df.columns
+        else (job_df[date_col].max() if date_col is not None and len(job_df) > 0 and date_col in job_df.columns else pd.NaT)
+    )
 
     burn_rate = pd.to_numeric(job_row.get("burn_rate_per_day"), errors="coerce")
     if pd.isna(burn_rate) or burn_rate <= 0:
-        if date_col is not None and len(job_df) > 0:
-            last_date = job_df[date_col].max()
+        burn_source = scoped_df if len(scoped_df) > 0 else job_df
+        if date_col is not None and len(burn_source) > 0 and date_col in burn_source.columns:
+            last_date = burn_source[date_col].max()
             cutoff = last_date - timedelta(days=28)
-            recent = job_df[job_df[date_col] >= cutoff]
+            recent = burn_source[burn_source[date_col] >= cutoff]
             if len(recent) == 0:
-                recent = job_df
+                recent = burn_source
             span_days = max((recent[date_col].max() - recent[date_col].min()).days, 1)
             hours = pd.to_numeric(recent.get("hours_raw"), errors="coerce").fillna(0.0).sum()
             burn_rate = hours / span_days if span_days > 0 else 0.0
@@ -787,17 +837,24 @@ def forecast_completion(
 
     burn_rate = float(burn_rate) if pd.notna(burn_rate) else 0.0
 
-    actual_cost = pd.to_numeric(job_row.get("actual_cost"), errors="coerce")
-    actual_hours = pd.to_numeric(job_row.get("actual_hours"), errors="coerce")
-    actual_revenue = pd.to_numeric(job_row.get("actual_revenue"), errors="coerce")
+    actual_cost = pd.to_numeric(remaining_summary.get("scoped_actual_cost"), errors="coerce")
+    actual_hours = pd.to_numeric(remaining_summary.get("scoped_actual_hours"), errors="coerce")
+    actual_revenue = pd.to_numeric(remaining_summary.get("scoped_actual_revenue"), errors="coerce")
 
-    if len(job_df) > 0:
+    if pd.isna(actual_cost):
+        actual_cost = pd.to_numeric(job_row.get("actual_cost"), errors="coerce")
+    if pd.isna(actual_hours):
+        actual_hours = pd.to_numeric(job_row.get("actual_hours"), errors="coerce")
+    if pd.isna(actual_revenue):
+        actual_revenue = pd.to_numeric(job_row.get("actual_revenue"), errors="coerce")
+
+    if len(scoped_df) > 0:
         if pd.isna(actual_cost):
-            actual_cost = pd.to_numeric(job_df.get("base_cost"), errors="coerce").fillna(0.0).sum()
+            actual_cost = pd.to_numeric(scoped_df.get("base_cost"), errors="coerce").fillna(0.0).sum()
         if pd.isna(actual_hours):
-            actual_hours = pd.to_numeric(job_df.get("hours_raw"), errors="coerce").fillna(0.0).sum()
+            actual_hours = pd.to_numeric(scoped_df.get("hours_raw"), errors="coerce").fillna(0.0).sum()
         if pd.isna(actual_revenue):
-            actual_revenue = pd.to_numeric(job_df.get("rev_alloc"), errors="coerce").fillna(0.0).sum()
+            actual_revenue = pd.to_numeric(scoped_df.get("rev_alloc"), errors="coerce").fillna(0.0).sum()
 
     actual_cost = float(actual_cost) if pd.notna(actual_cost) else 0.0
     actual_hours = float(actual_hours) if pd.notna(actual_hours) else 0.0
@@ -805,10 +862,20 @@ def forecast_completion(
 
     avg_cost_per_hour = (actual_cost / actual_hours) if actual_hours > 0 else np.nan
 
-    quoted_amount = pd.to_numeric(job_row.get("quoted_amount"), errors="coerce")
+    scope_is_full_job = bool(remaining_summary.get("scope_is_full_job", len(scope_set) == 0))
+    quoted_amount = pd.to_numeric(remaining_summary.get("scoped_quoted_amount"), errors="coerce")
+    if (pd.isna(quoted_amount) or quoted_amount <= 0) and scope_is_full_job:
+        quoted_amount = pd.to_numeric(job_row.get("quoted_amount"), errors="coerce")
+    if (pd.isna(quoted_amount) or quoted_amount <= 0) and len(scoped_df) > 0:
+        scoped_quotes = safe_quote_job_task(scoped_df)
+        if len(scoped_quotes) > 0 and "quoted_amount_total" in scoped_quotes.columns:
+            quoted_amount = pd.to_numeric(
+                scoped_quotes["quoted_amount_total"], errors="coerce"
+            ).fillna(0.0).sum()
     if (pd.isna(quoted_amount) or quoted_amount <= 0) and len(job_df) > 0:
         _qh, qa = _safe_quote_totals_for_job(job_df)
-        quoted_amount = qa
+        if scope_is_full_job:
+            quoted_amount = qa
 
     is_stalled = bool((pd.isna(burn_rate)) or burn_rate <= 0)
 

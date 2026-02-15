@@ -72,7 +72,8 @@ def test_partial_subsidy_verdict():
     result = compute_client_group_subsidy_context(df, jobs_df, "SEL", lookback_months=12, scope="all")
 
     assert result["status"] == "ok"
-    assert result["summary"]["verdict"] == "Partially Subsidized"
+    # Guardrail: when the overall group is still loss-making, do not label as subsidized.
+    assert result["summary"]["verdict"] == "Weak Subsidy"
     assert result["summary"]["coverage_ratio"] == pytest.approx(0.7)
 
 
@@ -106,6 +107,18 @@ def test_no_subsidy_needed_verdict():
 
     assert result["status"] == "ok"
     assert result["summary"]["verdict"] == "No Subsidy Needed"
+
+
+def test_group_negative_prevents_fully_subsidized_label():
+    df = _make_df(selected_margin=-100, peer_margins=[120, -40])
+    jobs_df = _make_jobs_df(["SEL", "P1", "P2"])
+
+    result = compute_client_group_subsidy_context(df, jobs_df, "SEL", lookback_months=12, scope="all")
+
+    assert result["status"] == "ok"
+    assert result["summary"]["group_margin"] < 0
+    assert result["summary"]["coverage_ratio"] > 1.0
+    assert result["summary"]["verdict"] == "Weak Subsidy"
 
 
 def test_group_column_fallback_to_client():

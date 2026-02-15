@@ -427,3 +427,77 @@ def test_forecast_completion_no_quote():
 
     expected = result["scenarios"]["expected"]
     assert expected["forecast_revenue"] == pytest.approx(1200.0)
+
+
+def test_forecast_completion_uses_scoped_summary_values():
+    df = pd.DataFrame(
+        _make_active_job_rows(job_no="A1", prep_hours=25.0, review_hours=25.0)
+    )
+    remaining_summary = {
+        "total_remaining_p25": 5.0,
+        "total_remaining_median": 10.0,
+        "total_remaining_p75": 15.0,
+        "included_tasks": ("Prep",),
+        "scoped_actual_hours": 25.0,
+        "scoped_actual_cost": 2500.0,
+        "scoped_actual_revenue": 3750.0,
+        "scoped_quoted_amount": 6000.0,
+    }
+
+    result = forecast_completion(
+        job_row=_job_row(
+            quoted_amount=10000.0,
+            burn_rate_per_day=5.0,
+            actual_cost=1000.0,
+            actual_hours=50.0,
+            actual_revenue=1000.0,
+        ),
+        remaining_summary=remaining_summary,
+        df_all=df,
+        job_no="A1",
+    )
+
+    expected = result["scenarios"]["expected"]
+    # Scoped cost rate = 2500/25 = 100; 10 remaining -> +1000 cost
+    assert expected["forecast_total_cost"] == pytest.approx(3500.0)
+    # Scoped quoted amount should be used over job-row quote
+    assert expected["forecast_revenue"] == pytest.approx(6000.0)
+
+
+def test_forecast_completion_partial_scope_without_quote_does_not_use_full_job_quote():
+    df = pd.DataFrame(
+        _make_active_job_rows(job_no="A1", prep_hours=25.0, review_hours=25.0)
+    )
+    # Simulate selected scope task without usable quote.
+    df.loc[df["task_name"] == "Prep", "quoted_amount_total"] = 0.0
+    df.loc[df["task_name"] == "Prep", "quoted_time_total"] = 0.0
+
+    remaining_summary = {
+        "total_remaining_p25": 5.0,
+        "total_remaining_median": 10.0,
+        "total_remaining_p75": 15.0,
+        "included_tasks": ("Prep",),
+        "scope_is_full_job": False,
+        "scoped_actual_hours": 25.0,
+        "scoped_actual_cost": 1250.0,
+        "scoped_actual_revenue": 1250.0,
+        "scoped_quoted_amount": np.nan,
+    }
+
+    result = forecast_completion(
+        job_row=_job_row(
+            quoted_amount=10000.0,
+            burn_rate_per_day=5.0,
+            actual_cost=5000.0,
+            actual_hours=50.0,
+            actual_revenue=7500.0,
+        ),
+        remaining_summary=remaining_summary,
+        df_all=df,
+        job_no="A1",
+    )
+
+    expected = result["scenarios"]["expected"]
+    # Revenue extrapolation should use scoped realised rate (1250/25 = 50/hr):
+    # 50 * (25 + 10) = 1750
+    assert expected["forecast_revenue"] == pytest.approx(1750.0)
