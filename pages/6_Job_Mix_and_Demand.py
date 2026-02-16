@@ -406,6 +406,341 @@ def compute_capacity_summary(
     return summary.sort_values("slack_hours", ascending=False)
 
 
+def _resolve_period_granularity(
+    requested_granularity: str, df: pd.DataFrame, df_base: pd.DataFrame
+) -> str:
+    """Return Weekly only when daily dates exist in both analysis and base frames."""
+    if (
+        requested_granularity == "Weekly"
+        and "work_date" in df.columns
+        and "work_date" in df_base.columns
+    ):
+        return "Weekly"
+    return "Monthly"
+
+
+def _attach_period_key(df: pd.DataFrame, granularity: str) -> pd.DataFrame:
+    """Attach a normalized period_key for weekly or monthly reporting."""
+    date_col = "work_date" if granularity == "Weekly" else "month_key"
+    if date_col not in df.columns:
+        return pd.DataFrame()
+
+    df_period = df.copy()
+    df_period[date_col] = pd.to_datetime(df_period[date_col], errors="coerce")
+    df_period = df_period[df_period[date_col].notna()].copy()
+    if len(df_period) == 0:
+        return pd.DataFrame()
+
+    if granularity == "Weekly":
+        # Weeks start on Monday (W-SUN periods end on Sunday).
+        df_period["period_key"] = df_period[date_col].dt.to_period("W-SUN").dt.start_time
+    else:
+        df_period["period_key"] = df_period[date_col].dt.to_period("M").dt.to_timestamp()
+    return df_period
+
+
+def _compute_staff_period_totals(df: pd.DataFrame) -> pd.DataFrame:
+    """Compute staff-period totals and effective FTE scaling."""
+    if "staff_name" not in df.columns or "period_key" not in df.columns:
+        return pd.DataFrame()
+
+    df_base = df.copy()
+    if "hours_raw" not in df_base.columns:
+        df_base["hours_raw"] = 0.0
+    df_base["hours_raw"] = pd.to_numeric(df_base["hours_raw"], errors="coerce").fillna(0.0)
+
+    if "fte_hours_scaling" in df_base.columns:
+        df_base["fte_hours_scaling"] = pd.to_numeric(
+            df_base["fte_hours_scaling"], errors="coerce"
+        ).fillna(config.DEFAULT_FTE_SCALING)
+
+        def _weighted_fte(group: pd.DataFrame) -> float:
+            weights = group["hours_raw"].fillna(0)
+            total = weights.sum()
+            if total > 0:
+                return float(np.average(group["fte_hours_scaling"], weights=weights))
+            return float(group["fte_hours_scaling"].mean())
+
+        grouped = df_base.groupby(["staff_name", "period_key"])
+        total_hours = grouped["hours_raw"].sum().rename("total_hours")
+        fte_scaling = grouped.apply(_weighted_fte).rename("fte_scaling")
+        staff_period = pd.concat([total_hours, fte_scaling], axis=1).reset_index()
+    else:
+        staff_period = df_base.groupby(["staff_name", "period_key"]).agg(
+            total_hours=("hours_raw", "sum")
+        ).reset_index()
+        staff_period["fte_scaling"] = config.DEFAULT_FTE_SCALING
+
+    return staff_period
+
+
+def build_fte_capacity_activity_profile(
+    df: pd.DataFrame,
+    df_base: pd.DataFrame,
+    category_col: str,
+    requested_granularity: str = "Monthly",
+) -> dict:
+    """
+    Build granular capacity-vs-hours mapping tables for export and drilldown.
+
+    Returns:
+        resolved_granularity, period_summary, department_summary,
+        hierarchy_summary, staff_profile, detail_profile.
+    """
+    empty = {
+        "resolved_granularity": "Monthly",
+        "period_summary": pd.DataFrame(),
+        "department_summary": pd.DataFrame(),
+        "hierarchy_summary": pd.DataFrame(),
+        "staff_profile": pd.DataFrame(),
+        "detail_profile": pd.DataFrame(),
+        "resolved_category_col": category_col,
+    }
+    if len(df) == 0 or len(df_base) == 0:
+        return empty
+
+    resolved_granularity = _resolve_period_granularity(
+        requested_granularity, df, df_base
+    )
+    df_period = _attach_period_key(df, resolved_granularity)
+    df_base_period = _attach_period_key(df_base, resolved_granularity)
+    if len(df_period) == 0 or len(df_base_period) == 0:
+        empty["resolved_granularity"] = resolved_granularity
+        return empty
+
+    if "staff_name" not in df_period.columns or "staff_name" not in df_base_period.columns:
+        empty["resolved_granularity"] = resolved_granularity
+        return empty
+
+    for frame in [df_period, df_base_period]:
+        frame["staff_name"] = frame["staff_name"].fillna("Unknown Staff").astype(str)
+        if "hours_raw" not in frame.columns:
+            frame["hours_raw"] = 0.0
+        frame["hours_raw"] = pd.to_numeric(frame["hours_raw"], errors="coerce").fillna(0.0)
+
+    resolved_category_col = category_col if category_col in df_period.columns else "job_category"
+    if resolved_category_col not in df_period.columns:
+        df_period[resolved_category_col] = "Unspecified Category"
+
+    for col, fill_value in [
+        ("department_final", "Unspecified Department"),
+        (resolved_category_col, "Unspecified Category"),
+        ("task_name", "Unspecified Task"),
+    ]:
+        if col not in df_period.columns:
+            df_period[col] = fill_value
+        df_period[col] = df_period[col].fillna(fill_value).astype(str)
+
+    if "is_billable" in df_period.columns:
+        df_period["billable_hours_component"] = np.where(
+            df_period["is_billable"] == True, df_period["hours_raw"], 0.0
+        )
+    else:
+        df_period["billable_hours_component"] = 0.0
+    df_period["nonbillable_hours_component"] = (
+        df_period["hours_raw"] - df_period["billable_hours_component"]
+    )
+
+    agg_map = {
+        "hours_worked": ("hours_raw", "sum"),
+        "billable_hours": ("billable_hours_component", "sum"),
+        "nonbillable_hours": ("nonbillable_hours_component", "sum"),
+    }
+    if "job_no" in df_period.columns:
+        agg_map["jobs_touched"] = ("job_no", "nunique")
+
+    detail_group_cols = [
+        "staff_name",
+        "period_key",
+        "department_final",
+        resolved_category_col,
+        "task_name",
+    ]
+    slice_hours = df_period.groupby(detail_group_cols, dropna=False).agg(**agg_map).reset_index()
+
+    staff_period_totals = _compute_staff_period_totals(df_base_period)
+    if len(staff_period_totals) == 0:
+        empty["resolved_granularity"] = resolved_granularity
+        empty["resolved_category_col"] = resolved_category_col
+        return empty
+
+    period_weeks = 1.0 if resolved_granularity == "Weekly" else 4.33
+    staff_period_totals["period_capacity_hours_total"] = (
+        staff_period_totals["fte_scaling"] * period_weeks * config.CAPACITY_HOURS_PER_WEEK
+    )
+
+    allocation = slice_hours.merge(
+        staff_period_totals,
+        on=["staff_name", "period_key"],
+        how="left",
+    )
+    allocation["total_hours"] = pd.to_numeric(
+        allocation["total_hours"], errors="coerce"
+    ).fillna(0.0)
+    allocation["fte_scaling"] = pd.to_numeric(
+        allocation["fte_scaling"], errors="coerce"
+    ).fillna(config.DEFAULT_FTE_SCALING)
+    allocation["period_capacity_hours_total"] = pd.to_numeric(
+        allocation["period_capacity_hours_total"], errors="coerce"
+    ).fillna(allocation["fte_scaling"] * period_weeks * config.CAPACITY_HOURS_PER_WEEK)
+    allocation["hour_share"] = np.where(
+        allocation["total_hours"] > 0,
+        allocation["hours_worked"] / allocation["total_hours"],
+        0.0,
+    )
+    allocation["allocated_fte"] = allocation["fte_scaling"] * allocation["hour_share"]
+    allocation["allocated_capacity_hours"] = (
+        allocation["period_capacity_hours_total"] * allocation["hour_share"]
+    )
+    allocation["slack_hours"] = allocation["allocated_capacity_hours"] - allocation["hours_worked"]
+    allocation["utilisation_pct"] = np.where(
+        allocation["allocated_capacity_hours"] > 0,
+        allocation["hours_worked"] / allocation["allocated_capacity_hours"] * 100,
+        np.nan,
+    )
+    allocation["billable_share_pct"] = np.where(
+        allocation["hours_worked"] > 0,
+        allocation["billable_hours"] / allocation["hours_worked"] * 100,
+        np.nan,
+    )
+    allocation["active_job_count"] = allocation.get("jobs_touched", np.nan)
+
+    period_summary = allocation.groupby("period_key").agg(
+        staff_count=("staff_name", "nunique"),
+        fte_equiv=("allocated_fte", "sum"),
+        capacity_hours=("allocated_capacity_hours", "sum"),
+        hours_worked=("hours_worked", "sum"),
+        billable_hours=("billable_hours", "sum"),
+        nonbillable_hours=("nonbillable_hours", "sum"),
+    ).reset_index()
+    period_summary["utilisation_pct"] = np.where(
+        period_summary["capacity_hours"] > 0,
+        period_summary["hours_worked"] / period_summary["capacity_hours"] * 100,
+        np.nan,
+    )
+    period_summary["slack_hours"] = (
+        period_summary["capacity_hours"] - period_summary["hours_worked"]
+    )
+    period_summary["billable_share_pct"] = np.where(
+        period_summary["hours_worked"] > 0,
+        period_summary["billable_hours"] / period_summary["hours_worked"] * 100,
+        np.nan,
+    )
+    period_summary = period_summary.sort_values("period_key")
+
+    department_summary = allocation.groupby("department_final").agg(
+        contributing_staff=("staff_name", "nunique"),
+        periods_active=("period_key", "nunique"),
+        fte_equiv=("allocated_fte", "sum"),
+        capacity_hours=("allocated_capacity_hours", "sum"),
+        hours_worked=("hours_worked", "sum"),
+        billable_hours=("billable_hours", "sum"),
+        nonbillable_hours=("nonbillable_hours", "sum"),
+    ).reset_index()
+    department_summary["utilisation_pct"] = np.where(
+        department_summary["capacity_hours"] > 0,
+        department_summary["hours_worked"] / department_summary["capacity_hours"] * 100,
+        np.nan,
+    )
+    department_summary["slack_hours"] = (
+        department_summary["capacity_hours"] - department_summary["hours_worked"]
+    )
+    department_summary["billable_share_pct"] = np.where(
+        department_summary["hours_worked"] > 0,
+        department_summary["billable_hours"] / department_summary["hours_worked"] * 100,
+        np.nan,
+    )
+    department_summary = department_summary.sort_values("hours_worked", ascending=False)
+
+    hierarchy_summary = allocation.groupby(
+        ["department_final", resolved_category_col, "task_name"], dropna=False
+    ).agg(
+        contributing_staff=("staff_name", "nunique"),
+        periods_active=("period_key", "nunique"),
+        fte_equiv=("allocated_fte", "sum"),
+        capacity_hours=("allocated_capacity_hours", "sum"),
+        hours_worked=("hours_worked", "sum"),
+        billable_hours=("billable_hours", "sum"),
+        nonbillable_hours=("nonbillable_hours", "sum"),
+    ).reset_index()
+    hierarchy_summary["utilisation_pct"] = np.where(
+        hierarchy_summary["capacity_hours"] > 0,
+        hierarchy_summary["hours_worked"] / hierarchy_summary["capacity_hours"] * 100,
+        np.nan,
+    )
+    hierarchy_summary["slack_hours"] = (
+        hierarchy_summary["capacity_hours"] - hierarchy_summary["hours_worked"]
+    )
+    hierarchy_summary["billable_share_pct"] = np.where(
+        hierarchy_summary["hours_worked"] > 0,
+        hierarchy_summary["billable_hours"] / hierarchy_summary["hours_worked"] * 100,
+        np.nan,
+    )
+    hierarchy_summary = hierarchy_summary.sort_values("hours_worked", ascending=False)
+
+    staff_activity = allocation.groupby("staff_name").agg(
+        active_periods=("period_key", "nunique"),
+        departments_worked=("department_final", "nunique"),
+        categories_worked=(resolved_category_col, "nunique"),
+        tasks_worked=("task_name", "nunique"),
+        fte_equiv=("allocated_fte", "sum"),
+        capacity_hours_selected=("allocated_capacity_hours", "sum"),
+        hours_worked=("hours_worked", "sum"),
+        billable_hours=("billable_hours", "sum"),
+        nonbillable_hours=("nonbillable_hours", "sum"),
+    ).reset_index()
+    staff_capacity = staff_period_totals.groupby("staff_name").agg(
+        avg_fte_scaling=("fte_scaling", "mean"),
+        capacity_hours_window_total=("period_capacity_hours_total", "sum"),
+    ).reset_index()
+    staff_profile = staff_activity.merge(staff_capacity, on="staff_name", how="left")
+    staff_profile["weekly_capacity_hours"] = (
+        staff_profile["avg_fte_scaling"] * config.CAPACITY_HOURS_PER_WEEK
+    )
+    staff_profile["monthly_capacity_hours"] = (
+        staff_profile["avg_fte_scaling"] * 4.33 * config.CAPACITY_HOURS_PER_WEEK
+    )
+    staff_profile["utilisation_selected_pct"] = np.where(
+        staff_profile["capacity_hours_selected"] > 0,
+        staff_profile["hours_worked"] / staff_profile["capacity_hours_selected"] * 100,
+        np.nan,
+    )
+    staff_profile["utilisation_total_capacity_pct"] = np.where(
+        staff_profile["capacity_hours_window_total"] > 0,
+        staff_profile["hours_worked"] / staff_profile["capacity_hours_window_total"] * 100,
+        np.nan,
+    )
+    staff_profile["capacity_coverage_pct"] = np.where(
+        staff_profile["capacity_hours_window_total"] > 0,
+        staff_profile["capacity_hours_selected"] / staff_profile["capacity_hours_window_total"] * 100,
+        np.nan,
+    )
+    staff_profile = staff_profile.sort_values("hours_worked", ascending=False)
+
+    detail_profile = allocation.copy()
+    detail_profile["staff_period_hours"] = detail_profile.groupby(
+        ["staff_name", "period_key"]
+    )["hours_worked"].transform("sum")
+    detail_profile["staff_period_share_pct"] = np.where(
+        detail_profile["staff_period_hours"] > 0,
+        detail_profile["hours_worked"] / detail_profile["staff_period_hours"] * 100,
+        np.nan,
+    )
+    detail_profile = detail_profile.sort_values(
+        ["period_key", "staff_name", "hours_worked"], ascending=[False, True, False]
+    )
+
+    return {
+        "resolved_granularity": resolved_granularity,
+        "period_summary": period_summary,
+        "department_summary": department_summary,
+        "hierarchy_summary": hierarchy_summary,
+        "staff_profile": staff_profile,
+        "detail_profile": detail_profile,
+        "resolved_category_col": resolved_category_col,
+    }
+
+
 def compute_job_volume_deltas(
     df: pd.DataFrame, group_col: str, time_window: str
 ) -> pd.DataFrame:
@@ -2609,6 +2944,429 @@ High slack means unutilised capacity; negative slack indicates overload.
                         "Job Volume Δ": st.column_config.NumberColumn(format="%.1f%%"),
                         "Billable Ratio": st.column_config.NumberColumn(format="%.1f%%"),
                     },
+                )
+
+        st.markdown("#### 3.2) FTE Capacity Activity Mapping (Weekly/Monthly)")
+        st.caption(
+            "Top-down view of capacity vs worked hours, plus department -> category -> task allocation and "
+            "exportable FTE activity profiles for the selected drill window."
+        )
+
+        profile_ctrl_cols = st.columns([1, 1, 1])
+        with profile_ctrl_cols[0]:
+            requested_profile_granularity = st.selectbox(
+                "Period Granularity",
+                options=["Monthly", "Weekly"],
+                key="fte_profile_period_granularity",
+            )
+        with profile_ctrl_cols[1]:
+            hierarchy_rows_shown = st.slider(
+                "Hierarchy rows shown",
+                min_value=25,
+                max_value=500,
+                value=150,
+                step=25,
+                key="fte_profile_hierarchy_rows",
+            )
+        with profile_ctrl_cols[2]:
+            detail_rows_shown = st.slider(
+                "Detailed profile rows shown",
+                min_value=25,
+                max_value=600,
+                value=200,
+                step=25,
+                key="fte_profile_detail_rows",
+            )
+
+        profile_pack = build_fte_capacity_activity_profile(
+            drill_df,
+            df_base_window,
+            category_col=category_col,
+            requested_granularity=requested_profile_granularity,
+        )
+        resolved_profile_granularity = profile_pack["resolved_granularity"]
+        resolved_profile_category_col = profile_pack["resolved_category_col"]
+
+        if (
+            requested_profile_granularity == "Weekly"
+            and resolved_profile_granularity != "Weekly"
+        ):
+            st.info("Weekly view requires `work_date`; falling back to monthly profile mapping.")
+
+        period_profile = profile_pack["period_summary"]
+        dept_profile = profile_pack["department_summary"]
+        hierarchy_profile = profile_pack["hierarchy_summary"]
+        staff_profile = profile_pack["staff_profile"]
+        detail_profile = profile_pack["detail_profile"]
+
+        if len(period_profile) == 0 or len(detail_profile) == 0:
+            st.warning("Unable to build FTE activity profile for this drill selection.")
+        else:
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=period_profile["period_key"],
+                    y=period_profile["capacity_hours"],
+                    name="Allocated Capacity Hours",
+                    mode="lines+markers",
+                    line=dict(color="#4c78a8", width=2),
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=period_profile["period_key"],
+                    y=period_profile["hours_worked"],
+                    name="Hours Worked",
+                    mode="lines+markers",
+                    line=dict(color="#f58518", width=2),
+                )
+            )
+            fig.update_layout(
+                title=f"{resolved_profile_granularity} Top-Down: Capacity vs Hours Worked",
+                yaxis=dict(title="Hours"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            )
+            st.plotly_chart(fig, use_container_width=True, key="fte_profile_period_trend")
+
+            period_view = period_profile.rename(
+                columns={
+                    "period_key": "Period",
+                    "staff_count": "Contributing Staff",
+                    "fte_equiv": "FTE Equiv",
+                    "capacity_hours": "Capacity Hours",
+                    "hours_worked": "Hours Worked",
+                    "billable_hours": "Billable Hours",
+                    "nonbillable_hours": "Non-Billable Hours",
+                    "utilisation_pct": "Utilisation %",
+                    "slack_hours": "Slack Hours",
+                    "billable_share_pct": "Billable Share %",
+                }
+            )
+            st.markdown("**Top-Down Period Map**")
+            st.dataframe(
+                period_view,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Period": st.column_config.DateColumn(
+                        format="YYYY-MM-DD" if resolved_profile_granularity == "Weekly" else "YYYY-MM"
+                    ),
+                    "Contributing Staff": st.column_config.NumberColumn(format="%.0f"),
+                    "FTE Equiv": st.column_config.NumberColumn(format="%.2f"),
+                    "Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Hours Worked": st.column_config.NumberColumn(format="%.1f"),
+                    "Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Non-Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Utilisation %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Billable Share %": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+
+            st.markdown("**Hours Worked vs Capacity by Department**")
+            dept_view = dept_profile.rename(
+                columns={
+                    "department_final": "Department",
+                    "contributing_staff": "Contributing Staff",
+                    "periods_active": "Active Periods",
+                    "fte_equiv": "FTE Equiv",
+                    "capacity_hours": "Capacity Hours",
+                    "hours_worked": "Hours Worked",
+                    "billable_hours": "Billable Hours",
+                    "nonbillable_hours": "Non-Billable Hours",
+                    "utilisation_pct": "Utilisation %",
+                    "slack_hours": "Slack Hours",
+                    "billable_share_pct": "Billable Share %",
+                }
+            )
+            st.dataframe(
+                dept_view,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Contributing Staff": st.column_config.NumberColumn(format="%.0f"),
+                    "Active Periods": st.column_config.NumberColumn(format="%.0f"),
+                    "FTE Equiv": st.column_config.NumberColumn(format="%.2f"),
+                    "Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Hours Worked": st.column_config.NumberColumn(format="%.1f"),
+                    "Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Non-Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Utilisation %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Billable Share %": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+
+            hierarchy_ctrl_cols = st.columns([1, 1, 1])
+            dept_options = ["All"] + sorted(
+                hierarchy_profile["department_final"].dropna().unique().tolist()
+            )
+            with hierarchy_ctrl_cols[0]:
+                hierarchy_dept = st.selectbox(
+                    "Hierarchy Department",
+                    options=dept_options,
+                    key="fte_profile_hierarchy_dept",
+                )
+
+            filtered_hierarchy = hierarchy_profile.copy()
+            if hierarchy_dept != "All":
+                filtered_hierarchy = filtered_hierarchy[
+                    filtered_hierarchy["department_final"] == hierarchy_dept
+                ]
+
+            category_options = ["All"] + sorted(
+                filtered_hierarchy[resolved_profile_category_col].dropna().unique().tolist()
+            )
+            with hierarchy_ctrl_cols[1]:
+                hierarchy_category = st.selectbox(
+                    "Hierarchy Category",
+                    options=category_options,
+                    key="fte_profile_hierarchy_category",
+                )
+            if hierarchy_category != "All":
+                filtered_hierarchy = filtered_hierarchy[
+                    filtered_hierarchy[resolved_profile_category_col] == hierarchy_category
+                ]
+
+            sort_options = {
+                "Hours Worked": "hours_worked",
+                "Capacity Hours": "capacity_hours",
+                "Slack Hours": "slack_hours",
+            }
+            with hierarchy_ctrl_cols[2]:
+                hierarchy_sort = st.selectbox(
+                    "Sort By",
+                    options=list(sort_options.keys()),
+                    key="fte_profile_hierarchy_sort",
+                )
+
+            filtered_hierarchy = filtered_hierarchy.sort_values(
+                sort_options[hierarchy_sort], ascending=False
+            ).head(hierarchy_rows_shown)
+
+            st.markdown("**Granular Mapping: Department -> Category -> Task**")
+            hierarchy_view = filtered_hierarchy.rename(
+                columns={
+                    "department_final": "Department",
+                    resolved_profile_category_col: "Category",
+                    "task_name": "Task",
+                    "contributing_staff": "Contributing Staff",
+                    "periods_active": "Active Periods",
+                    "fte_equiv": "FTE Equiv",
+                    "capacity_hours": "Capacity Hours",
+                    "hours_worked": "Hours Worked",
+                    "billable_hours": "Billable Hours",
+                    "nonbillable_hours": "Non-Billable Hours",
+                    "utilisation_pct": "Utilisation %",
+                    "slack_hours": "Slack Hours",
+                    "billable_share_pct": "Billable Share %",
+                }
+            )
+            st.dataframe(
+                hierarchy_view,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Contributing Staff": st.column_config.NumberColumn(format="%.0f"),
+                    "Active Periods": st.column_config.NumberColumn(format="%.0f"),
+                    "FTE Equiv": st.column_config.NumberColumn(format="%.2f"),
+                    "Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Hours Worked": st.column_config.NumberColumn(format="%.1f"),
+                    "Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Non-Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Utilisation %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Billable Share %": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+
+            st.markdown("**Detailed FTE Window Profile (Who did what vs capacity)**")
+            staff_view = staff_profile.rename(
+                columns={
+                    "staff_name": "Staff",
+                    "active_periods": "Active Periods",
+                    "departments_worked": "Departments Worked",
+                    "categories_worked": "Categories Worked",
+                    "tasks_worked": "Tasks Worked",
+                    "avg_fte_scaling": "Avg FTE Scaling",
+                    "fte_equiv": "FTE Equiv (Selected)",
+                    "weekly_capacity_hours": "Weekly Capacity Hours",
+                    "monthly_capacity_hours": "Monthly Capacity Hours",
+                    "capacity_hours_window_total": "Window Capacity Hours (Total)",
+                    "capacity_hours_selected": "Window Capacity Hours (Selected)",
+                    "hours_worked": "Hours Worked",
+                    "billable_hours": "Billable Hours",
+                    "nonbillable_hours": "Non-Billable Hours",
+                    "utilisation_selected_pct": "Utilisation % (Selected)",
+                    "utilisation_total_capacity_pct": "Utilisation % (Total Capacity)",
+                    "capacity_coverage_pct": "Capacity Coverage %",
+                }
+            )
+            st.dataframe(
+                staff_view,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Active Periods": st.column_config.NumberColumn(format="%.0f"),
+                    "Departments Worked": st.column_config.NumberColumn(format="%.0f"),
+                    "Categories Worked": st.column_config.NumberColumn(format="%.0f"),
+                    "Tasks Worked": st.column_config.NumberColumn(format="%.0f"),
+                    "Avg FTE Scaling": st.column_config.NumberColumn(format="%.2f"),
+                    "FTE Equiv (Selected)": st.column_config.NumberColumn(format="%.2f"),
+                    "Weekly Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Monthly Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Window Capacity Hours (Total)": st.column_config.NumberColumn(format="%.1f"),
+                    "Window Capacity Hours (Selected)": st.column_config.NumberColumn(format="%.1f"),
+                    "Hours Worked": st.column_config.NumberColumn(format="%.1f"),
+                    "Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Non-Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Utilisation % (Selected)": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Utilisation % (Total Capacity)": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Capacity Coverage %": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+
+            detail_view_df = detail_profile.copy()
+            if hierarchy_dept != "All":
+                detail_view_df = detail_view_df[
+                    detail_view_df["department_final"] == hierarchy_dept
+                ]
+            if hierarchy_category != "All":
+                detail_view_df = detail_view_df[
+                    detail_view_df[resolved_profile_category_col] == hierarchy_category
+                ]
+            staff_options = sorted(detail_view_df["staff_name"].dropna().unique().tolist())
+            selected_staff_detail = st.multiselect(
+                "Detailed profile staff filter (optional)",
+                options=staff_options,
+                key="fte_profile_detail_staff",
+            )
+            if selected_staff_detail:
+                detail_view_df = detail_view_df[
+                    detail_view_df["staff_name"].isin(selected_staff_detail)
+                ]
+            detail_view_df = detail_view_df.head(detail_rows_shown)
+            detail_view = detail_view_df.rename(
+                columns={
+                    "period_key": "Period",
+                    "staff_name": "Staff",
+                    "department_final": "Department",
+                    resolved_profile_category_col: "Category",
+                    "task_name": "Task",
+                    "hours_worked": "Hours Worked",
+                    "billable_hours": "Billable Hours",
+                    "nonbillable_hours": "Non-Billable Hours",
+                    "allocated_capacity_hours": "Allocated Capacity Hours",
+                    "period_capacity_hours_total": "Staff Period Capacity Hours (Total)",
+                    "total_hours": "Staff Period Hours (Total)",
+                    "hour_share": "Hour Share",
+                    "allocated_fte": "Allocated FTE",
+                    "utilisation_pct": "Utilisation %",
+                    "slack_hours": "Slack Hours",
+                    "billable_share_pct": "Billable Share %",
+                    "staff_period_share_pct": "Staff Period Share %",
+                    "active_job_count": "Jobs Touched",
+                }
+            )
+            st.markdown("**Detailed FTE Activity Profile (Period x Department x Category x Task)**")
+            st.dataframe(
+                detail_view,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Period": st.column_config.DateColumn(
+                        format="YYYY-MM-DD" if resolved_profile_granularity == "Weekly" else "YYYY-MM"
+                    ),
+                    "Hours Worked": st.column_config.NumberColumn(format="%.1f"),
+                    "Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Non-Billable Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Allocated Capacity Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Staff Period Capacity Hours (Total)": st.column_config.NumberColumn(format="%.1f"),
+                    "Staff Period Hours (Total)": st.column_config.NumberColumn(format="%.1f"),
+                    "Hour Share": st.column_config.NumberColumn(format="%.2f"),
+                    "Allocated FTE": st.column_config.NumberColumn(format="%.2f"),
+                    "Utilisation %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Slack Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Billable Share %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Staff Period Share %": st.column_config.NumberColumn(format="%.1f%%"),
+                    "Jobs Touched": st.column_config.NumberColumn(format="%.0f"),
+                },
+            )
+
+            scope_for_filename = str(selected_dept).replace(" ", "_").replace("/", "-")
+            export_suffix = (
+                f"{resolved_profile_granularity.lower()}_{time_window}_{scope_for_filename.lower()}"
+            )
+
+            export_cols = st.columns(4)
+            with export_cols[0]:
+                st.download_button(
+                    "Export Period Map CSV",
+                    data=period_view.to_csv(index=False),
+                    file_name=f"fte_period_map_{export_suffix}.csv",
+                    mime="text/csv",
+                    key="fte_export_period_map",
+                )
+            with export_cols[1]:
+                st.download_button(
+                    "Export Dept-Category-Task CSV",
+                    data=hierarchy_profile.rename(
+                        columns={
+                            "department_final": "Department",
+                            resolved_profile_category_col: "Category",
+                            "task_name": "Task",
+                            "contributing_staff": "Contributing Staff",
+                            "periods_active": "Active Periods",
+                            "fte_equiv": "FTE Equiv",
+                            "capacity_hours": "Capacity Hours",
+                            "hours_worked": "Hours Worked",
+                            "billable_hours": "Billable Hours",
+                            "nonbillable_hours": "Non-Billable Hours",
+                            "utilisation_pct": "Utilisation %",
+                            "slack_hours": "Slack Hours",
+                            "billable_share_pct": "Billable Share %",
+                        }
+                    ).to_csv(index=False),
+                    file_name=f"fte_dept_category_task_profile_{export_suffix}.csv",
+                    mime="text/csv",
+                    key="fte_export_hierarchy",
+                )
+            with export_cols[2]:
+                st.download_button(
+                    "Export FTE Window Profile CSV",
+                    data=staff_view.to_csv(index=False),
+                    file_name=f"fte_window_profile_{export_suffix}.csv",
+                    mime="text/csv",
+                    key="fte_export_staff_window",
+                )
+            with export_cols[3]:
+                st.download_button(
+                    "Export Detailed FTE Activity CSV",
+                    data=detail_profile.rename(
+                        columns={
+                            "period_key": "Period",
+                            "staff_name": "Staff",
+                            "department_final": "Department",
+                            resolved_profile_category_col: "Category",
+                            "task_name": "Task",
+                            "hours_worked": "Hours Worked",
+                            "billable_hours": "Billable Hours",
+                            "nonbillable_hours": "Non-Billable Hours",
+                            "allocated_capacity_hours": "Allocated Capacity Hours",
+                            "period_capacity_hours_total": "Staff Period Capacity Hours (Total)",
+                            "total_hours": "Staff Period Hours (Total)",
+                            "hour_share": "Hour Share",
+                            "allocated_fte": "Allocated FTE",
+                            "utilisation_pct": "Utilisation %",
+                            "slack_hours": "Slack Hours",
+                            "billable_share_pct": "Billable Share %",
+                            "staff_period_share_pct": "Staff Period Share %",
+                            "active_job_count": "Jobs Touched",
+                        }
+                    ).to_csv(index=False),
+                    file_name=f"fte_activity_detail_{export_suffix}.csv",
+                    mime="text/csv",
+                    key="fte_export_detail",
                 )
 
     # =========================================================================
