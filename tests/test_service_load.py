@@ -270,6 +270,15 @@ def test_compute_staff_task_capacity_flow():
                     "hours_raw": 6,
                 },
                 {
+                    "staff_name": "Alice",
+                    "job_no": "J010",
+                    "job_name": "Client A Retainer",
+                    "client": "Client A",
+                    "task_name": "Scheduling",
+                    "month_key": m,
+                    "hours_raw": 5,
+                },
+                {
                     "staff_name": "Bob",
                     "job_no": "J013",
                     "job_name": "Other Work",
@@ -302,6 +311,8 @@ def test_compute_staff_task_capacity_flow():
     copy_detail = detail[detail["task_name"] == "Copywriting"]
     assert set(copy_detail["job_no"]) == {"J010", "J011"}
     assert copy_detail["share_of_task_pct"].sum() == pytest.approx(100.0, rel=1e-6)
+    copy_j010 = copy_detail[copy_detail["job_no"] == "J010"].iloc[0]
+    assert copy_j010["share_of_job_pct"] == pytest.approx(66.6666, rel=1e-3)
 
 
 def test_compute_staff_task_capacity_flow_multiple_staff():

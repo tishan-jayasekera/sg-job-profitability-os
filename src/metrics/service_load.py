@@ -797,6 +797,7 @@ def compute_staff_task_capacity_flow(
         "total_hours",
         "hours_per_month",
         "share_of_task_pct",
+        "share_of_job_pct",
         "share_of_staff_scope_pct",
     ]
 
@@ -880,6 +881,14 @@ def compute_staff_task_capacity_flow(
         0.0,
     )
 
+    job_totals = task_job_df.groupby("job_no", dropna=False)["total_hours"].sum().rename("job_total")
+    task_job_df = task_job_df.merge(job_totals.reset_index(), on="job_no", how="left")
+    task_job_df["share_of_job_pct"] = np.where(
+        task_job_df["job_total"] > 0,
+        task_job_df["total_hours"] / task_job_df["job_total"] * 100,
+        0.0,
+    )
+
     top_driver = task_job_df.sort_values(["task_name", "total_hours"], ascending=[True, False]).drop_duplicates(
         subset=["task_name"]
     )
@@ -898,5 +907,5 @@ def compute_staff_task_capacity_flow(
     task_summary = task_summary.sort_values("total_hours", ascending=False)
     task_job_df = task_job_df.sort_values(["task_name", "total_hours"], ascending=[True, False])
 
-    task_job_df = task_job_df.drop(columns=["task_total"], errors="ignore")
+    task_job_df = task_job_df.drop(columns=["task_total", "job_total"], errors="ignore")
     return task_summary[summary_cols], task_job_df[detail_cols]

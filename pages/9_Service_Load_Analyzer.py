@@ -3,8 +3,10 @@ Service Load Analyzer page.
 """
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import sys
+import zipfile
 from typing import Dict
 
 import numpy as np
@@ -100,6 +102,8 @@ def _unique_truncated_label_map(values: list[str], max_len: int = 40) -> dict[st
 
     for raw in values:
         text = str(raw)
+        if text in mapping:
+            continue
         base = _truncate_text(text, max_len=max_len)
         label = base
         suffix_idx = 2
@@ -139,6 +143,43 @@ def _render_explainer_expander(
     st.markdown(f"**ℹ️ {title}**")
     for point in points:
         st.markdown(f"- {point}")
+
+
+def _filter_to_export_window(df: pd.DataFrame, lookback_months: int) -> pd.DataFrame:
+    out = df.copy()
+    if lookback_months <= 0:
+        return out.iloc[0:0].copy()
+
+    if "month_key" in out.columns:
+        month_ts = pd.to_datetime(out["month_key"], errors="coerce")
+    elif "work_date" in out.columns:
+        month_ts = pd.to_datetime(out["work_date"], errors="coerce")
+    else:
+        return out
+
+    month_period = month_ts.dt.to_period("M")
+    valid = month_period.dropna()
+    if len(valid) == 0:
+        return out.iloc[0:0].copy()
+
+    end_period = valid.max()
+    start_period = end_period - (lookback_months - 1)
+    mask = (month_period >= start_period) & (month_period <= end_period)
+    return out[mask].copy()
+
+
+def _build_data_zip(file_map: Dict[str, pd.DataFrame]) -> bytes:
+    """
+    Build an in-memory zip containing each dataframe as CSV.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for filename, df_part in file_map.items():
+            part = df_part.copy()
+            if isinstance(part.columns, pd.MultiIndex):
+                part.columns = ["__".join([str(c) for c in col if str(c) != ""]) for col in part.columns]
+            zf.writestr(filename, part.to_csv(index=False))
+    return buffer.getvalue()
 
 
 def _staff_load_display(staff_df: pd.DataFrame, scope_budget: float) -> pd.io.formats.style.Styler:
@@ -698,12 +739,16 @@ def main() -> None:
 
         max_top_n = int(min(25, len(task_breakdown_df)))
         default_top_n = int(min(12, max_top_n))
-        top_n_tasks = st.slider(
-            "Top tasks to display",
-            min_value=1,
-            max_value=max_top_n,
-            value=default_top_n,
-        )
+        if max_top_n <= 1:
+            top_n_tasks = 1
+            st.caption("Only one scoped task is available for this selection.")
+        else:
+            top_n_tasks = st.slider(
+                "Top tasks to display",
+                min_value=1,
+                max_value=max_top_n,
+                value=default_top_n,
+            )
 
         chart_df = task_breakdown_df.head(top_n_tasks).copy().sort_values("hours_per_month", ascending=True)
         chart_df["task_label"] = chart_df["task_name"].astype(str).apply(lambda x: _truncate_text(x, max_len=42))
@@ -803,63 +848,118 @@ def main() -> None:
         }
     )
 
-    with st.container(border=True):
-        if len(selected_staff_list) == 1:
-            client_breakdown = compute_staff_client_breakdown(
+    if len(selected_staff_list) == 1:
+        client_breakdown = compute_staff_client_breakdown(
+            df,
+            staff_name=selected_staff_list[0],
+            scope_mask=scope_mask,
+            lookback_months=lookback_months,
+        )
+    else:
+        client_parts = []
+        for staff_name in selected_staff_list:
+            part = compute_staff_client_breakdown(
                 df,
-                staff_name=selected_staff_list[0],
+                staff_name=staff_name,
                 scope_mask=scope_mask,
                 lookback_months=lookback_months,
             )
+            if len(part) > 0:
+                client_parts.append(part)
+        if len(client_parts) == 0:
+            client_breakdown = pd.DataFrame(
+                columns=[
+                    "client",
+                    "job_no",
+                    "job_name",
+                    "job_category",
+                    "total_hours",
+                    "in_scope_hours",
+                    "out_of_scope_hours",
+                    "hours_per_month",
+                    "share_of_staff_total_pct",
+                    "is_in_scope",
+                ]
+            )
         else:
-            client_parts = []
-            for staff_name in selected_staff_list:
-                part = compute_staff_client_breakdown(
-                    df,
-                    staff_name=staff_name,
-                    scope_mask=scope_mask,
-                    lookback_months=lookback_months,
+            combined_client = pd.concat(client_parts, ignore_index=True)
+            client_breakdown = (
+                combined_client.groupby(
+                    ["client", "job_no", "job_name", "job_category"],
+                    dropna=False,
                 )
-                if len(part) > 0:
-                    client_parts.append(part)
-            if len(client_parts) == 0:
-                client_breakdown = pd.DataFrame(
-                    columns=[
-                        "client",
-                        "job_no",
-                        "job_name",
-                        "job_category",
-                        "total_hours",
-                        "in_scope_hours",
-                        "out_of_scope_hours",
-                        "hours_per_month",
-                        "share_of_staff_total_pct",
-                        "is_in_scope",
-                    ]
+                .agg(
+                    total_hours=("total_hours", "sum"),
+                    in_scope_hours=("in_scope_hours", "sum"),
+                    out_of_scope_hours=("out_of_scope_hours", "sum"),
+                    hours_per_month=("hours_per_month", "sum"),
                 )
-            else:
-                combined_client = pd.concat(client_parts, ignore_index=True)
-                client_breakdown = (
-                    combined_client.groupby(
-                        ["client", "job_no", "job_name", "job_category"],
-                        dropna=False,
-                    )
-                    .agg(
-                        total_hours=("total_hours", "sum"),
-                        in_scope_hours=("in_scope_hours", "sum"),
-                        out_of_scope_hours=("out_of_scope_hours", "sum"),
-                        hours_per_month=("hours_per_month", "sum"),
-                    )
-                    .reset_index()
-                )
-                total_combined_hours = float(client_breakdown["total_hours"].sum())
-                client_breakdown["share_of_staff_total_pct"] = np.where(
-                    total_combined_hours > 0,
-                    client_breakdown["total_hours"] / total_combined_hours * 100,
-                    0.0,
-                )
-                client_breakdown["is_in_scope"] = client_breakdown["in_scope_hours"] > 0
-                client_breakdown = client_breakdown.sort_values("total_hours", ascending=False)
+                .reset_index()
+            )
+            total_combined_hours = float(client_breakdown["total_hours"].sum())
+            client_breakdown["share_of_staff_total_pct"] = np.where(
+                total_combined_hours > 0,
+                client_breakdown["total_hours"] / total_combined_hours * 100,
+                0.0,
+            )
+            client_breakdown["is_in_scope"] = client_breakdown["in_scope_hours"] > 0
+            client_breakdown = client_breakdown.sort_values("total_hours", ascending=False)
+
+    staff_task_summary, staff_task_jobs = compute_staff_task_capacity_flow(
+        df,
+        staff_name=selected_staff_list,
+        scope_mask=scope_mask,
+        lookback_months=lookback_months,
+    )
+
+    scope_mask_aligned = pd.Series(scope_mask, index=df.index).fillna(False).astype(bool)
+    deep_dive_rows = df.copy()
+    deep_dive_rows["is_in_scope"] = scope_mask_aligned
+    deep_dive_rows = _filter_to_export_window(deep_dive_rows, lookback_months=lookback_months)
+    if "staff_name" in deep_dive_rows.columns:
+        deep_dive_rows = deep_dive_rows[deep_dive_rows["staff_name"].astype(str).isin(selected_staff_list)].copy()
+    deep_dive_scope_rows = deep_dive_rows[deep_dive_rows["is_in_scope"]].copy()
+
+    deep_dive_summary_export = pd.DataFrame(
+        [
+            {
+                "selected_staff": " | ".join(selected_staff_list),
+                "selected_staff_count": len(selected_staff_list),
+                "lookback_months": lookback_months,
+                "scope_budget_hours_per_month_per_staff": float(scope_budget),
+                "scope_budget_pool_hours_per_month": float(scope_budget) * len(selected_staff_list),
+                "in_scope_hours_per_month": selected_row["in_scope_hours_per_month"],
+                "out_of_scope_hours_per_month": selected_row["out_of_scope_hours_per_month"],
+                "capacity_used_pct": selected_row["capacity_used_pct"],
+                "scope_share_pct": selected_row["scope_share_pct"],
+                "headroom_hours_per_month": selected_row["headroom_hours_per_month"],
+                "absorption_estimate": selected_row["absorption_estimate"],
+            }
+        ]
+    )
+
+    deep_dive_export_zip = _build_data_zip(
+        {
+            "deep_dive_summary.csv": deep_dive_summary_export,
+            "selected_staff_load.csv": selected_staff_df,
+            "client_job_breakdown.csv": client_breakdown,
+            "staff_task_capacity_summary.csv": staff_task_summary,
+            "staff_task_constituent_jobs.csv": staff_task_jobs,
+            "timesheet_rows_selected_staff.csv": deep_dive_rows,
+            "timesheet_rows_selected_staff_scoped.csv": deep_dive_scope_rows,
+        }
+    )
+    st.download_button(
+        "Download Deep Dive Data (ZIP)",
+        data=deep_dive_export_zip,
+        file_name="service_load_selected_staff_deep_dive.zip",
+        mime="application/zip",
+    )
+    st.caption(
+        "Includes selected staff load, client/job breakdown, task capacity flow, task→job linkage, and raw scoped timesheet rows."
+    )
+
+    with st.container(border=True):
 
         st.markdown("**So What Summary**")
         summary = _build_staff_so_what_summary(selected_staff_label, selected_row, client_breakdown)
@@ -1015,12 +1115,6 @@ def main() -> None:
 
             st.markdown("**Staff Task Capacity Flow (Scoped Jobs)**")
             st.caption("Task-level view across selected staff and scoped jobs, with direct linkage back to contributing jobs.")
-            staff_task_summary, staff_task_jobs = compute_staff_task_capacity_flow(
-                df,
-                staff_name=selected_staff_list,
-                scope_mask=scope_mask,
-                lookback_months=lookback_months,
-            )
 
             if len(staff_task_summary) == 0:
                 st.info("No scoped task activity found for the selected staff in the selected window.")
@@ -1115,6 +1209,10 @@ def main() -> None:
                 if len(task_job_view) == 0:
                     st.info("No constituent job linkage found for scoped tasks.")
                 else:
+                    st.caption(
+                        "Clarity view: `Share of Task %` = within a task, how much each job contributes. "
+                        "`Share of Job %` = within a job, how much time each task consumes."
+                    )
                     budget_pool = float(scope_budget) * len(selected_staff_list) if float(scope_budget) > 0 else np.nan
                     scoped_task_hours_month = float(staff_task_summary["hours_per_month"].sum())
                     budget_used_pct = (
@@ -1139,32 +1237,42 @@ def main() -> None:
                     r4.caption("Scoped task hours divided by budget pool")
 
                     max_task_rows = int(min(12, len(staff_task_summary)))
-                    task_rows_to_show = st.slider(
-                        "Tasks shown in task-to-job stack",
-                        min_value=1,
-                        max_value=max_task_rows,
-                        value=max_task_rows,
-                        key=f"task_job_stack_rows_{len(selected_staff_list)}",
-                    )
+                    if max_task_rows <= 1:
+                        task_rows_to_show = 1
+                        st.caption("Only one task is available in this staff-level scoped view.")
+                    else:
+                        task_rows_to_show = st.slider(
+                            "Tasks shown in task-to-job stack",
+                            min_value=1,
+                            max_value=max_task_rows,
+                            value=max_task_rows,
+                            key=f"task_job_stack_rows_{len(selected_staff_list)}",
+                        )
                     shown_tasks = staff_task_summary.head(task_rows_to_show)["task_name"].astype(str).tolist()
                     shown_task_set = set(shown_tasks)
                     task_label_map = _unique_truncated_label_map(shown_tasks, max_len=40)
 
-                    stack_df = task_job_view[task_job_view["task_name"].astype(str).isin(shown_task_set)].copy()
-                    stack_df["task_label"] = stack_df["task_name"].astype(str).map(task_label_map)
-                    stack_df["job_label"] = (
-                        stack_df["client"].fillna("Unknown").astype(str)
+                    stack_source = task_job_view[task_job_view["task_name"].astype(str).isin(shown_task_set)].copy()
+                    stack_source["task_label"] = stack_source["task_name"].astype(str).map(task_label_map)
+                    stack_source["job_key"] = (
+                        stack_source["client"].fillna("Unknown").astype(str)
                         + " — "
-                        + stack_df["job_name"].fillna(stack_df["job_no"]).astype(str)
-                    ).apply(lambda x: _truncate_text(x, max_len=42))
+                        + stack_source["job_name"].fillna(stack_source["job_no"]).astype(str)
+                    )
+                    job_label_map = _unique_truncated_label_map(
+                        stack_source["job_key"].astype(str).tolist(),
+                        max_len=42,
+                    )
+                    stack_source["job_label"] = stack_source["job_key"].astype(str).map(job_label_map)
 
                     top_jobs = (
-                        stack_df.groupby("job_label", dropna=False)["hours_per_month"]
+                        stack_source.groupby("job_label", dropna=False)["hours_per_month"]
                         .sum()
                         .sort_values(ascending=False)
                         .head(12)
                         .index
                     )
+                    stack_df = stack_source.copy()
                     stack_df["job_group"] = np.where(
                         stack_df["job_label"].isin(top_jobs),
                         stack_df["job_label"],
@@ -1174,6 +1282,17 @@ def main() -> None:
                         stack_df.groupby(["task_label", "job_group"], dropna=False)["hours_per_month"]
                         .sum()
                         .reset_index()
+                    )
+                    task_totals_for_stack = stack_df.groupby("task_label", dropna=False)["hours_per_month"].sum()
+                    stack_df = stack_df.merge(
+                        task_totals_for_stack.rename("task_hours_total").reset_index(),
+                        on="task_label",
+                        how="left",
+                    )
+                    stack_df["share_of_task_pct"] = np.where(
+                        stack_df["task_hours_total"] > 0,
+                        stack_df["hours_per_month"] / stack_df["task_hours_total"] * 100,
+                        0.0,
                     )
 
                     task_order = [task_label_map[str(task)] for task in shown_tasks]
@@ -1198,9 +1317,11 @@ def main() -> None:
                                 x=sub["hours_per_month"],
                                 orientation="h",
                                 name=str(job_group),
+                                customdata=np.column_stack([sub["share_of_task_pct"]]),
                                 hovertemplate=(
                                     "%{y}<br>Constituent job: %{fullData.name}"
-                                    "<br>Hrs/Mo: %{x:.1f}<extra></extra>"
+                                    "<br>Hrs/Mo: %{x:.1f}"
+                                    "<br>Share of task: %{customdata[0]:.1f}%<extra></extra>"
                                 ),
                             )
                         )
@@ -1214,6 +1335,79 @@ def main() -> None:
                         legend_title_text="Scoped Jobs",
                     )
                     st.plotly_chart(fig_task_job_stack, use_container_width=True)
+
+                    top_job_labels = list(top_jobs)
+                    job_mix_df = stack_source[stack_source["job_label"].isin(top_job_labels)].copy()
+                    if len(job_mix_df) > 0:
+                        st.markdown("**Job Time Split by Task (%)**")
+                        st.caption("For each job, this shows what percentage of that job's selected-staff scoped time is spent on each task.")
+                        job_totals = job_mix_df.groupby("job_label", dropna=False)["hours_per_month"].sum()
+                        job_mix_df = job_mix_df.merge(
+                            job_totals.rename("job_hours_total").reset_index(),
+                            on="job_label",
+                            how="left",
+                        )
+                        job_mix_df["share_of_job_pct"] = np.where(
+                            job_mix_df["job_hours_total"] > 0,
+                            job_mix_df["hours_per_month"] / job_mix_df["job_hours_total"] * 100,
+                            0.0,
+                        )
+
+                        job_order = (
+                            job_mix_df.groupby("job_label", dropna=False)["hours_per_month"]
+                            .sum()
+                            .sort_values(ascending=True)
+                            .index
+                        )
+                        task_order_for_job_view = [
+                            task_label_map[str(task)] for task in shown_tasks if str(task) in task_label_map
+                        ]
+                        fig_job_task_mix = go.Figure()
+                        for task_label in task_order_for_job_view:
+                            sub = job_mix_df[job_mix_df["task_label"] == task_label]
+                            if len(sub) == 0:
+                                continue
+                            fig_job_task_mix.add_trace(
+                                go.Bar(
+                                    y=sub["job_label"],
+                                    x=sub["share_of_job_pct"],
+                                    orientation="h",
+                                    name=str(task_label),
+                                    customdata=np.column_stack([sub["hours_per_month"]]),
+                                    hovertemplate=(
+                                        "%{y}<br>Task: %{fullData.name}"
+                                        "<br>Share of job: %{x:.1f}%"
+                                        "<br>Hrs/Mo: %{customdata[0]:.1f}<extra></extra>"
+                                    ),
+                                )
+                            )
+                        fig_job_task_mix.update_layout(
+                            barmode="stack",
+                            template="plotly_white",
+                            margin=PLOT_MARGINS,
+                            xaxis_title="% of Job Time",
+                            yaxis_title="Constituent Job",
+                            yaxis=dict(categoryorder="array", categoryarray=list(job_order)),
+                            legend_title_text="Task",
+                        )
+                        st.plotly_chart(fig_job_task_mix, use_container_width=True)
+
+                    task_job_table = stack_source.copy().sort_values(
+                        ["job_label", "hours_per_month"],
+                        ascending=[True, False],
+                    )
+                    task_job_table["share_of_job_pct"] = task_job_table["share_of_job_pct"].fillna(0.0)
+                    task_job_table_view = pd.DataFrame(
+                        {
+                            "Job": task_job_table["job_label"].astype(str),
+                            "Task": task_job_table["task_label"].astype(str),
+                            "Hrs/Mo": task_job_table["hours_per_month"].apply(fmt_hours),
+                            "Share of Task %": task_job_table["share_of_task_pct"].apply(fmt_percent),
+                            "Share of Job %": task_job_table["share_of_job_pct"].apply(fmt_percent),
+                            "Share of Scoped Load %": task_job_table["share_of_staff_scope_pct"].apply(fmt_percent),
+                        }
+                    )
+                    st.dataframe(task_job_table_view, use_container_width=True, hide_index=True)
 
                     task_recon = staff_task_summary.copy()
                     if pd.notna(budget_pool) and budget_pool > 0:
