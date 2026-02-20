@@ -788,7 +788,7 @@ def render_recurring_task_overruns_section(
     if "Revenue at risk ($)" in task_table.columns:
         task_formatters["Revenue at risk ($)"] = lambda x: fmt_currency(x) if pd.notna(x) else "—"
 
-    styled_task = task_table.style.format(task_formatters).background_gradient(subset=["Overrun rate"], cmap="Reds")
+    styled_task = task_table.style.format(task_formatters)
 
     st.markdown("**Recurring Margin-Leak Tasks**")
     st.dataframe(styled_task, use_container_width=True, hide_index=True)
