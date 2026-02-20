@@ -22,8 +22,9 @@ from src.data.semantic import get_category_col, safe_quote_job_task
 from src.metrics.quote_delivery import (
     compute_task_overrun_consistency,
     get_overrun_jobs_for_task,
+    compute_scope_creep,
 )
-from src.ui.formatting import fmt_currency
+from src.ui.formatting import fmt_currency, build_job_name_lookup, format_job_label
 
 
 st.set_page_config(
@@ -420,11 +421,26 @@ def _show_actions(task_scope: pd.DataFrame, selected_task_row: pd.Series):
     rule_1_trigger = overrun_rate >= 0.60 and avg_overrun_pct >= 0.20
 
     mismatch_share = np.nan
-    rule_2_evaluable = "quote_match_flag" in task_scope.columns and not task_scope.empty
+    rule_2_evaluable = False
     rule_2_trigger = False
-    if rule_2_evaluable:
-        mismatch_share = task_scope["quote_match_flag"].astype(str).str.lower().ne("matched").mean()
-        rule_2_trigger = mismatch_share >= 0.20
+
+    unquoted_hours = np.nan
+    unquoted_share = np.nan
+    if not task_scope.empty and "hours_raw" in task_scope.columns:
+        scope_creep_df = compute_scope_creep(task_scope)
+        if not scope_creep_df.empty and "unquoted_share" in scope_creep_df.columns:
+            unquoted_hours = float(scope_creep_df["unquoted_hours"].iloc[0]) if "unquoted_hours" in scope_creep_df.columns else np.nan
+            unquoted_share = float(scope_creep_df["unquoted_share"].iloc[0]) / 100.0
+            rule_2_evaluable = True
+            rule_2_trigger = unquoted_share >= 0.20
+
+    if "quote_match_flag" in task_scope.columns and not task_scope.empty:
+        flag = task_scope["quote_match_flag"].astype("string").str.strip().str.lower()
+        valid = flag.notna() & flag.ne("")
+        if valid.any():
+            mismatch_share = flag[valid].ne("matched").mean()
+            rule_2_evaluable = True
+            rule_2_trigger = rule_2_trigger or (mismatch_share >= 0.20)
 
     quote_rate = np.nan
     realised_rate = np.nan
@@ -462,14 +478,37 @@ def _show_actions(task_scope: pd.DataFrame, selected_task_row: pd.Series):
     )
 
     if rule_2_evaluable and rule_2_trigger:
-        card_2_body = (
-            f"{mismatch_share * 100:.0f}% of task rows are not quote-matched. Enforce variation approval before extra "
-            "delivery effort and track exceptions weekly."
-        )
+        if pd.notna(unquoted_share):
+            card_2_body = (
+                f"Unquoted delivery is {unquoted_share * 100:.0f}% of task hours "
+                f"({unquoted_hours:,.1f}h). Enforce variation approval before extra delivery effort "
+                "and track exceptions weekly."
+            )
+        elif pd.notna(mismatch_share):
+            card_2_body = (
+                f"{mismatch_share * 100:.0f}% of quote-match-flagged rows are not matched. "
+                "Enforce variation approval before extra delivery effort and track exceptions weekly."
+            )
+        else:
+            card_2_body = (
+                "Scope creep signal is elevated. Enforce variation approval before extra delivery effort "
+                "and track exceptions weekly."
+            )
     elif rule_2_evaluable:
-        card_2_body = (
-            f"Quote mismatch share is {mismatch_share * 100:.0f}%. Keep change-control gates active and review mismatches monthly."
-        )
+        if pd.notna(unquoted_share):
+            card_2_body = (
+                f"Unquoted delivery is {unquoted_share * 100:.0f}% of task hours. "
+                "Keep change-control gates active and review scope deviations monthly."
+            )
+        elif pd.notna(mismatch_share):
+            card_2_body = (
+                f"Quote mismatch share is {mismatch_share * 100:.0f}%. "
+                "Keep change-control gates active and review mismatches monthly."
+            )
+        else:
+            card_2_body = (
+                "Scope control is stable now; keep variation approvals and monthly exception reviews in place."
+            )
     else:
         card_2_body = "Introduce scope variation control with mandatory approval and a weekly scope-change log."
 
@@ -574,6 +613,7 @@ def render_recurring_task_overruns_section(
         category=category,
         time_window=time_window,
     )
+    job_name_lookup = build_job_name_lookup(scoped_for_detail, "job_no", "job_name")
 
     top_rows = task_overruns.head(2)
     if has_cost and top_rows["total_overrun_cost"].notna().any():
@@ -832,7 +872,9 @@ def render_recurring_task_overruns_section(
         chart_label = "Overrun cost ($)" if chart_col_metric == "overrun_cost" else "Overrun hours"
 
         jobs_chart_df = top_jobs.head(10).copy()
-        jobs_chart_df["job_label"] = jobs_chart_df["job_no"].astype(str)
+        jobs_chart_df["job_label"] = jobs_chart_df["job_no"].apply(
+            lambda x: format_job_label(x, job_name_lookup)
+        )
         if client_col:
             jobs_chart_df["job_label"] = jobs_chart_df["job_label"] + " | " + jobs_chart_df[client_col].fillna("—").astype(str)
 
@@ -858,7 +900,7 @@ def render_recurring_task_overruns_section(
             )
 
         jobs_table = pd.DataFrame({
-            "Job": top_jobs["job_no"].astype(str),
+            "Job": top_jobs["job_no"].apply(lambda x: format_job_label(x, job_name_lookup)),
             "Quoted hours": top_jobs["quoted_hours"],
             "Actual hours": top_jobs["actual_hours"],
             "Overrun hours": top_jobs["overrun_hours"],
