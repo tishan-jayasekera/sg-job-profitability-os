@@ -45,10 +45,47 @@ COLORS = {
     "warn_soft": "#fef2f2",
 }
 
+PAGE_FACT_COLUMNS = (
+    "department_final",
+    "category_rev_job",
+    "job_category",
+    "category_rev_job_month",
+    "job_no",
+    "job_name",
+    "task_name",
+    "staff_name",
+    "hours_raw",
+    "base_cost",
+    "rev_alloc",
+    "quoted_time_total",
+    "quoted_amount_total",
+    "quote_match_flag",
+    "month_key",
+    "work_date",
+    "client_name",
+    "client_group",
+)
+
+NUMERIC_FACT_COLUMNS = (
+    "hours_raw",
+    "base_cost",
+    "rev_alloc",
+    "quoted_time_total",
+    "quoted_amount_total",
+)
+
 
 @st.cache_data(show_spinner=False)
 def load_data() -> pd.DataFrame:
-    return load_fact_timesheet()
+    df = load_fact_timesheet(columns=PAGE_FACT_COLUMNS)
+    if df.empty:
+        return df
+
+    for col in NUMERIC_FACT_COLUMNS:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce", downcast="float")
+
+    return df
 
 
 def inject_theme() -> None:
@@ -289,7 +326,7 @@ def compute_overrun_trend(
         window_start = (month_ts - pd.DateOffset(months=max(rolling_months, 1) - 1)).replace(day=1)
         window_end = month_ts + pd.offsets.MonthEnd(0)
 
-        window_df = scoped[(scoped[date_col] >= window_start) & (scoped[date_col] <= window_end)].copy()
+        window_df = scoped[(scoped[date_col] >= window_start) & (scoped[date_col] <= window_end)]
         if window_df.empty:
             continue
 
@@ -310,14 +347,10 @@ def compute_overrun_trend(
             else np.nan
         )
 
-        task_overruns = compute_task_overrun_consistency(
-            window_df,
-            department=None,
-            category=None,
-            time_window="all",
-            min_jobs_with_quote=min_jobs_with_quote,
-            min_overrun_rate=min_overrun_rate,
-        )
+        task_overruns = all_task_overruns[
+            (all_task_overruns["jobs_with_quote"] >= min_jobs_with_quote)
+            & (all_task_overruns["overrun_rate"] >= min_overrun_rate)
+        ].copy()
 
         if task_overruns.empty:
             rows.append(
@@ -1001,7 +1034,12 @@ def render_recurring_task_overruns_section(
     if "Revenue at risk ($)" in task_table.columns:
         task_formatters["Revenue at risk ($)"] = lambda x: fmt_currency(x) if pd.notna(x) else "—"
 
-    styled_task = task_table.style.format(task_formatters)
+    max_task_rows = 200
+    task_table_display = task_table.head(max_task_rows).copy()
+    if len(task_table) > max_task_rows:
+        st.caption(f"Showing top {max_task_rows} tasks. Narrow filters to inspect fewer rows.")
+
+    styled_task = task_table_display.style.format(task_formatters)
 
     st.markdown("**Recurring Margin-Leak Tasks**")
     st.dataframe(styled_task, use_container_width=True, hide_index=True)
@@ -1309,15 +1347,17 @@ def main() -> None:
         st.info("Department data is not available in this dataset.")
         st.stop()
 
-    dept_options = sorted(df["department_final"].dropna().astype(str).unique().tolist())
+    dept_series = df["department_final"].astype("string")
+    dept_options = sorted(dept_series.dropna().unique().tolist())
 
     top_left, top_right = st.columns([1.4, 1.0])
     with top_left:
         dept = st.selectbox("Department", options=dept_options, index=0)
+    dept_mask = (dept_series == str(dept)).fillna(False)
     with top_right:
-        st.metric("Rows in selected department", f"{int((df['department_final'].astype(str) == str(dept)).sum()):,}")
+        st.metric("Rows in selected department", f"{int(dept_mask.sum()):,}")
 
-    df_dept = df[df["department_final"].astype(str) == str(dept)].copy()
+    df_dept = df.loc[dept_mask]
 
     tabs = st.tabs([
         "Level 1: Department Diagnostic",
@@ -1328,7 +1368,7 @@ def main() -> None:
         render_recurring_task_overruns_section(
             df_scope=df_dept,
             scope_label=f"Department: {dept}",
-            department=dept,
+            department=None,
             category=None,
         )
 
@@ -1360,7 +1400,7 @@ def main() -> None:
         render_recurring_task_overruns_section(
             df_scope=df_dept,
             scope_label=f"Category: {dept} : {selected_category_label}",
-            department=dept,
+            department=None,
             category=selected_category_value,
         )
 
