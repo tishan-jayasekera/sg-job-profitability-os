@@ -154,40 +154,6 @@ def _filter_scope(
     return scoped
 
 
-def _build_bulk_export_df(
-    sections: Dict[str, pd.DataFrame],
-    metadata: Dict[str, object],
-) -> pd.DataFrame:
-    export_frames: list[pd.DataFrame] = []
-    col_order = ["section"] + list(metadata.keys())
-
-    for section_name, section_df in sections.items():
-        if section_df is None or section_df.empty:
-            continue
-
-        section = section_df.copy()
-        section["section"] = section_name
-        for meta_col, meta_val in metadata.items():
-            section[meta_col] = meta_val
-
-        ordered = [c for c in col_order if c in section.columns]
-        remaining = [c for c in section.columns if c not in ordered]
-        section = section[ordered + remaining]
-        export_frames.append(section)
-
-        for col in section.columns:
-            if col not in col_order:
-                col_order.append(col)
-
-    if not export_frames:
-        return pd.DataFrame()
-
-    return pd.concat(
-        [frame.reindex(columns=col_order) for frame in export_frames],
-        ignore_index=True,
-    )
-
-
 def _format_signed_pct(value: float) -> str:
     if pd.isna(value):
         return "—"
@@ -482,9 +448,9 @@ def _render_trend_reconciliation(
     trend_df: pd.DataFrame,
     has_cost: bool,
     scope_key: Optional[str] = None,
-) -> pd.DataFrame:
+) -> None:
     if trend_df.empty:
-        return pd.DataFrame()
+        return
 
     use_cost = has_cost and "total_overrun_cost" in trend_df.columns and trend_df["total_overrun_cost"].notna().any()
 
@@ -582,7 +548,6 @@ def _render_trend_reconciliation(
             ),
         )
         st.dataframe(style, use_container_width=True, hide_index=True)
-    return recon
 
 
 def _trend_signal_text(trend_df: pd.DataFrame, has_cost: bool) -> tuple[str, str]:
@@ -821,10 +786,6 @@ def render_recurring_task_overruns_section(
         time_window=time_window,
     )
     job_name_lookup = build_job_name_lookup(scoped_for_detail, "job_no", "job_name")
-    trend_recon_df = pd.DataFrame()
-    staff_table_export = pd.DataFrame()
-    staff_job_trace_export = pd.DataFrame()
-    selected_staff_label: Optional[str] = None
 
     top_rows = task_overruns.head(2)
     if has_cost and top_rows["total_overrun_cost"].notna().any():
@@ -971,11 +932,7 @@ def render_recurring_task_overruns_section(
                     f"How calculated: total overrun hours are summed across threshold-passing tasks in each "
                     f"{rolling_months}-month rolling window."
                 )
-        trend_recon_df = _render_trend_reconciliation(
-            trend_df,
-            has_cost=has_cost,
-            scope_key=scope_key,
-        )
+        _render_trend_reconciliation(trend_df, has_cost=has_cost, scope_key=scope_key)
 
     c1, c2 = st.columns([1.2, 1.0])
     with c1:
@@ -1206,7 +1163,6 @@ def render_recurring_task_overruns_section(
                 np.nan,
             )
             staff_table = staff_summary.sort_values("hours", ascending=False).head(12).copy()
-            staff_table_export = staff_table.copy()
             staff_table["Staff"] = staff_table["staff_name"].fillna("(Unassigned)").astype(str)
 
             st.markdown("**Who drives it: top contributing staff**")
@@ -1256,7 +1212,6 @@ def render_recurring_task_overruns_section(
                     format_func=lambda idx: str(trace_source.loc[idx, "Staff"]),
                     key=f"overrun_staff_trace_{scope_key}",
                 )
-                selected_staff_label = str(trace_source.loc[selected_staff_idx, "Staff"])
                 selected_staff_name = trace_source.loc[selected_staff_idx, "staff_name"]
 
                 if pd.isna(selected_staff_name):
@@ -1324,54 +1279,6 @@ def render_recurring_task_overruns_section(
                             }
                         )
                         st.dataframe(styled_staff_job, use_container_width=True, hide_index=True)
-                        staff_job_trace_export = staff_job_display.copy()
-
-    export_date_col = (
-        "month_key"
-        if "month_key" in scoped_for_detail.columns
-        else "work_date"
-        if "work_date" in scoped_for_detail.columns
-        else None
-    )
-    period_tag = "all"
-    if export_date_col and not scoped_for_detail.empty:
-        export_dates = pd.to_datetime(scoped_for_detail[export_date_col], errors="coerce").dropna()
-        if not export_dates.empty:
-            period_tag = f"{export_dates.min():%Y%m}_{export_dates.max():%Y%m}"
-
-    bulk_export_df = _build_bulk_export_df(
-        sections={
-            "scope_rows": scoped_for_detail,
-            "task_overrun_summary": task_overruns,
-            "trend_points": trend_df,
-            "trend_reconciliation": trend_recon_df,
-            "selected_task_overrun_jobs": top_jobs,
-            "selected_task_staff_summary": staff_table_export,
-            "selected_staff_job_trace": staff_job_trace_export,
-        },
-        metadata={
-            "scope_label": scope_label,
-            "department": "" if department is None else str(department),
-            "category": "" if category is None else str(category),
-            "time_window": time_window,
-            "min_jobs_with_quote": min_jobs_with_quote,
-            "min_overrun_rate": min_overrun_rate,
-            "trend_basis": trend_basis,
-            "trend_lookback_months": trend_lookback_months,
-            "selected_task": selected_label,
-            "selected_staff": "" if selected_staff_label is None else selected_staff_label,
-        },
-    )
-    if not bulk_export_df.empty:
-        scope_slug = scope_key.strip("_")[:64] if scope_key else "scope"
-        st.download_button(
-            "Download all page data (CSV)",
-            data=bulk_export_df.to_csv(index=False).encode("utf-8"),
-            file_name=f"recurring_quote_overruns_{scope_slug}_{period_tag}.csv",
-            mime="text/csv",
-            key=f"overrun_bulk_export_{scope_key}",
-        )
-        st.caption("Bulk export includes all diagnostic tables in one CSV. Use `section` to split views.")
 
     _show_actions(task_scope=task_scope, selected_task_row=selected_task_row)
 
