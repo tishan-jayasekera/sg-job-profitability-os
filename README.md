@@ -22,8 +22,6 @@ Everything else (client, state, role, etc.) is filter-only.
 6. **Data Quality & QA** - Schema validation, reconciliation, anomaly detection
 7. **Glossary & Method** - Metric definitions, formulas, methodology
 
-- **Revenue Decline Diagnostics** - Service-line driver diagnostics (volume × price decomposition, client bridge, hypothesis scorecard for MA/CRM/Landing Pages)
-
 ## Quick Start
 
 ### 1. Install Dependencies
