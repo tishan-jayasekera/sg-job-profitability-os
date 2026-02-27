@@ -287,10 +287,26 @@ def main():
         else:
             client_options = []
 
+        client_scope_key = (
+            selected_dept,
+            selected_cat,
+            benchmark_window,
+            bool(active_staff_only),
+        )
+        if st.session_state.get("quote_client_scope_key") != client_scope_key:
+            st.session_state["quote_client_scope_key"] = client_scope_key
+            st.session_state["quote_compare_clients"] = client_options.copy()
+        elif "quote_compare_clients" not in st.session_state:
+            st.session_state["quote_compare_clients"] = client_options.copy()
+        else:
+            existing_clients = st.session_state.get("quote_compare_clients", [])
+            valid_clients = [client for client in existing_clients if client in client_options]
+            if len(valid_clients) != len(existing_clients):
+                st.session_state["quote_compare_clients"] = valid_clients
+
         selected_clients = st.multiselect(
             "Client(s) to compare",
             options=client_options,
-            default=client_options,
             disabled=compare_locked,
             key="quote_compare_clients",
         )
@@ -733,7 +749,7 @@ def main():
 
                 st.markdown("**Dispersion Contributors (Review These Jobs)**")
                 outlier_view = outliers.copy()
-                outlier_view["Exclude"] = False
+                outlier_view["Exclude"] = True
                 outlier_view = outlier_view.set_index("job_no")
                 outlier_edit = st.data_editor(
                     outlier_view[["Exclude", "job_label", "dispersion_score"] + metric_cols],
@@ -751,6 +767,7 @@ def main():
                     num_rows="fixed",
                     key="quote_outlier_editor",
                 )
+                st.caption("Defaults are pre-selected. Uncheck jobs you want to keep in the pool.")
                 if st.button("Remove selected outliers from pool", key="quote_outlier_apply"):
                     to_remove = outlier_edit[outlier_edit["Exclude"]].index.tolist()
                     if to_remove:
@@ -763,7 +780,7 @@ def main():
 
                 st.markdown("**Most Similar Jobs (Closest to Median)**")
                 similar_view = similar.copy()
-                similar_view["Include"] = False
+                similar_view["Include"] = True
                 similar_view = similar_view.set_index("job_no")
                 similar_edit = st.data_editor(
                     similar_view[["Include", "job_label", "dispersion_score"] + metric_cols],
@@ -781,7 +798,7 @@ def main():
                     num_rows="fixed",
                     key="quote_similar_editor",
                 )
-                st.caption("Apply replaces the pool with the selected similar jobs.")
+                st.caption("Defaults are pre-selected. Uncheck jobs you do not want in the replacement pool.")
                 if st.button("Use selected similar jobs as pool", key="quote_similar_apply"):
                     selected = similar_edit[similar_edit["Include"]].index.tolist()
                     if selected:

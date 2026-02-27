@@ -5,9 +5,11 @@ Standalone diagnostic page for repeated task-level quote overruns.
 """
 from __future__ import annotations
 
+import io
 from pathlib import Path
 import sys
 from typing import Optional, Dict
+import zipfile
 
 import numpy as np
 import pandas as pd
@@ -195,6 +197,23 @@ def _format_signed_pct(value: float) -> str:
     if pd.isna(value):
         return "—"
     return f"{value * 100:+.0f}%"
+
+
+def _slugify_label(value: object) -> str:
+    text = str(value).strip().lower()
+    slug = "".join(ch if ch.isalnum() else "_" for ch in text)
+    slug = "_".join(part for part in slug.split("_") if part)
+    return slug[:80] or "na"
+
+
+def _build_tables_zip_bytes(table_exports: Dict[str, pd.DataFrame]) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for name, table in table_exports.items():
+            if table is None:
+                continue
+            zf.writestr(f"{name}.csv", table.to_csv(index=False).encode("utf-8"))
+    return buffer.getvalue()
 
 
 def _build_task_leakage_chart(task_overruns: pd.DataFrame, has_cost: bool):
@@ -460,21 +479,132 @@ def _build_trend_leakage_chart(trend_df: pd.DataFrame, has_cost: bool):
     use_cost = has_cost and "total_overrun_cost" in trend_df.columns and trend_df["total_overrun_cost"].notna().any()
     y_col = "total_overrun_cost" if use_cost else "total_overrun_hours"
     y_label = "Estimated Margin Erosion ($)" if use_cost else "Total Overrun Hours"
+    chart_df = trend_df.copy()
+    chart_df[y_col] = pd.to_numeric(chart_df[y_col], errors="coerce").fillna(0.0)
+    chart_df["prev_leakage"] = chart_df[y_col].shift(1)
+    chart_df["delta_vs_prev"] = chart_df[y_col] - chart_df["prev_leakage"]
+    chart_df["delta_vs_prev_pct"] = np.where(
+        chart_df["prev_leakage"] > 0,
+        chart_df["delta_vs_prev"] / chart_df["prev_leakage"],
+        np.nan,
+    )
+
+    eps = 1e-9
+    chart_df["trend_direction"] = np.where(
+        chart_df["prev_leakage"].isna(),
+        "Start",
+        np.where(
+            chart_df["delta_vs_prev"] > eps,
+            "Worsening (higher leakage)",
+            np.where(
+                chart_df["delta_vs_prev"] < -eps,
+                "Improving (lower leakage)",
+                "Flat",
+            ),
+        ),
+    )
+    chart_df["bar_text"] = chart_df[y_col].map(
+        lambda v: fmt_currency(v) if use_cost else f"{v:,.1f}h"
+    )
+
+    coverage_col = "cost_coverage_pct" if use_cost else "hours_coverage_pct"
+    if coverage_col in chart_df.columns:
+        chart_df["coverage_pct"] = chart_df[coverage_col]
+    else:
+        chart_df["coverage_pct"] = np.nan
+
+    hover_data = {
+        "window_label": True,
+        y_col: ":$,.0f" if use_cost else ":,.1f",
+        "delta_vs_prev": ":$,.0f" if use_cost else ":,.1f",
+        "delta_vs_prev_pct": ":.0%",
+        "coverage_pct": ":.0%",
+        "tasks_flagged": True,
+        "trend_direction": False,
+    }
 
     fig = px.bar(
-        trend_df,
+        chart_df,
         x="month",
         y=y_col,
-        color=y_col,
-        color_continuous_scale="Teal",
+        color="trend_direction",
+        color_discrete_map={
+            "Worsening (higher leakage)": "#b91c1c",
+            "Improving (lower leakage)": "#0f766e",
+            "Flat": "#64748b",
+            "Start": "#475569",
+        },
+        category_orders={
+            "trend_direction": [
+                "Worsening (higher leakage)",
+                "Improving (lower leakage)",
+                "Flat",
+                "Start",
+            ]
+        },
         labels={"month": "Month", y_col: y_label},
+        hover_data=hover_data,
+    )
+    fig.update_traces(
+        text=chart_df["bar_text"],
+        textposition="outside",
+        cliponaxis=False,
     )
     fig.update_layout(
-        title="Trend: Leakage Magnitude",
+        title="Trend: Leakage Magnitude (Lower is better)",
         height=320,
         margin=dict(l=10, r=10, t=42, b=10),
+        legend_title_text="Direction vs prior window",
     )
     return fig
+
+
+def _render_trend_leakage_message(
+    trend_df: pd.DataFrame,
+    has_cost: bool,
+    rolling_months: int,
+) -> None:
+    use_cost = has_cost and "total_overrun_cost" in trend_df.columns and trend_df["total_overrun_cost"].notna().any()
+    y_col = "total_overrun_cost" if use_cost else "total_overrun_hours"
+    coverage_col = "cost_coverage_pct" if use_cost else "hours_coverage_pct"
+
+    series = pd.to_numeric(trend_df.get(y_col), errors="coerce").fillna(0.0)
+    if series.empty:
+        return
+
+    last = trend_df.iloc[-1]
+    current = float(series.iloc[-1])
+    current_label = fmt_currency(current) if use_cost else f"{current:,.1f}h"
+    window_label = str(last.get("window_label", last.get("month_label", "latest window")))
+
+    if len(series) > 1:
+        prev = float(series.iloc[-2])
+        delta = current - prev
+        abs_delta_label = fmt_currency(abs(delta)) if use_cost else f"{abs(delta):,.1f}h"
+        if abs(delta) < 1e-9:
+            delta_text = "flat vs prior window"
+        elif delta > 0:
+            delta_text = f"up {abs_delta_label} vs prior window (worse)"
+        else:
+            delta_text = f"down {abs_delta_label} vs prior window (better)"
+    else:
+        delta_text = "first available trend point"
+
+    coverage_text = ""
+    coverage_value = last.get(coverage_col, np.nan)
+    if pd.notna(coverage_value):
+        coverage_text = f" It represents {coverage_value * 100:.0f}% of all quoted-task leakage in that window."
+
+    metric_name = "estimated margin erosion" if use_cost else "overrun hours"
+    st.markdown(
+        (
+            "<div class='rq-note'><b>What this chart says:</b> "
+            f"In <b>{window_label}</b> ({rolling_months}-month rolling), {metric_name} is "
+            f"<b>{current_label}</b>, {delta_text}.{coverage_text}"
+            "</div>"
+        ),
+        unsafe_allow_html=True,
+    )
 
 
 def _render_trend_reconciliation(
@@ -952,7 +1082,12 @@ def render_recurring_task_overruns_section(
                 "Weighted overrun rate = sum(overrun_jobs) / sum(jobs_with_quote) across tasks passing filters."
             )
         with tc2:
+            _render_trend_leakage_message(trend_df, has_cost=has_cost, rolling_months=rolling_months)
             st.plotly_chart(_build_trend_leakage_chart(trend_df, has_cost=has_cost), use_container_width=True)
+            st.caption(
+                "Color meaning: red = worsening (higher leakage than prior window), "
+                "green = improving (lower leakage), grey = flat/start."
+            )
             if has_cost and trend_df["total_overrun_cost"].notna().any():
                 st.caption(
                     "How calculated: for each job-task, overrun_hours = max(actual_hours - quoted_hours, 0) "
@@ -1024,6 +1159,10 @@ def render_recurring_task_overruns_section(
 
     if not has_cost:
         task_table["Est. margin erosion ($)"] = np.nan
+
+    table_exports: Dict[str, pd.DataFrame] = {
+        "recurring_margin_leak_tasks": task_table.copy(),
+    }
 
     task_formatters = {
         "Overrun rate": "{:.0%}",
@@ -1317,6 +1456,188 @@ def render_recurring_task_overruns_section(
                             }
                         )
                         st.dataframe(styled_staff_job, use_container_width=True, hide_index=True)
+
+    export_task_df = task_overruns.reset_index(drop=True).copy()
+    export_task_df["task_label"] = export_task_df["task_name"].fillna("(Unspecified task)").astype(str)
+    all_jobs_n = (
+        max(int(scoped_for_detail["job_no"].nunique()) + 5, 200)
+        if "job_no" in scoped_for_detail.columns
+        else 200
+    )
+
+    for task_rank, task_row in export_task_df.iterrows():
+        export_task_name = task_row["task_name"]
+        export_task_label = task_row["task_label"]
+        export_task_slug = _slugify_label(export_task_label)
+        task_prefix = f"task_{task_rank + 1:03d}_{export_task_slug}"
+
+        export_top_jobs = get_overrun_jobs_for_task(
+            df_scope,
+            task_name=export_task_name,
+            department=department,
+            category=category,
+            time_window=time_window,
+            n=all_jobs_n,
+        )
+        if export_top_jobs.empty:
+            continue
+
+        export_client_col = None
+        if "client_name" in export_top_jobs.columns and export_top_jobs["client_name"].notna().any():
+            export_client_col = "client_name"
+        elif "client_group" in export_top_jobs.columns and export_top_jobs["client_group"].notna().any():
+            export_client_col = "client_group"
+
+        export_jobs_table = pd.DataFrame(
+            {
+                "Job": export_top_jobs["job_no"].apply(lambda x: format_job_label(x, job_name_lookup)),
+                "Quoted hours": export_top_jobs["quoted_hours"],
+                "Actual hours": export_top_jobs["actual_hours"],
+                "Overrun hours": export_top_jobs["overrun_hours"],
+                "Overrun cost ($)": export_top_jobs["overrun_cost"] if has_cost else np.nan,
+                "Avg cost rate": export_top_jobs["avg_cost_rate"],
+            }
+        )
+        if export_client_col:
+            export_jobs_table.insert(1, "Client", export_top_jobs[export_client_col].fillna("—").astype(str))
+        if "department_final" in export_top_jobs.columns and export_top_jobs["department_final"].notna().any():
+            export_jobs_table.insert(
+                2 if export_client_col else 1,
+                "Department",
+                export_top_jobs["department_final"].fillna("—").astype(str),
+            )
+        if "category" in export_top_jobs.columns and export_top_jobs["category"].notna().any():
+            export_jobs_table.insert(
+                3 if export_client_col else 2,
+                "Category",
+                export_top_jobs["category"].fillna("—").astype(str),
+            )
+        if "quote_rate" in export_top_jobs.columns and export_top_jobs["quote_rate"].notna().any():
+            export_jobs_table["Quote rate"] = export_top_jobs["quote_rate"]
+        if "revenue_at_risk" in export_top_jobs.columns and export_top_jobs["revenue_at_risk"].notna().any():
+            export_jobs_table["Revenue at risk ($)"] = export_top_jobs["revenue_at_risk"]
+
+        table_exports[f"{task_prefix}__top_offending_jobs"] = export_jobs_table.copy()
+
+        if "staff_name" not in scoped_for_detail.columns:
+            continue
+
+        if pd.isna(export_task_name):
+            export_staff_scope = scoped_for_detail[scoped_for_detail["task_name"].isna()].copy()
+        else:
+            export_staff_scope = scoped_for_detail[scoped_for_detail["task_name"] == export_task_name].copy()
+        export_staff_scope = export_staff_scope[export_staff_scope["job_no"].isin(export_top_jobs["job_no"].tolist())]
+        if export_staff_scope.empty:
+            continue
+
+        export_staff_job = export_staff_scope.groupby(["staff_name", "job_no"], dropna=False).agg(
+            hours=("hours_raw", "sum"),
+        ).reset_index()
+        if has_cost:
+            export_cost_by_staff_job = (
+                export_staff_scope.groupby(["staff_name", "job_no"], dropna=False)["base_cost"]
+                .sum(min_count=1)
+                .reset_index(name="cost")
+            )
+            export_staff_job = export_staff_job.merge(export_cost_by_staff_job, on=["staff_name", "job_no"], how="left")
+        else:
+            export_staff_job["cost"] = np.nan
+
+        export_overrun_cols = ["job_no", "overrun_hours", "overrun_cost"]
+        if export_client_col:
+            export_overrun_cols.append(export_client_col)
+        export_job_overrun_meta = export_top_jobs[export_overrun_cols].drop_duplicates(subset=["job_no"])
+        export_staff_job = export_staff_job.merge(export_job_overrun_meta, on="job_no", how="left")
+
+        export_staff_summary = export_staff_job.groupby("staff_name", dropna=False).agg(
+            hours=("hours", "sum"),
+            jobs=("job_no", "nunique"),
+        ).reset_index()
+        if has_cost:
+            export_cost_summary = (
+                export_staff_job.groupby("staff_name", dropna=False)["cost"]
+                .sum(min_count=1)
+                .reset_index(name="cost")
+            )
+            export_staff_summary = export_staff_summary.merge(export_cost_summary, on="staff_name", how="left")
+        else:
+            export_staff_summary["cost"] = np.nan
+        export_staff_summary["hours_share"] = np.where(
+            export_staff_summary["hours"].sum() > 0,
+            export_staff_summary["hours"] / export_staff_summary["hours"].sum(),
+            np.nan,
+        )
+
+        export_staff_table = export_staff_summary.sort_values("hours", ascending=False).copy()
+        export_staff_table["Staff"] = export_staff_table["staff_name"].fillna("(Unassigned)").astype(str)
+        export_staff_display = export_staff_table[["Staff", "jobs", "hours", "hours_share", "cost"]].rename(
+            columns={
+                "jobs": "Jobs",
+                "hours": "Hours",
+                "hours_share": "Share of staff effort",
+                "cost": "Cost",
+            }
+        )
+        table_exports[f"{task_prefix}__top_contributing_staff"] = export_staff_display.copy()
+
+        export_trace_source = export_staff_table[["staff_name", "Staff"]].reset_index(drop=True)
+        for staff_rank, staff_row in export_trace_source.iterrows():
+            export_staff_name = staff_row["staff_name"]
+            export_staff_slug = _slugify_label(staff_row["Staff"])
+
+            if pd.isna(export_staff_name):
+                export_staff_job_detail = export_staff_job[export_staff_job["staff_name"].isna()].copy()
+            else:
+                export_staff_job_detail = export_staff_job[export_staff_job["staff_name"] == export_staff_name].copy()
+            if export_staff_job_detail.empty:
+                continue
+
+            export_staff_job_detail["Job"] = export_staff_job_detail["job_no"].apply(
+                lambda x: format_job_label(x, job_name_lookup)
+            )
+            if export_client_col and export_client_col in export_staff_job_detail.columns:
+                export_staff_job_detail["Client"] = export_staff_job_detail[export_client_col].fillna("—").astype(str)
+            export_staff_job_detail["staff_hours_share"] = np.where(
+                export_staff_job_detail["hours"].sum() > 0,
+                export_staff_job_detail["hours"] / export_staff_job_detail["hours"].sum(),
+                np.nan,
+            )
+
+            export_staff_job_display_cols = ["Job"]
+            if "Client" in export_staff_job_detail.columns:
+                export_staff_job_display_cols.append("Client")
+            export_staff_job_display_cols += [
+                "hours",
+                "staff_hours_share",
+                "cost",
+                "overrun_hours",
+                "overrun_cost",
+            ]
+            export_staff_job_display = export_staff_job_detail[export_staff_job_display_cols].rename(
+                columns={
+                    "hours": "Hours",
+                    "staff_hours_share": "Share of selected staff effort",
+                    "cost": "Cost",
+                    "overrun_hours": "Job overrun hours",
+                    "overrun_cost": "Job overrun cost ($)",
+                }
+            ).sort_values("Hours", ascending=False)
+            table_exports[
+                f"{task_prefix}__staff_trace_jobs__{staff_rank + 1:03d}_{export_staff_slug}"
+            ] = export_staff_job_display.copy()
+
+    zip_file_name = (
+        f"recurring_quote_overruns_tables_{_slugify_label(scope_label)}_{_slugify_label(time_window)}.zip"
+    )
+    zip_payload = _build_tables_zip_bytes(table_exports)
+    st.caption(f"Bulk export contains {len(table_exports):,} CSV tables across all filtered tasks and staff.")
+    st.download_button(
+        "Download all tasks/staff tables (ZIP)",
+        data=zip_payload,
+        file_name=zip_file_name,
+        mime="application/zip",
+        key=f"bulk_tables_all_{scope_key}_{time_window}_{min_jobs_with_quote}_{int(min_overrun_rate * 100)}",
+    )
 
     _show_actions(task_scope=task_scope, selected_task_row=selected_task_row)
 
