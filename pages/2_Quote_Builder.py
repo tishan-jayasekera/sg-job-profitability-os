@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+import re
 import sys
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -40,16 +41,11 @@ st.set_page_config(page_title="Quote Builder", page_icon="📝", layout="wide")
 init_state()
 
 
-def get_task_benchmarks(df: pd.DataFrame, department: str, category: str,
-                        recency_weighted: bool = False) -> pd.DataFrame:
+def get_task_benchmarks(df: pd.DataFrame, recency_weighted: bool = False) -> pd.DataFrame:
     """
-    Get task benchmarks for a department/category combination.
+    Get task benchmarks for the currently selected comparable pool.
     """
-    # Filter to department and category
-    df_dept = df[df["department_final"] == department] if "department_final" in df.columns else df
-    category_col = get_category_col(df_dept)
-    mask = (df["department_final"] == department) & (df[category_col] == category)
-    df_slice = df[mask].copy()
+    df_slice = df.copy()
     
     if len(df_slice) == 0:
         return pd.DataFrame()
@@ -67,6 +63,51 @@ def get_task_benchmarks(df: pd.DataFrame, department: str, category: str,
     ).reset_index()
     
     job_task = job_task.merge(actuals, on=["job_no", "task_name"], how="left")
+
+    # Timesheet-based department allocation per task (captures cross-team support).
+    task_primary_department: dict[str, str] = {}
+    task_primary_department_share: dict[str, float] = {}
+    task_dept_mix_label: dict[str, str] = {}
+    task_dept_allocation: dict[str, dict[str, float]] = {}
+    if "department_final" in df_slice.columns and "hours_raw" in df_slice.columns:
+        alloc = df_slice[["task_name", "department_final", "hours_raw"]].copy()
+        alloc["department_final"] = alloc["department_final"].fillna("Unspecified").astype(str)
+        alloc["hours_raw"] = pd.to_numeric(alloc["hours_raw"], errors="coerce").fillna(0.0)
+        alloc = (
+            alloc.groupby(["task_name", "department_final"], dropna=False)["hours_raw"]
+            .sum()
+            .reset_index()
+        )
+
+        for task, task_alloc in alloc.groupby("task_name"):
+            total_hours = float(task_alloc["hours_raw"].sum())
+            if total_hours <= 0:
+                task_primary_department[str(task)] = "Unspecified"
+                task_primary_department_share[str(task)] = 0.0
+                task_dept_mix_label[str(task)] = "Unspecified 0%"
+                task_dept_allocation[str(task)] = {"Unspecified": 1.0}
+                continue
+
+            task_alloc = task_alloc.sort_values("hours_raw", ascending=False).copy()
+            task_alloc["share"] = task_alloc["hours_raw"] / total_hours
+            task_alloc["share_pct"] = task_alloc["share"] * 100
+
+            primary_dept = str(task_alloc.iloc[0]["department_final"])
+            primary_share_pct = float(task_alloc.iloc[0]["share_pct"])
+            mix_label = ", ".join(
+                f"{str(r['department_final'])} {float(r['share_pct']):.0f}%"
+                for _, r in task_alloc.head(4).iterrows()
+            )
+            alloc_map = {
+                str(r["department_final"]): float(r["share"])
+                for _, r in task_alloc.iterrows()
+            }
+
+            task_key = str(task)
+            task_primary_department[task_key] = primary_dept
+            task_primary_department_share[task_key] = primary_share_pct
+            task_dept_mix_label[task_key] = mix_label
+            task_dept_allocation[task_key] = alloc_map
     
     # Apply recency weighting if enabled
     if recency_weighted:
@@ -86,7 +127,7 @@ def get_task_benchmarks(df: pd.DataFrame, department: str, category: str,
     task_stats = []
     
     for task in job_task["task_name"].unique():
-        task_data = job_task[job_task["task_name"] == task]
+        task_data = job_task[job_task["task_name"] == task].copy()
         
         # Compute metrics
         n_jobs = task_data["job_no"].nunique()
@@ -140,8 +181,18 @@ def get_task_benchmarks(df: pd.DataFrame, department: str, category: str,
         # Inclusion rate (what % of jobs in this slice have this task)
         total_jobs = df_slice["job_no"].nunique()
         inclusion_rate = n_jobs / total_jobs * 100 if total_jobs > 0 else 0
+
+        task_key = str(task)
+        task_department = task_primary_department.get(task_key, "Unspecified")
+        primary_share_pct = float(task_primary_department_share.get(task_key, 0.0))
+        dept_mix_label = task_dept_mix_label.get(task_key, "Unspecified 0%")
+        dept_allocation = task_dept_allocation.get(task_key, {"Unspecified": 1.0})
         
         task_stats.append({
+            "department": task_department,
+            "primary_dept_share_pct": primary_share_pct,
+            "timesheet_dept_mix": dept_mix_label,
+            "timesheet_dept_allocation": dept_allocation,
             "task_name": task,
             "n_jobs": n_jobs,
             "inclusion_rate": inclusion_rate,
@@ -155,7 +206,10 @@ def get_task_benchmarks(df: pd.DataFrame, department: str, category: str,
         })
     
     result = pd.DataFrame(task_stats)
-    result = result.sort_values("inclusion_rate", ascending=False)
+    if "department" in result.columns:
+        result = result.sort_values(["department", "inclusion_rate"], ascending=[True, False])
+    else:
+        result = result.sort_values("inclusion_rate", ascending=False)
     
     return result
 
@@ -174,33 +228,7 @@ def main():
     
     with col_inputs:
         section_header("Configuration")
-        
-        # Department selection
-        departments = sorted(df["department_final"].dropna().unique().tolist())
-        selected_dept = st.selectbox(
-            "Department",
-            options=departments,
-            key="quote_dept"
-        )
-        
-        # Category selection (filtered by department)
-        df_dept = df[df["department_final"] == selected_dept] if selected_dept else df
-        category_col = get_category_col(df_dept)
-        if selected_dept and category_col in df.columns:
-            categories = sorted(
-                df_dept[category_col]
-                .dropna().unique().tolist()
-            )
-        else:
-            categories = []
-        
-        selected_cat = st.selectbox(
-            "Category",
-            options=categories,
-            key="quote_cat"
-        )
-        
-        st.divider()
+        st.caption("Comparable selection starts from quote value, then keywords, then departments.")
         
         # Benchmark window
         window_options = {
@@ -239,22 +267,14 @@ def main():
     # MAIN CONTENT
     # =========================================================================
     with col_main:
-        if not selected_dept or not selected_cat:
-            st.info("Select a department and category to build a quote template.")
-            return
-        
         # Filter data
         df_filtered = filter_by_time_window(df, benchmark_window)
         
         if active_staff_only:
             df_filtered = filter_active_staff(df_filtered)
-        
-        # Get benchmark metadata
-        df_filtered_dept = df_filtered[df_filtered["department_final"] == selected_dept]
-        category_col = get_category_col(df_filtered_dept)
-        mask = (df_filtered["department_final"] == selected_dept) & \
-               (df_filtered[category_col] == selected_cat)
-        df_slice = df_filtered[mask]
+
+        # Comparable retrieval starts from full benchmark window.
+        df_compare_seed = df_filtered.copy()
 
         def _reset_task_state():
             st.session_state["quote_task_locked"] = False
@@ -264,8 +284,6 @@ def main():
             st.session_state["quote_bench_key"] = None
 
         compare_lock_key = (
-            selected_dept,
-            selected_cat,
             benchmark_window,
             bool(active_staff_only),
         )
@@ -279,60 +297,9 @@ def main():
         # =====================================================================
         # COMPARABLE JOB FILTERS
         # =====================================================================
-        section_header("Comparable Jobs", "Narrow benchmarks to specific clients or jobs")
+        section_header("Comparable Jobs", "Retrieve and refine similar jobs before locking benchmarks")
+        st.caption("Start with quote value, then narrow by description keywords, then relevant departments.")
         compare_locked = st.session_state.get("quote_compare_locked", False)
-
-        if "client" in df_slice.columns:
-            client_options = sorted(df_slice["client"].dropna().unique().tolist())
-        else:
-            client_options = []
-
-        client_scope_key = (
-            selected_dept,
-            selected_cat,
-            benchmark_window,
-            bool(active_staff_only),
-        )
-        if st.session_state.get("quote_client_scope_key") != client_scope_key:
-            st.session_state["quote_client_scope_key"] = client_scope_key
-            st.session_state["quote_compare_clients"] = client_options.copy()
-        elif "quote_compare_clients" not in st.session_state:
-            st.session_state["quote_compare_clients"] = client_options.copy()
-        else:
-            existing_clients = st.session_state.get("quote_compare_clients", [])
-            valid_clients = [client for client in existing_clients if client in client_options]
-            if len(valid_clients) != len(existing_clients):
-                st.session_state["quote_compare_clients"] = valid_clients
-
-        selected_clients = st.multiselect(
-            "Client(s) to compare",
-            options=client_options,
-            disabled=compare_locked,
-            key="quote_compare_clients",
-        )
-
-        if selected_clients:
-            df_client_slice = df_slice[df_slice["client"].isin(selected_clients)]
-        else:
-            df_client_slice = df_slice
-
-        job_options = sorted(df_client_slice["job_no"].dropna().unique().tolist()) if "job_no" in df_client_slice.columns else []
-        job_name_lookup = build_job_name_lookup(df_client_slice)
-        job_category_lookup = {}
-        if "job_category_quote" in df_client_slice.columns and job_options:
-            job_category_lookup = (
-                df_client_slice[["job_no", "job_category_quote"]]
-                .dropna()
-                .assign(job_no=lambda d: d["job_no"].astype(str))
-                .groupby("job_no")["job_category_quote"]
-                .agg(lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else x.iloc[0])
-                .to_dict()
-            )
-        def _parse_keywords(raw: str) -> list[str]:
-            if not raw:
-                return []
-            parts = [p.strip() for p in raw.replace("\n", ",").split(",")]
-            return [p for p in parts if p]
 
         def _normalize_job_ids(values) -> list[str]:
             if values is None:
@@ -354,193 +321,442 @@ def main():
                 return df_in.iloc[0:0]
             return df_in[df_in["job_no"].astype(str).isin(job_set)]
 
+        def _first_non_null(series: pd.Series):
+            non_null = series.dropna()
+            if len(non_null) == 0:
+                return np.nan
+            return non_null.iloc[0]
+
+        if "job_no" not in df_compare_seed.columns:
+            st.warning("No job-level identifiers found for comparable selection.")
+            return
+
+        base_job_ids = _normalize_job_ids(df_compare_seed["job_no"].dropna().unique().tolist())
+        if not base_job_ids:
+            st.warning("No historical jobs found for the selected benchmark window.")
+            return
+
+        df_job_scope = df_filtered[df_filtered["job_no"].astype(str).isin(set(base_job_ids))].copy()
+        if len(df_job_scope) == 0:
+            df_job_scope = df_compare_seed.copy()
+        if "job_no" in df_job_scope.columns:
+            df_job_scope["job_no"] = df_job_scope["job_no"].astype(str)
+
+        job_name_lookup = build_job_name_lookup(df_job_scope)
+
+        job_profile = pd.DataFrame({"job_no": base_job_ids})
+
+        profile_cols = [c for c in ["job_no", "client", "job_name", "job_description"] if c in df_job_scope.columns]
+        profile_agg = {
+            **({"client": _first_non_null} if "client" in profile_cols else {}),
+            **({"job_name": _first_non_null} if "job_name" in profile_cols else {}),
+            **({"job_description": _first_non_null} if "job_description" in profile_cols else {}),
+        }
+        if profile_cols and profile_agg:
+            profile_core = (
+                df_job_scope[profile_cols]
+                .dropna(subset=["job_no"])
+                .drop_duplicates()
+                .groupby("job_no")
+                .agg(profile_agg)
+                .reset_index()
+            )
+            job_profile = job_profile.merge(profile_core, on="job_no", how="left")
+
+        quote_by_job = pd.DataFrame(columns=["job_no", "quoted_value", "quoted_hours"])
+        job_quote_scope = safe_quote_job_task(df_job_scope)
+        if len(job_quote_scope) > 0:
+            job_quote_scope = job_quote_scope.copy()
+            job_quote_scope["job_no"] = job_quote_scope["job_no"].astype(str)
+            quote_agg = {}
+            if "quoted_amount_total" in job_quote_scope.columns:
+                quote_agg["quoted_value"] = ("quoted_amount_total", "sum")
+            if "quoted_time_total" in job_quote_scope.columns:
+                quote_agg["quoted_hours"] = ("quoted_time_total", "sum")
+            if quote_agg:
+                quote_by_job = job_quote_scope.groupby("job_no").agg(**quote_agg).reset_index()
+
+        job_profile = job_profile.merge(quote_by_job, on="job_no", how="left")
+        job_profile["quoted_value"] = pd.to_numeric(job_profile.get("quoted_value", 0), errors="coerce").fillna(0.0)
+        job_profile["quoted_hours"] = pd.to_numeric(job_profile.get("quoted_hours", 0), errors="coerce").fillna(0.0)
+
+        if "department_final" in df_job_scope.columns:
+            dept_rollup = (
+                df_job_scope[["job_no", "department_final"]]
+                .dropna(subset=["job_no", "department_final"])
+                .drop_duplicates()
+                .groupby("job_no")["department_final"]
+                .agg(lambda x: sorted({str(v) for v in x if pd.notna(v)}))
+                .reset_index(name="departments")
+            )
+            job_profile = job_profile.merge(dept_rollup, on="job_no", how="left")
+        if "departments" not in job_profile.columns:
+            job_profile["departments"] = [[] for _ in range(len(job_profile))]
+        job_profile["departments"] = job_profile["departments"].apply(
+            lambda v: v if isinstance(v, list) else []
+        )
+        job_profile["department_count"] = job_profile["departments"].apply(len)
+        job_profile["departments_label"] = job_profile["departments"].apply(
+            lambda d: ", ".join(d) if d else "—"
+        )
+
+        if "job_description" not in job_profile.columns:
+            job_profile["job_description"] = ""
+        if "job_name" not in job_profile.columns:
+            job_profile["job_name"] = ""
+        job_profile["search_text"] = (
+            job_profile["job_description"].fillna("").astype(str).str.lower()
+            + " "
+            + job_profile["job_name"].fillna("").astype(str).str.lower()
+        ).str.strip()
+        job_profile["search_text_norm"] = (
+            job_profile["search_text"]
+            .astype(str)
+            .str.replace(r"[&/+]", " ", regex=True)
+            .str.replace(r"[^a-z0-9\s-]", " ", regex=True)
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+        )
+        job_profile["search_tokens"] = job_profile["search_text_norm"].apply(
+            lambda t: set(t.split()) if isinstance(t, str) and t else set()
+        )
+
+        job_category_lookup = {}
+        if "job_category_quote" in df_compare_seed.columns and len(job_profile) > 0:
+            job_category_lookup = (
+                df_compare_seed[["job_no", "job_category_quote"]]
+                .dropna()
+                .assign(job_no=lambda d: d["job_no"].astype(str))
+                .drop_duplicates(subset=["job_no", "job_category_quote"])
+                .groupby("job_no")["job_category_quote"]
+                .agg(lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else x.iloc[0])
+                .to_dict()
+            )
+
+        st.caption("Filter order: Quoted value → Description keywords → Departments involved")
+
+        value_pool = job_profile.copy()
+        value_min = float(value_pool["quoted_value"].min()) if len(value_pool) > 0 else 0.0
+        value_max = float(value_pool["quoted_value"].max()) if len(value_pool) > 0 else 0.0
+        value_range = (value_min, value_max)
+        if len(value_pool) > 0:
+            if value_max > value_min:
+                value_step = max(1.0, float(round((value_max - value_min) / 200.0, 2)))
+                value_key = "quote_compare_value_range"
+                existing_value_range = st.session_state.get(value_key)
+                if (
+                    not isinstance(existing_value_range, (tuple, list))
+                    or len(existing_value_range) != 2
+                ):
+                    st.session_state[value_key] = (value_min, value_max)
+                else:
+                    low = float(existing_value_range[0])
+                    high = float(existing_value_range[1])
+                    low = min(max(low, value_min), value_max)
+                    high = min(max(high, value_min), value_max)
+                    if high < low:
+                        low, high = value_min, value_max
+                    st.session_state[value_key] = (low, high)
+                value_range = st.slider(
+                    "Quoted value range (historical jobs)",
+                    min_value=value_min,
+                    max_value=value_max,
+                    value=st.session_state[value_key],
+                    step=value_step,
+                    format="$%.0f",
+                    disabled=compare_locked,
+                    key=value_key,
+                    help="Filter by actual historical quoted value at job level.",
+                )
+            else:
+                st.caption(f"Quoted value is constant in this pool: {fmt_currency(value_min)}")
+
+        refined_jobs = value_pool[
+            value_pool["quoted_value"].between(float(value_range[0]), float(value_range[1]), inclusive="both")
+        ].copy()
+        value_filtered_count = refined_jobs["job_no"].nunique()
+
+        keyword_input = st.text_area(
+            "Job-description intents/capabilities (include)",
+            placeholder=(
+                "e.g.\n"
+                "Strategy, Planning & Buying\n"
+                "Paid Search & Social\n"
+                "Video/TV & CTV\n"
+                "Marketing Automation"
+            ),
+            key="quote_job_keyword_input",
+            disabled=compare_locked,
+            help="Paste comma/newline lists. The parser auto-extracts individual words and removes conjunctions.",
+        )
+        exclude_input = st.text_area(
+            "Exclude intents/capabilities",
+            placeholder="e.g. print, support only, offline",
+            key="quote_job_keyword_exclude_input",
+            disabled=compare_locked,
+        )
+        keyword_mode = st.selectbox(
+            "Keyword match mode",
+            options=["Match any keyword", "Match all keywords"],
+            key="quote_job_keyword_mode",
+            disabled=compare_locked,
+            help="Any = broad retrieval. All = high-coverage retrieval from extracted core terms.",
+        )
+
+        stop_tokens = {
+            "and", "or", "the", "a", "an", "of", "to", "for", "with", "in", "on", "at", "by",
+            "from", "into", "onto", "via", "plus", "vs", "per", "mgt", "management", "services",
+            "service", "team", "teams", "work", "project"
+        }
+
+        def _split_concepts(raw: str) -> list[str]:
+            if not raw:
+                return []
+            chunks = re.split(r"[\n,;|]+", raw)
+            concepts = []
+            for chunk in chunks:
+                cleaned = re.sub(r"^[\s\-\*\u2022\d\.\)\(]+", "", str(chunk)).strip()
+                if cleaned:
+                    concepts.append(cleaned)
+            return concepts
+
+        def _normalize_phrase(text: str) -> str:
+            out = str(text).lower()
+            out = re.sub(r"[&/+]", " ", out)
+            out = re.sub(r"[^a-z0-9\s-]", " ", out)
+            out = re.sub(r"\s+", " ", out).strip()
+            return out
+
+        def _extract_terms_and_phrases(raw: str) -> tuple[set[str], set[str], set[str]]:
+            terms = set()
+            phrases = set()
+            ignored = set()
+            for concept in _split_concepts(raw):
+                normalized = _normalize_phrase(concept)
+                if not normalized:
+                    continue
+                tokens = [t for t in normalized.split() if len(t) >= 2]
+                kept = [t for t in tokens if t not in stop_tokens]
+                ignored.update(t for t in tokens if t in stop_tokens)
+                if kept:
+                    terms.update(kept)
+                    phrases.add(" ".join(kept))
+            return terms, phrases, ignored
+
+        include_terms, include_phrases, include_ignored = _extract_terms_and_phrases(keyword_input)
+        exclude_terms, exclude_phrases, _ = _extract_terms_and_phrases(exclude_input)
+
+        if keyword_input:
+            st.caption(
+                f"Parsed include terms: {len(include_terms)}"
+                + (f" · ignored conjunctives/common words: {', '.join(sorted(include_ignored)[:8])}" if include_ignored else "")
+            )
+
+        refined_jobs["keyword_score"] = 0.0
+        refined_jobs["keyword_hits"] = ""
+
+        if include_terms or include_phrases:
+            include_term_count = max(len(include_terms), 1)
+            include_phrase_count = max(len(include_phrases), 1)
+
+            def _keyword_eval(row):
+                tokens = row["search_tokens"] if isinstance(row.get("search_tokens"), set) else set()
+                text_norm = str(row.get("search_text_norm", ""))
+                term_hits = sorted(include_terms.intersection(tokens)) if include_terms else []
+                phrase_hits = sorted([p for p in include_phrases if p and p in text_norm]) if include_phrases else []
+                term_cov = len(term_hits) / include_term_count
+                phrase_cov = len(phrase_hits) / include_phrase_count
+                score = (0.75 * term_cov) + (0.25 * phrase_cov)
+                hits = term_hits[:8]
+                if len(phrase_hits) > 0:
+                    hits += [f"\"{p}\"" for p in phrase_hits[:4]]
+                return pd.Series({
+                    "keyword_term_hits": len(term_hits),
+                    "keyword_phrase_hits": len(phrase_hits),
+                    "keyword_score": score,
+                    "keyword_hits": ", ".join(hits),
+                })
+
+            keyword_eval = refined_jobs.apply(_keyword_eval, axis=1)
+            # Overwrite/update columns explicitly to avoid duplicate column labels.
+            for col in keyword_eval.columns:
+                refined_jobs[col] = keyword_eval[col].values
+
+            if keyword_mode == "Match all keywords":
+                # Practical "all" mode: require strong coverage of extracted terms
+                required_hits = int(np.ceil(len(include_terms) * 0.6))
+                required_hits = max(1, min(required_hits, len(include_terms)))
+                keyword_mask = refined_jobs["keyword_term_hits"] >= required_hits
+            else:
+                keyword_mask = (
+                    (refined_jobs["keyword_term_hits"] > 0)
+                    | (refined_jobs["keyword_phrase_hits"] > 0)
+                )
+            refined_jobs = refined_jobs[keyword_mask]
+
+        if (exclude_terms or exclude_phrases) and len(refined_jobs) > 0:
+            def _exclude_match(row) -> bool:
+                tokens = row["search_tokens"] if isinstance(row.get("search_tokens"), set) else set()
+                text_norm = str(row.get("search_text_norm", ""))
+                if exclude_terms.intersection(tokens):
+                    return True
+                return any(p for p in exclude_phrases if p and p in text_norm)
+
+            refined_jobs = refined_jobs[~refined_jobs.apply(_exclude_match, axis=1)]
+
+        # Defensive cleanup in case duplicate labels are introduced by future edits.
+        if refined_jobs.columns.duplicated().any():
+            refined_jobs = refined_jobs.loc[:, ~refined_jobs.columns.duplicated()]
+
+        if "keyword_score" in refined_jobs.columns:
+            refined_jobs = refined_jobs.sort_values(
+                ["keyword_score", "quoted_value"],
+                ascending=[False, False],
+            )
+        keyword_filtered_count = refined_jobs["job_no"].nunique()
+
+        available_departments = sorted(
+            {
+                dept
+                for depts in refined_jobs["departments"].tolist()
+                for dept in (depts if isinstance(depts, list) else [])
+            }
+        )
+        existing_dept_filters = st.session_state.get("quote_compare_departments", [])
+        st.session_state["quote_compare_departments"] = [
+            d for d in existing_dept_filters if d in available_departments
+        ]
+        selected_departments = st.multiselect(
+            "Departments involved",
+            options=available_departments,
+            key="quote_compare_departments",
+            disabled=compare_locked or len(available_departments) == 0,
+            help="Refine to jobs that involve similar cross-functional delivery.",
+        )
+
+        dept_mode = None
+        overlap_min = 1
+        if selected_departments:
+            dept_mode = st.selectbox(
+                "Department match logic",
+                options=[
+                    "Match any selected department",
+                    "Match all selected departments",
+                    "Minimum overlap threshold",
+                ],
+                key="quote_compare_department_mode",
+                disabled=compare_locked,
+            )
+            selected_dept_set = set(selected_departments)
+            refined_jobs["department_overlap"] = refined_jobs["departments"].apply(
+                lambda d: len(set(d).intersection(selected_dept_set))
+            )
+            if dept_mode == "Match any selected department":
+                refined_jobs = refined_jobs[refined_jobs["department_overlap"] >= 1]
+            elif dept_mode == "Match all selected departments":
+                refined_jobs = refined_jobs[refined_jobs["department_overlap"] == len(selected_dept_set)]
+            else:
+                overlap_key = "quote_compare_department_overlap"
+                existing_overlap = st.session_state.get(overlap_key)
+                if not isinstance(existing_overlap, int):
+                    st.session_state[overlap_key] = 1
+                else:
+                    st.session_state[overlap_key] = min(max(existing_overlap, 1), len(selected_departments))
+                overlap_min = st.slider(
+                    "Minimum overlapping departments",
+                    min_value=1,
+                    max_value=len(selected_departments),
+                    value=st.session_state[overlap_key],
+                    step=1,
+                    disabled=compare_locked,
+                    key=overlap_key,
+                )
+                refined_jobs = refined_jobs[refined_jobs["department_overlap"] >= overlap_min]
+                dept_sort_cols = ["department_overlap", "department_count", "quoted_value"]
+                dept_sort_order = [False, True, False]
+                if "keyword_score" in refined_jobs.columns:
+                    dept_sort_cols.insert(2, "keyword_score")
+                    dept_sort_order = [False, True, False, False]
+                refined_jobs = refined_jobs.sort_values(dept_sort_cols, ascending=dept_sort_order)
+            refined_jobs["department_overlap_label"] = refined_jobs["department_overlap"].apply(
+                lambda x: f"{int(x)}/{len(selected_departments)} selected"
+            )
+        else:
+            refined_jobs["department_overlap"] = 0
+            refined_jobs["department_overlap_label"] = "—"
+
+        refined_jobs = refined_jobs.drop_duplicates(subset=["job_no"]).copy()
+        refined_job_ids = _normalize_job_ids(refined_jobs["job_no"].tolist())
+
+        summary_cols = st.columns(4)
+        with summary_cols[0]:
+            st.metric("Initial jobs", len(base_job_ids))
+        with summary_cols[1]:
+            st.metric("After value filter", value_filtered_count)
+        with summary_cols[2]:
+            st.metric("After keyword filter", keyword_filtered_count)
+        with summary_cols[3]:
+            st.metric("Refined comparable jobs", len(refined_job_ids))
+
+        if len(refined_jobs) > 0:
+            preview = refined_jobs.copy()
+            preview["job_label"] = preview["job_no"].apply(lambda j: format_job_label(j, job_name_lookup))
+            preview_cols = ["job_label", "quoted_value", "departments_label", "department_overlap_label"]
+            preview_names = {
+                "job_label": "Job",
+                "quoted_value": "Quoted Value",
+                "departments_label": "Departments Involved",
+                "department_overlap_label": "Department Match",
+            }
+            if include_terms or include_phrases:
+                preview_cols.insert(2, "keyword_score")
+                preview_cols.insert(3, "keyword_hits")
+                preview_names["keyword_score"] = "Keyword Relevance"
+                preview_names["keyword_hits"] = "Matched Terms"
+            if "client" in preview.columns:
+                preview_cols.insert(1, "client")
+                preview_names["client"] = "Client"
+            st.dataframe(
+                preview[preview_cols].rename(columns=preview_names),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Quoted Value": st.column_config.NumberColumn(format="$%.0f"),
+                    "Keyword Relevance": st.column_config.NumberColumn(format="%.2f"),
+                },
+            )
+
+        if "quote_compare_jobs" not in st.session_state:
+            st.session_state["quote_compare_jobs"] = []
+        current_manual_jobs = _normalize_job_ids(st.session_state.get("quote_compare_jobs", []))
+        valid_manual_jobs = [j for j in current_manual_jobs if j in set(refined_job_ids)]
+        if valid_manual_jobs != current_manual_jobs:
+            st.session_state["quote_compare_jobs"] = valid_manual_jobs
+
         use_all_jobs = st.checkbox(
-            "Use all jobs from selected clients",
+            "Use full refined pool",
             value=True,
-            disabled=compare_locked or len(selected_clients) == 0,
-            help="Uncheck to pick a subset of jobs.",
+            disabled=compare_locked or len(refined_job_ids) == 0,
+            help="Uncheck to pick a manual subset from the refined pool.",
             key="quote_use_all_jobs",
         )
 
         selected_jobs = []
-        if "quote_compare_jobs_override" in st.session_state:
-            st.session_state["quote_compare_jobs"] = st.session_state.pop("quote_compare_jobs_override")
-        if selected_clients and not use_all_jobs and job_options and not compare_locked:
-            keyword_matches = []
-            if "job_description" in df_client_slice.columns:
-                st.markdown("**Keyword Search (Job Description)**")
-                keyword_input = st.text_area(
-                    "Enter keywords or phrases (comma or new line separated)",
-                    placeholder="e.g. retainer, performance marketing, SEO audit",
-                    key="quote_job_keyword_input",
-                )
-                exclude_input = st.text_area(
-                    "Exclude keywords or phrases (comma or new line separated)",
-                    placeholder="e.g. brand, offline",
-                    key="quote_job_keyword_exclude_input",
-                )
-                match_mode = st.selectbox(
-                    "Match mode",
-                    options=["Match any keyword", "Match all keywords"],
-                    key="quote_job_keyword_mode",
-                )
-                use_regex = st.checkbox(
-                    "Regex mode",
-                    value=False,
-                    help="Treat keywords as regex patterns.",
-                    key="quote_job_keyword_regex",
-                )
-                keywords = _parse_keywords(keyword_input)
-                exclude_keywords = _parse_keywords(exclude_input)
-
-                if keywords:
-                    desc_df = (
-                        df_client_slice[["job_no", "job_description"]]
-                        .dropna(subset=["job_no", "job_description"])
-                        .drop_duplicates(subset=["job_no"])
-                        .copy()
-                    )
-                    desc_df["job_no"] = desc_df["job_no"].astype(str)
-                    descriptions = desc_df.set_index("job_no")["job_description"].astype(str).str.lower()
-                    keyword_hits = []
-                    for keyword in keywords:
-                        keyword_l = keyword.lower()
-                        hits = descriptions.index[
-                            descriptions.str.contains(keyword_l, regex=use_regex, na=False)
-                        ]
-                        keyword_hits.append(set(hits.tolist()))
-
-                    if keyword_hits:
-                        if match_mode == "Match all keywords":
-                            matched = set.intersection(*keyword_hits)
-                        else:
-                            matched = set.union(*keyword_hits)
-                        keyword_matches = sorted(matched)
-
-                if keyword_matches and exclude_keywords:
-                    exclude_hits = set()
-                    for keyword in exclude_keywords:
-                        keyword_l = keyword.lower()
-                        hits = descriptions.index[
-                            descriptions.str.contains(keyword_l, regex=use_regex, na=False)
-                        ]
-                        exclude_hits.update(hits.tolist())
-                    keyword_matches = sorted(set(keyword_matches) - exclude_hits)
-
-                if keyword_matches:
-                    st.caption(f"Keyword matches: {len(keyword_matches)} jobs")
-                    if st.button("Select all keyword matches", key="quote_select_keyword_jobs"):
-                        existing = st.session_state.get("quote_compare_jobs", []) or []
-                        st.session_state["quote_compare_jobs"] = sorted(set(existing) | set(keyword_matches))
-                        st.rerun()
-                elif keywords:
-                    st.caption("Keyword matches: 0 jobs")
-
-                st.markdown("**Find similar jobs from a pasted description**")
-                paste_desc = st.text_area(
-                    "Paste a job description to find similar jobs",
-                    placeholder="Paste a brief job description here...",
-                    key="quote_job_similarity_input",
-                )
-                top_k = st.slider(
-                    "Results to show",
-                    min_value=3,
-                    max_value=15,
-                    value=8,
-                    step=1,
-                    key="quote_job_similarity_topk",
-                )
-
-                def _tokenize(text: str) -> list[str]:
-                    if not text:
-                        return []
-                    text = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
-                    tokens = [t for t in text.split() if len(t) > 2]
-                    stop = {
-                        "the", "and", "for", "with", "from", "that", "this", "into", "onto",
-                        "your", "our", "their", "was", "were", "are", "is", "to", "of", "in",
-                        "on", "by", "as", "an", "a", "at", "or", "be", "it", "its", "we"
-                    }
-                    return [t for t in tokens if t not in stop]
-
-                if paste_desc:
-                    desc_df = (
-                        df_client_slice[["job_no", "job_description"]]
-                        .dropna(subset=["job_no", "job_description"])
-                        .drop_duplicates(subset=["job_no"])
-                        .copy()
-                    )
-                    desc_df["job_no"] = desc_df["job_no"].astype(str)
-                    query_tokens = set(_tokenize(paste_desc))
-                    if len(query_tokens) == 0:
-                        st.info("Paste a longer description to match.")
-                    else:
-                        rows = []
-                        for _, row in desc_df.iterrows():
-                            tokens = set(_tokenize(str(row["job_description"])))
-                            if not tokens:
-                                continue
-                            overlap = query_tokens.intersection(tokens)
-                            jaccard = len(overlap) / len(query_tokens.union(tokens))
-                            if jaccard == 0:
-                                continue
-                            rows.append({
-                                "job_no": row["job_no"],
-                                "score": jaccard,
-                                "overlap_terms": ", ".join(sorted(list(overlap))[:8]),
-                            })
-
-                        if rows:
-                            sim_df = pd.DataFrame(rows).sort_values("score", ascending=False).head(top_k)
-                            sim_df["job_label"] = sim_df["job_no"].apply(
-                                lambda j: format_job_label(j, job_name_lookup)
-                            )
-                            st.dataframe(
-                                sim_df[["job_label", "score", "overlap_terms"]].rename(columns={
-                                    "job_label": "Job",
-                                    "score": "Similarity",
-                                    "overlap_terms": "Why (overlap terms)",
-                                }),
-                                use_container_width=True,
-                                hide_index=True,
-                                column_config={
-                                    "Similarity": st.column_config.NumberColumn(format="%.2f"),
-                                },
-                            )
-                            if st.button("Select all similar jobs", key="quote_select_similar_jobs"):
-                                existing = st.session_state.get("quote_compare_jobs", []) or []
-                                st.session_state["quote_compare_jobs"] = sorted(set(existing) | set(sim_df["job_no"].tolist()))
-                                st.rerun()
-                        else:
-                            st.caption("No close matches found for the pasted description.")
-
+        if not use_all_jobs and refined_job_ids:
             selected_jobs = st.multiselect(
-                "Select specific jobs",
-                options=job_options,
+                "Select specific jobs from refined pool",
+                options=refined_job_ids,
                 format_func=lambda j: (
                     f"{format_job_label(j, job_name_lookup)} — {job_category_lookup.get(str(j), 'Unknown')}"
                     if job_category_lookup
                     else format_job_label(j, job_name_lookup)
                 ),
                 key="quote_compare_jobs",
-            )
-        elif selected_clients and not use_all_jobs and job_options and compare_locked:
-            selected_jobs = st.multiselect(
-                "Select specific jobs",
-                options=job_options,
-                format_func=lambda j: (
-                    f"{format_job_label(j, job_name_lookup)} — {job_category_lookup.get(str(j), 'Unknown')}"
-                    if job_category_lookup
-                    else format_job_label(j, job_name_lookup)
-                ),
-                key="quote_compare_jobs",
-                disabled=True,
+                disabled=compare_locked,
             )
 
-        if selected_jobs:
-            df_compare_draft = _filter_jobs(df_client_slice, selected_jobs)
-        else:
-            df_compare_draft = df_client_slice
+        draft_job_ids = refined_job_ids if use_all_jobs else _normalize_job_ids(selected_jobs)
+        df_compare_draft = _filter_jobs(df_compare_seed, draft_job_ids)
 
         if len(df_compare_draft) == 0:
             st.warning("No jobs found for the selected comparable filters.")
@@ -582,7 +798,7 @@ def main():
             compare_pool_jobs = compare_locked_jobs.copy()
             st.session_state["quote_compare_pool_jobs"] = compare_pool_jobs
 
-        df_compare = _filter_jobs(df_slice, compare_pool_jobs) if compare_pool_jobs else df_slice.iloc[0:0]
+        df_compare = _filter_jobs(df_compare_seed, compare_pool_jobs) if compare_pool_jobs else df_compare_seed.iloc[0:0]
 
         if len(df_compare) == 0:
             st.warning("No jobs found in the current comparable pool.")
@@ -819,8 +1035,6 @@ def main():
         pool_job_key = tuple(compare_pool_jobs)
         bench_key = (
             "quote_benchmarks",
-            selected_dept,
-            selected_cat,
             benchmark_window,
             pool_job_key,
             bool(recency_weighted),
@@ -828,7 +1042,7 @@ def main():
         if st.session_state.get("quote_bench_key") != bench_key:
             # Get task benchmarks
             benchmarks = get_task_benchmarks(
-                df_compare, selected_dept, selected_cat,
+                df_compare,
                 recency_weighted=recency_weighted
             )
             st.session_state["quote_bench_key"] = bench_key
@@ -846,10 +1060,13 @@ def main():
         section_header("Task Template", "Select tasks, adjust hours, and build a usable quote plan fast")
         
         # Initialize table in session state if not exists or context changes
-        table_key = (selected_dept, selected_cat, benchmark_window, pool_job_key)
+        table_key = (benchmark_window, pool_job_key)
         if st.session_state.get("quote_task_table_key") != table_key:
             default_tasks = benchmarks[benchmarks["inclusion_rate"] >= 50]["task_name"].tolist()
             base_table = benchmarks.rename(columns={
+                "department": "Department",
+                "primary_dept_share_pct": "Primary Dept %",
+                "timesheet_dept_mix": "TS Dept Mix",
                 "task_name": "Task",
                 "inclusion_rate": "Inclusion %",
                 "quoted_hours_p50": "Median (p50)",
@@ -859,15 +1076,20 @@ def main():
                 "cost_per_hour": "Cost/hr",
                 "quote_rate": "Quote Rate",
             })[[
-                "Task", "Inclusion %", "Median (p50)", "Low (p25)", "High (p75)",
+                "Department", "Task", "Primary Dept %", "TS Dept Mix", "Inclusion %",
+                "Median (p50)", "Low (p25)", "High (p75)",
                 "Overrun Risk %", "Cost/hr", "Quote Rate"
             ]].copy()
+            base_table["Department"] = base_table["Department"].fillna("Unspecified").astype(str)
+            base_table["Primary Dept %"] = pd.to_numeric(base_table["Primary Dept %"], errors="coerce").fillna(0.0)
+            base_table["TS Dept Mix"] = base_table["TS Dept Mix"].fillna("Unspecified 0%").astype(str)
             base_table["Include"] = base_table["Task"].isin(default_tasks)
             base_table["Hours"] = np.where(
                 base_table["Include"],
                 base_table["Median (p50)"],
                 0.0,
             )
+            base_table = base_table.sort_values(["Department", "Inclusion %"], ascending=[True, False]).reset_index(drop=True)
             st.session_state["quote_task_table"] = base_table
             st.session_state["quote_task_table_key"] = table_key
             st.session_state["quote_task_locked"] = False
@@ -881,16 +1103,25 @@ def main():
             "Legend: ✅ Editable (your quote) · 📊 Empirical benchmarks (read‑only). "
             "Use Hours + Include to build the quote; benchmarks show historical ranges."
         )
-        control_cols = st.columns([1.2, 1, 1, 1, 1.4])
+        st.caption("Tasks are grouped by their most representative department from the comparable pool.")
+        control_cols = st.columns([1.2, 1.1, 1, 1, 1, 1.4])
         with control_cols[0]:
             task_search = st.text_input("Search tasks", value="", placeholder="Type to filter tasks")
         with control_cols[1]:
-            min_inclusion = st.slider("Min inclusion %", 0, 100, 0, step=10)
+            dept_options = sorted(task_table["Department"].dropna().astype(str).unique().tolist()) if "Department" in task_table.columns else []
+            selected_task_depts = st.multiselect(
+                "Departments",
+                options=dept_options,
+                default=dept_options,
+                help="Show tasks for selected departments.",
+            )
         with control_cols[2]:
-            show_only_selected = st.checkbox("Show selected only", value=False)
+            min_inclusion = st.slider("Min inclusion %", 0, 100, 0, step=10)
         with control_cols[3]:
-            sort_by = st.selectbox("Sort by", ["Inclusion %", "Overrun Risk %", "Hours"], index=0)
+            show_only_selected = st.checkbox("Show selected only", value=False)
         with control_cols[4]:
+            sort_by = st.selectbox("Sort by", ["Department", "Inclusion %", "Overrun Risk %", "Hours"], index=0)
+        with control_cols[5]:
             bulk_set = st.selectbox("Set hours to", ["Keep current", "Low (p25)", "Median (p50)", "High (p75)"])
 
         action_cols = st.columns(3)
@@ -926,20 +1157,28 @@ def main():
         # Apply filters for display
         view_table = task_table.copy()
         if task_search:
-            view_table = view_table[view_table["Task"].str.contains(task_search, case=False, na=False)]
+            view_table = view_table[
+                view_table["Task"].str.contains(task_search, case=False, na=False)
+                | view_table["Department"].str.contains(task_search, case=False, na=False)
+            ]
+        if selected_task_depts:
+            view_table = view_table[view_table["Department"].isin(selected_task_depts)]
         view_table = view_table[view_table["Inclusion %"] >= min_inclusion]
         if show_only_selected:
             view_table = view_table[view_table["Include"]]
-        view_table = view_table.sort_values(sort_by, ascending=False)
+        if sort_by == "Department":
+            view_table = view_table.sort_values(["Department", "Inclusion %", "Task"], ascending=[True, False, True])
+        else:
+            view_table = view_table.sort_values(sort_by, ascending=False)
 
         st.markdown(
             """
             <style>
             /* Highlight editable columns in the task editor (Include + Hours) */
             [data-testid="stDataEditor"] div[role="columnheader"]:nth-child(1),
-            [data-testid="stDataEditor"] div[role="columnheader"]:nth-child(3),
+            [data-testid="stDataEditor"] div[role="columnheader"]:nth-child(6),
             [data-testid="stDataEditor"] div[role="gridcell"]:nth-child(1),
-            [data-testid="stDataEditor"] div[role="gridcell"]:nth-child(3) {
+            [data-testid="stDataEditor"] div[role="gridcell"]:nth-child(6) {
                 background: #fff7cc;
             }
             </style>
@@ -950,7 +1189,7 @@ def main():
         locked = st.session_state.get("quote_task_locked", False)
         edited_view = None
         view_editor_table = view_table[[
-                    "Include", "Task", "Hours", "Inclusion %",
+                    "Include", "Department", "Task", "Primary Dept %", "TS Dept Mix", "Hours", "Inclusion %",
                     "Low (p25)", "Median (p50)", "High (p75)",
                     "Overrun Risk %", "Cost/hr", "Quote Rate"
                 ]].copy().reset_index(drop=True)
@@ -960,7 +1199,10 @@ def main():
                 view_editor_table,
                 column_config={
                     "Include": st.column_config.CheckboxColumn("✅ Include", disabled=locked),
+                    "Department": st.column_config.TextColumn("Department", disabled=True),
                     "Task": st.column_config.TextColumn("Task", disabled=True),
+                    "Primary Dept %": st.column_config.NumberColumn("📊 Primary Dept %", format="%.0f%%", disabled=True),
+                    "TS Dept Mix": st.column_config.TextColumn("📊 TS Dept Mix", disabled=True),
                     "Hours": st.column_config.NumberColumn("✅ Quote Hours", min_value=0, step=0.5, disabled=locked),
                     "Inclusion %": st.column_config.NumberColumn("📊 Inclusion %", format="%.1f%%", disabled=True),
                     "Low (p25)": st.column_config.NumberColumn("📊 Low (p25)", format="%.1f", disabled=True),
@@ -984,12 +1226,95 @@ def main():
         # Merge edits back into full table only on submit
         if apply_edits and edited_view is not None and len(edited_view) > 0 and not locked:
             update_cols = ["Include", "Hours"]
-            task_table.set_index("Task", inplace=True)
-            edited_view.set_index("Task", inplace=True)
+            index_cols = ["Department", "Task"]
+            task_table.set_index(index_cols, inplace=True)
+            edited_view.set_index(index_cols, inplace=True)
             task_table.loc[edited_view.index, update_cols] = edited_view[update_cols]
             task_table.reset_index(inplace=True)
             st.session_state["quote_task_table"] = task_table
             st.session_state["quote_econ_ready"] = False
+
+        st.markdown("#### Timesheet-Based Department Hour Allocation")
+        st.caption(
+            "Quote hours are distributed by historical timesheet share per task, "
+            "so cross-team subsidy/support is visible before locking."
+        )
+
+        allocation_lookup = {}
+        if "timesheet_dept_allocation" in benchmarks.columns:
+            allocation_lookup = (
+                benchmarks[["task_name", "timesheet_dept_allocation"]]
+                .drop_duplicates(subset=["task_name"])
+                .set_index("task_name")["timesheet_dept_allocation"]
+                .to_dict()
+            )
+
+        alloc_task_rows = []
+        alloc_source = task_table.copy()
+        alloc_source["Hours"] = pd.to_numeric(alloc_source["Hours"], errors="coerce").fillna(0.0)
+        alloc_source = alloc_source[(alloc_source["Include"]) & (alloc_source["Hours"] > 0)]
+        for _, row in alloc_source.iterrows():
+            task_name = str(row["Task"])
+            quote_hours = float(row["Hours"])
+            fallback_department = str(row.get("Department", "Unspecified"))
+            alloc_map = allocation_lookup.get(task_name, {fallback_department: 1.0})
+            if not isinstance(alloc_map, dict) or len(alloc_map) == 0:
+                alloc_map = {fallback_department: 1.0}
+
+            for dept, share in alloc_map.items():
+                share_val = float(share) if pd.notna(share) else 0.0
+                if share_val <= 0:
+                    continue
+                alloc_task_rows.append({
+                    "Department": str(dept),
+                    "Task": task_name,
+                    "Task Quote Hours": quote_hours,
+                    "Timesheet Share %": share_val * 100,
+                    "Allocated Quote Hours": quote_hours * share_val,
+                })
+
+        if len(alloc_task_rows) > 0:
+            alloc_detail_df = pd.DataFrame(alloc_task_rows)
+            alloc_dept_df = (
+                alloc_detail_df.groupby("Department")
+                .agg(
+                    allocated_hours=("Allocated Quote Hours", "sum"),
+                    contributing_tasks=("Task", "nunique"),
+                )
+                .reset_index()
+                .sort_values("allocated_hours", ascending=False)
+            )
+            total_allocated_hours = float(alloc_dept_df["allocated_hours"].sum())
+            alloc_dept_df["Allocated Share %"] = np.where(
+                total_allocated_hours > 0,
+                alloc_dept_df["allocated_hours"] / total_allocated_hours * 100,
+                0.0,
+            )
+            st.dataframe(
+                alloc_dept_df.rename(columns={
+                    "allocated_hours": "Allocated Quote Hours",
+                    "contributing_tasks": "Tasks Contributing",
+                }),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Allocated Quote Hours": st.column_config.NumberColumn(format="%.1f"),
+                    "Allocated Share %": st.column_config.NumberColumn(format="%.1f%%"),
+                },
+            )
+            with st.expander("View task-level allocation detail", expanded=False):
+                st.dataframe(
+                    alloc_detail_df.sort_values(["Department", "Allocated Quote Hours"], ascending=[True, False]),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Task Quote Hours": st.column_config.NumberColumn(format="%.1f"),
+                        "Timesheet Share %": st.column_config.NumberColumn(format="%.1f%%"),
+                        "Allocated Quote Hours": st.column_config.NumberColumn(format="%.1f"),
+                    },
+                )
+        else:
+            st.caption("No included tasks with quote hours yet. Update Include/Hours to generate allocation.")
 
         lock_cols = st.columns([1.2, 1, 1, 1.8])
         with lock_cols[0]:
@@ -1000,8 +1325,9 @@ def main():
                     if st.session_state.get("quote_lock_visible_only", True):
                         task_table["Include"] = False
                         task_table["Hours"] = 0.0
-                    task_table.set_index("Task", inplace=True)
-                    editor_state = editor_state.set_index("Task")
+                    index_cols = ["Department", "Task"]
+                    task_table.set_index(index_cols, inplace=True)
+                    editor_state = editor_state.set_index(index_cols)
                     task_table.loc[editor_state.index, update_cols] = editor_state[update_cols]
                     task_table.reset_index(inplace=True)
                     st.session_state["quote_task_table"] = task_table
@@ -1017,8 +1343,9 @@ def main():
                                 for col, val in changes.items():
                                     if col in update_cols:
                                         view_snapshot.at[int(row_idx), col] = val
-                        task_table.set_index("Task", inplace=True)
-                        view_snapshot.set_index("Task", inplace=True)
+                        index_cols = ["Department", "Task"]
+                        task_table.set_index(index_cols, inplace=True)
+                        view_snapshot.set_index(index_cols, inplace=True)
                         task_table.loc[view_snapshot.index, update_cols] = view_snapshot[update_cols]
                         task_table.reset_index(inplace=True)
                         st.session_state["quote_task_table"] = task_table
@@ -1473,6 +1800,23 @@ def main():
         # =====================================================================
         # ACTIONS
         # =====================================================================
+        inferred_department = "Mixed"
+        if "department_final" in df_compare.columns:
+            dept_vals = sorted(df_compare["department_final"].dropna().astype(str).unique().tolist())
+            if len(dept_vals) == 1:
+                inferred_department = dept_vals[0]
+            elif len(dept_vals) == 0:
+                inferred_department = "Unknown"
+
+        inferred_category = "Mixed"
+        inferred_category_col = get_category_col(df_compare)
+        if inferred_category_col in df_compare.columns:
+            cat_vals = sorted(df_compare[inferred_category_col].dropna().astype(str).unique().tolist())
+            if len(cat_vals) == 1:
+                inferred_category = cat_vals[0]
+            elif len(cat_vals) == 0:
+                inferred_category = "Unknown"
+
         action_cols = st.columns(3)
         
         with action_cols[0]:
@@ -1489,8 +1833,8 @@ def main():
                         ))
                 
                 plan = QuotePlan(
-                    department=selected_dept,
-                    category=selected_cat,
+                    department=inferred_department,
+                    category=inferred_category,
                     tasks=tasks,
                     benchmark_window=benchmark_window,
                     recency_weighted=recency_weighted,
@@ -1503,20 +1847,20 @@ def main():
         with action_cols[1]:
             # Export as CSV
             export_df = edited_df[["Task", "Hours"]].copy()
-            export_df["Department"] = selected_dept
-            export_df["Category"] = selected_cat
+            export_df["Department"] = inferred_department
+            export_df["Category"] = inferred_category
             
             csv = export_df.to_csv(index=False)
             st.download_button(
                 "Export CSV",
                 data=csv,
-                file_name=f"quote_plan_{selected_dept}_{selected_cat}.csv",
+                file_name="quote_plan_refined_pool.csv",
                 mime="text/csv"
             )
         
         with action_cols[2]:
             if st.button("Clear Plan"):
-                st.session_state.pop(plan_key, None)
+                st.session_state.pop("quote_plan", None)
                 st.rerun()
 
 
