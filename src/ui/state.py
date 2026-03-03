@@ -34,6 +34,15 @@ STATE_KEYS = {
     "quote_plan": "quote_plan",
     "recency_weighted": "recency_weighted",
     "active_staff_only": "active_staff_only",
+    "quote_lines": "quote_lines",
+    "hours_basis": "hours_basis",
+    "quote_client_name": "quote_client_name",
+    "quote_job_name": "quote_job_name",
+    "quote_lookup_dept": "quote_lookup_dept",
+    "quote_lookup_cat": "quote_lookup_cat",
+    "quote_lookup_recency": "quote_lookup_recency",
+    "quote_lookup_min_rev": "quote_lookup_min_rev",
+    "quote_lookup_max_rev": "quote_lookup_max_rev",
     
     # Job Mix
     "cohort_definition": "cohort_definition",
@@ -77,6 +86,15 @@ DEFAULTS = {
     "quote_plan": None,
     "recency_weighted": False,
     "active_staff_only": True,
+    "quote_lines": [],
+    "hours_basis": "p50",
+    "quote_client_name": "",
+    "quote_job_name": "",
+    "quote_lookup_dept": None,
+    "quote_lookup_cat": None,
+    "quote_lookup_recency": 24,
+    "quote_lookup_min_rev": None,
+    "quote_lookup_max_rev": None,
     "cohort_definition": "first_activity",
     
     # Operational Intervention Engine
