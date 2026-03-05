@@ -94,6 +94,15 @@ def _completed_jobs(df: pd.DataFrame) -> pd.DataFrame:
     return df.iloc[0:0]
 
 
+def _get_client_col(df: pd.DataFrame) -> str | None:
+    """Return the preferred client grouping column (same preference as LTV page)."""
+    if "client_group_rev_job" in df.columns and df["client_group_rev_job"].notna().any():
+        return "client_group_rev_job"
+    if "client" in df.columns and df["client"].notna().any():
+        return "client"
+    return None
+
+
 def _normalize_text(value: Any) -> str:
     """Normalize text for robust keyword matching."""
     text = str(value or "").lower()
@@ -480,6 +489,31 @@ def _summary_text(
     return "\n".join(lines)
 
 
+def _get_peer_jobs_for_pairs(
+    df_scope: pd.DataFrame,
+    pairs: list[tuple[str, str]],
+    recency_months: int,
+) -> pd.DataFrame:
+    """Return peer jobs combined across one or more (department, category) pairs."""
+    frames: list[pd.DataFrame] = []
+    for department, category in pairs:
+        pair_jobs = get_peer_jobs(
+            df=df_scope,
+            department=department,
+            category=category,
+            min_revenue=None,
+            max_revenue=None,
+            recency_months=recency_months,
+        )
+        if len(pair_jobs) == 0:
+            continue
+        frames.append(pair_jobs.copy())
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 def _render_peer_lookup(df: pd.DataFrame, category_col: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Render Section 1: Peer Job Lookup."""
     section_header("Peer Job Lookup", "Pull completed peer jobs by department, category, size, and recency.")
@@ -488,14 +522,74 @@ def _render_peer_lookup(df: pd.DataFrame, category_col: str) -> tuple[pd.DataFra
         st.warning("Missing `department_final` in fact table.")
         return pd.DataFrame(), pd.DataFrame()
 
-    departments = sorted(df["department_final"].dropna().astype(str).unique().tolist())
-    if not departments:
-        st.info("No departments found in the dataset.")
+    client_col = _get_client_col(df)
+    if client_col is None:
+        st.warning("No client grouping field available (`client_group_rev_job` or `client`).")
         return pd.DataFrame(), pd.DataFrame()
 
+    client_label = "Client Group" if client_col == "client_group_rev_job" else "Client"
+    all_clients_label = "All Client Groups" if client_label == "Client Group" else "All Clients"
+    client_options = sorted(df[client_col].dropna().astype(str).unique().tolist())
+    client_options_with_all = [all_clients_label] + client_options
+    current_clients_raw = get_state(STATE_KEYS["quote_lookup_client"])
+    if isinstance(current_clients_raw, str):
+        current_clients = [current_clients_raw] if current_clients_raw.strip() else []
+    elif isinstance(current_clients_raw, list):
+        current_clients = [str(c) for c in current_clients_raw]
+    else:
+        current_clients = []
+    current_clients = [c for c in current_clients if c in client_options_with_all]
+    if not current_clients:
+        current_clients = [all_clients_label]
+    if all_clients_label in current_clients and len(current_clients) > 1:
+        current_clients = [all_clients_label]
+
+    selected_clients_raw = st.multiselect(
+        f"{client_label}(s)",
+        options=client_options_with_all,
+        default=current_clients,
+        help=(
+            f"Default is {all_clients_label}. "
+            "Select one or more specific clients to narrow the peer pool."
+        ),
+    )
+
+    if len(selected_clients_raw) == 0 or all_clients_label in selected_clients_raw:
+        selected_clients_effective: list[str] = []
+        selected_clients_state = [all_clients_label]
+    else:
+        selected_clients_effective = [v for v in selected_clients_raw if v != all_clients_label]
+        selected_clients_state = selected_clients_effective
+
+    if sorted(selected_clients_state) != sorted(current_clients):
+        set_state(STATE_KEYS["quote_lookup_client"], selected_clients_state)
+        set_state(STATE_KEYS["quote_lookup_dept"], None)
+        set_state(STATE_KEYS["quote_lookup_cat"], None)
+        set_state(STATE_KEYS["quote_lookup_min_rev"], None)
+        set_state(STATE_KEYS["quote_lookup_max_rev"], None)
+    else:
+        set_state(STATE_KEYS["quote_lookup_client"], selected_clients_state)
+
+    if len(selected_clients_effective) == 0:
+        df_scope = df.copy()
+    else:
+        df_scope = df[df[client_col].astype(str).isin([str(v) for v in selected_clients_effective])].copy()
+
+    if len(df_scope) == 0:
+        st.info("No data found for the selected client scope.")
+        return pd.DataFrame(), pd.DataFrame()
+
+    departments = sorted(df_scope["department_final"].dropna().astype(str).unique().tolist())
+    if not departments:
+        st.info("No departments found in this client scope.")
+        return pd.DataFrame(), pd.DataFrame()
+
+    dept_options = ["All Departments"] + departments
     current_dept = get_state(STATE_KEYS["quote_lookup_dept"])
-    dept_index = departments.index(current_dept) if current_dept in departments else 0
-    selected_department = st.selectbox("Department", options=departments, index=dept_index)
+    if current_dept not in dept_options:
+        current_dept = "All Departments"
+    dept_index = dept_options.index(current_dept)
+    selected_department = st.selectbox("Department", options=dept_options, index=dept_index)
 
     if selected_department != current_dept:
         set_state(STATE_KEYS["quote_lookup_dept"], selected_department)
@@ -505,15 +599,66 @@ def _render_peer_lookup(df: pd.DataFrame, category_col: str) -> tuple[pd.DataFra
     else:
         set_state(STATE_KEYS["quote_lookup_dept"], selected_department)
 
-    dept_df = df[df["department_final"].astype(str) == str(selected_department)]
-    categories = sorted(dept_df[category_col].dropna().astype(str).unique().tolist())
-    category_options = ["Select category"] + categories
-
+    selected_pairs: list[tuple[str, str]] = []
     current_cat = get_state(STATE_KEYS["quote_lookup_cat"])
-    cat_index = category_options.index(current_cat) if current_cat in category_options else 0
-    selected_category_raw = st.selectbox("Category", options=category_options, index=cat_index)
-    selected_category = None if selected_category_raw == "Select category" else selected_category_raw
-    set_state(STATE_KEYS["quote_lookup_cat"], selected_category)
+    if selected_department == "All Departments":
+        depcat_pairs = (
+            df_scope[["department_final", category_col]]
+            .dropna(subset=["department_final", category_col])
+            .drop_duplicates()
+            .copy()
+        )
+        depcat_pairs["department_final"] = depcat_pairs["department_final"].astype(str)
+        depcat_pairs[category_col] = depcat_pairs[category_col].astype(str)
+        depcat_pairs["pair_label"] = (
+            depcat_pairs["department_final"] + " -> " + depcat_pairs[category_col]
+        )
+        depcat_pairs = depcat_pairs.sort_values("pair_label")
+
+        pair_labels = depcat_pairs["pair_label"].tolist()
+        pair_map = {
+            row["pair_label"]: (row["department_final"], row[category_col])
+            for _, row in depcat_pairs.iterrows()
+        }
+        stored_selected: list[str]
+        if isinstance(current_cat, list):
+            stored_selected = [v for v in current_cat if isinstance(v, str)]
+        elif isinstance(current_cat, str):
+            stored_selected = [current_cat]
+        else:
+            stored_selected = []
+        stored_selected = [v for v in stored_selected if v in (["All Categories"] + pair_labels)]
+        if not stored_selected:
+            stored_selected = ["All Categories"]
+
+        selected_category_labels = st.multiselect(
+            "Categories",
+            options=["All Categories"] + pair_labels,
+            default=stored_selected,
+            help="When all departments are selected, choose one or more categories, or select all categories.",
+        )
+        if not selected_category_labels:
+            set_state(STATE_KEYS["quote_lookup_cat"], [])
+            selected_pairs = []
+        else:
+            if "All Categories" in selected_category_labels:
+                selected_pairs = [pair_map[label] for label in pair_labels]
+                set_state(STATE_KEYS["quote_lookup_cat"], ["All Categories"])
+                st.caption(f"Using all {len(pair_labels)} categories across all departments.")
+            else:
+                selected_pairs = [pair_map[label] for label in selected_category_labels if label in pair_map]
+                set_state(STATE_KEYS["quote_lookup_cat"], selected_category_labels)
+    else:
+        dept_df = df_scope[df_scope["department_final"].astype(str) == str(selected_department)].copy()
+        categories = sorted(dept_df[category_col].dropna().astype(str).unique().tolist())
+        category_options = ["Select category"] + categories
+        current_cat_single = current_cat if isinstance(current_cat, str) else None
+        cat_index = category_options.index(current_cat_single) if current_cat_single in category_options else 0
+        selected_category_raw = st.selectbox("Category", options=category_options, index=cat_index)
+        selected_category = None if selected_category_raw == "Select category" else selected_category_raw
+        set_state(STATE_KEYS["quote_lookup_cat"], selected_category)
+        if selected_category:
+            selected_pairs = [(str(selected_department), str(selected_category))]
 
     recency_values = [v for _, v in RECENCY_CHOICES]
     current_recency = int(get_state(STATE_KEYS["quote_lookup_recency"]) or 24)
@@ -526,16 +671,13 @@ def _render_peer_lookup(df: pd.DataFrame, category_col: str) -> tuple[pd.DataFra
     )
     set_state(STATE_KEYS["quote_lookup_recency"], selected_recency)
 
-    if not selected_category:
+    if len(selected_pairs) == 0:
         st.info("Select a category to see peer-job benchmarks.")
         return pd.DataFrame(), pd.DataFrame()
 
-    base_peer_jobs = get_peer_jobs(
-        df=df,
-        department=selected_department,
-        category=selected_category,
-        min_revenue=None,
-        max_revenue=None,
+    base_peer_jobs = _get_peer_jobs_for_pairs(
+        df_scope=df_scope,
+        pairs=selected_pairs,
         recency_months=selected_recency,
     )
 
@@ -574,12 +716,9 @@ def _render_peer_lookup(df: pd.DataFrame, category_col: str) -> tuple[pd.DataFra
     set_state(STATE_KEYS["quote_lookup_min_rev"], float(band_min))
     set_state(STATE_KEYS["quote_lookup_max_rev"], float(band_max))
 
-    peer_jobs = get_peer_jobs(
-        df=df,
-        department=selected_department,
-        category=selected_category,
-        min_revenue=None,
-        max_revenue=None,
+    peer_jobs = _get_peer_jobs_for_pairs(
+        df_scope=df_scope,
+        pairs=selected_pairs,
         recency_months=selected_recency,
     )
     peer_jobs = peer_jobs[
@@ -591,16 +730,16 @@ def _render_peer_lookup(df: pd.DataFrame, category_col: str) -> tuple[pd.DataFra
         return pd.DataFrame(), pd.DataFrame()
 
     description_source = None
-    if "job_description" in df.columns:
+    if "job_description" in df_scope.columns:
         description_source = "job_description"
-    elif "job_name" in df.columns:
+    elif "job_name" in df_scope.columns:
         description_source = "job_name"
 
     peer_jobs = peer_jobs.copy()
     peer_jobs["job_no"] = peer_jobs["job_no"].astype(str)
     if description_source is not None:
         description_lookup = (
-            df[["job_no", description_source]]
+            df_scope[["job_no", description_source]]
             .dropna(subset=["job_no"])
             .copy()
         )
@@ -692,13 +831,22 @@ def _render_peer_lookup(df: pd.DataFrame, category_col: str) -> tuple[pd.DataFra
         st.info("No peer jobs matched the keyword filter. Broaden or clear your keywords.")
         return pd.DataFrame(), pd.DataFrame()
 
+    pair_key_values = {f"{dept}||{cat}" for dept, cat in selected_pairs}
     peer_job_nos = peer_jobs_filtered["job_no"].astype(str).tolist()
-    dept_task_scope = dept_df.copy()
+    dept_task_scope = df_scope.copy()
     dept_task_scope["job_no"] = dept_task_scope["job_no"].astype(str)
-    scoped_for_tasks = dept_task_scope[
-        (dept_task_scope[category_col].astype(str) == str(selected_category))
-        & (dept_task_scope["job_no"].isin(peer_job_nos))
-    ].copy()
+    dept_task_scope["_pair_key"] = (
+        dept_task_scope["department_final"].astype(str)
+        + "||"
+        + dept_task_scope[category_col].astype(str)
+    )
+    task_mask = (
+        dept_task_scope["_pair_key"].isin(pair_key_values)
+        & dept_task_scope["job_no"].isin(peer_job_nos)
+    )
+    scoped_for_tasks = dept_task_scope[task_mask].copy()
+    if "_pair_key" in scoped_for_tasks.columns:
+        scoped_for_tasks = scoped_for_tasks.drop(columns=["_pair_key"])
     task_mix = get_peer_task_mix(scoped_for_tasks, peer_job_nos)
 
     summary = get_peer_pool_summary(peer_jobs_filtered)
@@ -748,6 +896,8 @@ def _render_peer_lookup(df: pd.DataFrame, category_col: str) -> tuple[pd.DataFra
 
     with st.expander("Peer Job Detail", expanded=False):
         detail_cols = [
+            "department_final",
+            "category",
             "job_no",
             "client",
             "total_hours",
@@ -766,6 +916,8 @@ def _render_peer_lookup(df: pd.DataFrame, category_col: str) -> tuple[pd.DataFra
             use_container_width=True,
             hide_index=True,
             column_config={
+                "department_final": st.column_config.TextColumn("Department"),
+                "category": st.column_config.TextColumn("Category"),
                 "job_no": st.column_config.TextColumn("Job"),
                 "client": st.column_config.TextColumn("Client"),
                 "total_hours": st.column_config.NumberColumn("Total Hrs", format="%.1f hrs"),
@@ -780,17 +932,44 @@ def _render_peer_lookup(df: pd.DataFrame, category_col: str) -> tuple[pd.DataFra
         )
 
     if st.button("+ Add to Quote", type="primary"):
-        new_line = _build_quote_line_from_peers(
-            department=selected_department,
-            category=selected_category,
-            peer_jobs=peer_jobs_filtered,
-            task_mix=task_mix,
-            recency_months=selected_recency,
-        )
         quote_lines = list(st.session_state.get(STATE_KEYS["quote_lines"], []))
-        quote_lines.append(new_line)
+        lines_added = 0
+        pair_lookup = {(dept, cat) for dept, cat in selected_pairs}
+        for department, category in sorted(pair_lookup):
+            pair_peer_jobs = peer_jobs_filtered[
+                (peer_jobs_filtered["department_final"].astype(str) == str(department))
+                & (peer_jobs_filtered["category"].astype(str) == str(category))
+            ].copy()
+            if len(pair_peer_jobs) == 0:
+                continue
+
+            pair_job_nos = pair_peer_jobs["job_no"].astype(str).tolist()
+            pair_task_scope = df_scope.copy()
+            pair_task_scope["job_no"] = pair_task_scope["job_no"].astype(str)
+            pair_task_scope = pair_task_scope[
+                (pair_task_scope["department_final"].astype(str) == str(department))
+                & (pair_task_scope[category_col].astype(str) == str(category))
+                & (pair_task_scope["job_no"].isin(pair_job_nos))
+            ].copy()
+            pair_task_mix = get_peer_task_mix(pair_task_scope, pair_job_nos)
+
+            new_line = _build_quote_line_from_peers(
+                department=str(department),
+                category=str(category),
+                peer_jobs=pair_peer_jobs,
+                task_mix=pair_task_mix,
+                recency_months=selected_recency,
+            )
+            quote_lines.append(new_line)
+            lines_added += 1
+
         st.session_state[STATE_KEYS["quote_lines"]] = quote_lines
-        st.success(f"Added line item: {selected_department} → {selected_category}")
+        if lines_added == 0:
+            st.warning("No categories with peer jobs were available to add.")
+        elif lines_added == 1:
+            st.success("Added 1 line item to quote.")
+        else:
+            st.success(f"Added {lines_added} line items to quote.")
         st.rerun()
 
     return peer_jobs_filtered, task_mix
@@ -1202,6 +1381,8 @@ def main() -> None:
         "job_status",
         "job_completed_date",
         "client",
+        "client_group_rev_job",
+        "client_group",
         "job_name",
         "job_description",
         "work_date",
